@@ -1,0 +1,9 @@
+links,mode,frac_routes_going_external
+10,BEST,1.0
+10,DEPTH_CAPPED(5),1.0
+20,BEST,1.0
+20,DEPTH_CAPPED(5),1.0
+50,BEST,1.0
+50,DEPTH_CAPPED(5),1.0
+100,BEST,1.0
+100,DEPTH_CAPPED(5),1.0

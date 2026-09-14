@@ -1,0 +1,32 @@
+# Independent contract review, external — 2026-09-11 — at the tagged revision
+
+Verdict: NOT READY for a public beta. Blockers: stale-price keeper overpayments, incomplete continuation safety, stranded reinforcement, fee forwarding that changes with transaction gas. Proposed beta limits after remediation: MAX_INDEX=4 on-chain; bond base ≥ 0.01 ETH; no sunset during beta; multisig steward; separate cold developer address; ≤ 20 promoted rounds and ≤ 20 ETH promoted genesis liquidity (operational).
+
+## Ranked findings
+1. HIGH — Price crash permits immediate keeper overpayment (BidDeployer.sol:202/285/515). Only pool j is checked against spot; conversion pools use historical averages → after a crash the vault pays ≈1.01V for a parcel now worth 0.1V. Fix: bound each conversion factor against current spot as well as both averages.
+2. HIGH — Unadopted intermediate continuation can still fork the trunk (RoundManager.sol:353/430/591). v3 adopts v1's unfinished head through an unadopted v2 (which reports idle with no rounds). Fix: reject adoption through an unadopted continuation / validate finality transitively.
+3. MEDIUM — Terminal-generation hop fees have no deployment path (BidDeployer.sol:278/293/305). The last head's parent-token hop pot cannot be deployed without an ETH entitlement; permanent at MAX_INDEX. Fix: independent deployment of existing parent-token reinforcement.
+4. MEDIUM — Gas selects which version receives fees; long forwarding chains cannot complete (FeeVault.sol:306/347/364). Low-gas booking keeps fees in the old vault; recursion stops by v5. Fix: pending-forward ledger decoupled from swap execution.
+5. MEDIUM — Keeper economics remain negative (Run 2: gas ≈ 215× bounty at j=1; 121 wei at j=8). Fix: recalibrate sizing/compensation or fund keepers; disclose dead zones.
+6. MEDIUM — "10% per rolling 24 hours" is false: resetting windows allow ≈19% in seconds at a boundary (FeeVault.sol:633). Fix: genuinely rolling limit.
+7. MEDIUM — Successor failure containment incomplete: (A) 32-byte return with dirty upper bits makes abi.decode revert every attributed third-party route (FamilyHook.sol:482); (B) successor calling `PoolManager.sync(ERC20)` breaks subsequent native `settle` (FamilyRouter.sol:401, Locker). Fix: validate address words without reverting; `sync(native)` before native settlement.
+8. MEDIUM — Losing candidates lose their supported exit and creator-fee route after the round (FamilyRouter.sol:187). Fix: historical candidate trades via the recorded round parent with attribution to the candidate's creator.
+9. MEDIUM (conditional) — Uniswap protocol fee (if enabled by its controller) inflates the absorption score (FamilyHook.sol:344). Fix: subtract v4 protocol-fee accrual from the scored input.
+10. MEDIUM — Disclosed "non-refundable bond floor" does not exist for winners (READINESS.md:59). Fix: correct disclosures.
+11. LOW — Lens pagination loads the whole candidate array (FamilyLens.sol:102). Fix: use the paginated overload.
+
+Previous-audit disposition: F1 incomplete (#2); F2 gas-burn fixed, containment incomplete (#4/#7); F3 arithmetic improved, viability not (#3/#5); F4 economically incomplete (#1/#6); F5 implemented but introduced #1; F6 works but disclosure false (#10); F7 open for ancestors; F8 fixed; F9 fixed for full fills; F10 partial (#11); F11 comment fixed, deployBlock inaccurate (disclosed).
+
+## Five weaknesses
+Economic: stale-price keeper purchases after a crash. Contract: adoption assumes an idle immediate predecessor has a final head. Score: temporary absorption is bought, not commitment; dust trades can worsen a rival's last-update tie-break. Weakest assumption: ETH value/liquidity/keeper incentives survive repeated generations (5–8% relative valuations; 121 wei at j=8). Edge: crash+extraction at generation 1 once the sleeve is funded; fork at N+1 as early as generation 1; depth warning at 8, size/precision incompatibility at 11.
+
+## Spec-versus-code discrepancies
+Non-ETH hop/snipe fees pooled per parent-token address (sibling losers share); partial fills are charged on the requested amount; creator-right transfer moves accrued fees and allows zero address; Fenwick sub-wei carry can round upward; "a 30-minute pump cannot raise payment" too strong (≈1.07% in the test); supported depth is warm-benchmark only; ten versions cannot resolve genesis through nine predecessors; deployments JSON block number is a forge artifact.
+
+## Disclosure additions
+Winning returns the bond (larger bond = more tied up, not a price); collected support may never become usable support and keepers currently lose money; after a crash keepers may be overpaid; a losing coin's sale is not supported by the router after trading ends; upgrades can produce conflicting histories or leave fees with an older version and gas can affect where fees go; fees can apply to requested amounts that do not fully trade; transferring creator rights transfers unclaimed earnings; actual second-granular snipe schedule ≈ 99%, 66.33%, 33.67%, then 0 at +3 s plus hop fee.
+
+## Evidence lists
+Verified: registered-key init; fixed curve; no mint; holder burns; Locker-only adds; removal/donate rejection; full-fill fees in four orientations; exact split; score freeze; submission window; refund/forfeit; idempotent finalize; deploy inputs; capped bond schedule. Narrower: vault ledger backed in tested states; invariant handler mixes genesis and ancestor keeper successes; does not exercise continuation, burns, v4 fee controller, realistic forwarding gas. Assumed: live PoolManager = vendored; controller config; future keeper participation; simulation prices/slot values; no invariant for zero residual BidDeployer credit.
+Recorded live (Run 2): genesis creation, hook fees/router trading, submit→finalize, refund/forfeit, claimDev, genesis keeper + earmark draw, ancestor keeper j=1, fast coverage, daily allowance, paginated reads. Never live: slow average reducing payout; sunset/cancel/adoption/forwarding; cross-version bids; creator claims; pull-refund fallback; failed-round decay; bond doubling; depth-cap rejection; ancestor deployment j≥2; competing actors; indexer.
+Unknowns: adversarial regressions for the new scenarios; keeper viability at j=1…4 with real costs; depth test asserting usable payouts; forwarding through 1–8 hops under real gas limits; slow-floor branch after ≥24 h and a full 7-day handover on testnet; deployment fidelity vs pinned builds; solvency proof summing entitlements and refunds vs assets incl. burns, failed calls, continuation.

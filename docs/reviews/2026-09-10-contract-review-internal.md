@@ -1,0 +1,22 @@
+# Internal contract review — 2026-09-10 — findings and dispositions
+
+Scope: all of `contracts/` at the tranche-2 revision, v4-core `46c6834`, 54 passing tests. Purpose: fix everything an external adversarial audit would flag before the final independent review.
+
+| ID | Sev | Finding | Disposition |
+|---|---|---|---|
+| C1 | Critical | `FamilyHook.afterSwap` subtracts the beforeSwap fee skim a second time from the score; v4 applies the beforeSwap return delta before the pool swap, so `parentDelta` is already net. Proven by instrumented test (R = 1e18 − 2×1.1e16). Attack: one exact-in buy into a rival during the 99% snipe window records R ≈ −0.98·A and integrates negative for the rest of the round. | FIX: score = pool parent delta (net absorbed); delete transient skim slot; pin exact R in 4 orientations + snipe-window test. |
+| C2 | Critical | `createGenesis` accepts caller-supplied `ranges`/`initSqrtPriceX96`; deploy script broadcasts factory and genesis as two txs → a watcher can squat genesis at near-zero FDV, buy ~100% of supply, and become permanent genesis creator. | FIX: genesis curve computed in-contract from `_curveSpec` + immutable `GENESIS_UNIT`. |
+| H1 | High | `FeeVault.deployAncestor(j)` executes j swaps + 2(j+1) consults → gas wall near generation 60–120; sleeve for deep generations permanently undeployable. | FIX: remove vault routing; keeper supplies `parentAmount` of token j−1, vault prices it via the consult chain (O(j) reads, no swaps), deposits bid, pays ETH + bounty. Ceiling measured at j = 32/128 and documented. |
+| H2 | High | Hop-fee pot and genesis earmark drained all-or-nothing before the 2% cap → any pot larger than the cap bricks `deployAncestor(j)` forever. | FIX: partial draws `min(pot, cap − deposited)`. |
+| H3 | High | Size cap computed from a virtual full-range reserve (`L/√P`), overstating real reserve ~30×+; cold pool → cap 0. | FIX: active-range amount via `SqrtPriceMath`; cold-start fallback to first-range liquidity. |
+| M1 | Medium | `swapPath` never checks `amountIn == msg.value` for ETH-first paths; router-held ETH sweepable. | FIX + test. |
+| M2 | Medium | TWAP ring spans ≤ 420 s under frequent swaps; `consult` returns spot on zero observations; band check silently passes on `twap == 0`. | FIX: `consult` returns coverage; band check reverts unless coverage ≥ window and ≥ 2 obs; cardinality 32, spacing 120 s. |
+| M3 | Medium | Keeper conversion routed with `minOut = 0` over j hops; ±3% sqrt band ≈ ±6% price per hop, compounding. | Closed by H1 fix (no vault routing). |
+| M4 | Medium | No protocol path to trade candidates during a round (router only routes canonical links). | FIX: `buyCandidate`/`sellCandidate` on router with creator attribution. |
+| M5 | Medium | Mid-route partial fill leaves an intermediate delta unsettled → opaque `CurrencyNotSettled` revert. | FIX: settle residuals to `to` or named revert; test. |
+| M6 | Medium | Invariant handler swallows all reverts → suite may pass vacuously. | FIX: ghost counters asserted > 0; runs 32 / depth 64. |
+| L1–L12 | Low | Fee on full `amountSpecified` for partial fills (documented); `depositBid` rounding slack (fix + fuzz); `_bidTicks` clamp can invert ticks (fix); `tFirstAttained` = last pre-T_end update (documented); hop pot unreachable when ETH sleeve is zero (fix via H2); Fenwick `MAX_INDEX` bricks genesis swaps at 4097 (fix: clear revert at registration); void external call to feeVault w/o code check (fix: code.length assert); hop fee 10 bps instead of 7.5 (fix: ppm units); constructor validation (fix); live `totalSupply()` read movable by burns (documented + test); dead `msgSender` (removed); round-trip `amountOut` read order (fix). | As noted. |
+
+Verified clean: hook delta neutrality in all four orientations; sign conventions; Fenwick rounding (claims ≤ entitlement); liquidity gating incl. PositionManager; `beforeInitialize` authentication; unlock-callback authentication; submission window/finalize idempotency/stale-round impossibility; bond conservation; score freeze; pre-swap observation (same-block sandwich fails); no pool balance to grief via `sync`.
+
+Unknowns closed by the fix tranche: score convention pinned; `depositBid` rounding fuzzed; keeper gas measured at j = 32/128; mirrored-orientation coverage added; `claimRefund` and `transferCreatorRecipient` exercised. Still open: whether Robinhood's sequencer exposes a public mempool (irrelevant once C2 is fixed in code).

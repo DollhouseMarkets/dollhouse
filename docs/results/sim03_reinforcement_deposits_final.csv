@@ -1,0 +1,3 @@
+budget_label,budget_eth,budget_usd,parent_deposited,parent_undeployed,pool_reserve_parent,deposit_frac_of_reserve
+fee_funded_3_rounds,0.375,1500.0,762482.8226901114,0.0,106925887.19208784,0.0071309468895997385
+cap_max,25.0,100000.0,2123268.087387955,21684224.15473453,108286672.4567857,0.0196078431372549
