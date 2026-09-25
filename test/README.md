@@ -5,7 +5,7 @@ Five groups, each proving a different kind of claim. Counts are test functions i
 
 | Group | Where | What it proves | Count |
 |---|---|---|---|
-| Unit tests by contract | `test/*.t.sol` | The behaviour of each contract, one file per component, including the regression tests for fixed findings | 326 (321 unit and fuzz tests, 5 invariants) |
+| Unit tests by contract | `test/*.t.sol` | The behaviour of each contract, one file per component, including the regression tests for fixed findings | 322 (317 unit and fuzz tests, 5 invariants), all passing |
 | Properties and invariants | `test/properties/` | Every property of `docs/spec/PROPERTIES.md` with a fuzz or invariant tier, stated as the specification states it | 89 (70 fuzz properties, 16 invariants, 3 measurements) |
 | Fork tests | `test/fork/` | The protocol against the real Uniswap v4 `PoolManager` singleton on a fork of the live chain | 38 |
 | Symbolic checks | `test/halmos/` | Bounded proofs over the shipped `FeeVault` and `RoundManager` bytecode and the curve and Fenwick libraries | 34 (32 in the default run) |

@@ -11,7 +11,9 @@
 //
 // This is that check, and it is one-directional on purpose: every key the web READS must be
 // produced by the deploy script. The reverse is not required - the record carries keys for
-// operators that the browser has no business with.
+// operators that the browser has no business with. The read side is `script/contract-keys.mjs`,
+// a small module shared with `sync-contracts.mjs` rather than this script reading the web build
+// directly, so the check still runs where `web/` is not present.
 //
 // Exit code 0 when every read key is produced, 1 with the missing ones listed.
 //
@@ -36,9 +38,9 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { DIRECT_READ_KEYS, VENUE_VIEW_KEY } from './contract-keys.mjs'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const sync = readFileSync(join(repo, 'web', 'scripts', 'sync-contracts.mjs'), 'utf8')
 const deploy = readFileSync(join(repo, 'script', 'Deploy.s.sol'), 'utf8')
 
 /// Every `vm.serialize*(o, "key", ...)` in the record's own object. The constants object is a
@@ -47,12 +49,11 @@ const produced = new Set()
 for (const m of deploy.matchAll(/vm\.serialize\w+\(\s*o\s*,\s*"([A-Za-z0-9_]+)"/g)) produced.add(m[1])
 for (const m of deploy.matchAll(/vm\.serializeString\(\s*"deployment"\s*,\s*"([A-Za-z0-9_]+)"/g)) produced.add(m[1])
 
-/// Every key the sync script reads off the record: `raw.<key>`, plus the venue view key, which
-/// it reaches through the address map it has just built rather than off `raw` directly.
-const read = new Set()
-for (const m of sync.matchAll(/\braw\.([A-Za-z0-9_]+)/g)) read.add(m[1])
-const venue = /const VENUE_VIEW_KEY = '([A-Za-z0-9_]+)'/.exec(sync)
-if (venue) read.add(venue[1])
+/// Every key the sync script reads off the record directly, plus the venue view key, which it
+/// reaches through the address map it has just built rather than off `raw` directly. Both come
+/// from `contract-keys.mjs`, shared with `sync-contracts.mjs`, so this stays in step without
+/// this script needing to read `web/` at all.
+const read = new Set([...DIRECT_READ_KEYS, VENUE_VIEW_KEY])
 
 /// The record whose VALUES are checked: named on the command line or in DEPLOYMENT_RECORD, else
 /// `deployments/<chainId>.json`. No record is not a

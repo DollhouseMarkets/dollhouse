@@ -11,11 +11,12 @@ call a non-view cheatcode), with a `// DIVERGENCE <ID>:` comment naming what the
 
 ## 0. Full-suite run
 
-`FOUNDRY_THREADS=1 forge test --threads 1 --no-match-path 'test/fork/*'`: **346 tests passed, 0
-failed, 1 skipped** (347 total, 52 suites); the one skip is
+`FOUNDRY_THREADS=1 forge test --threads 1 --no-match-path 'test/{fork,halmos,properties,medusa}/**'`
+(unit tier) plus `--match-path 'test/properties/**'` (property tier): **395 tests passed, 0
+failed, 1 skipped** (396 total, 51 suites); the one skip is
 `testFuzz_SLV03_sleeveIsNeverOverAllocated`, the symbolic case the forge tier does not run (Halmos
 owns it). The fork tier (`test/fork/*`, needs an RPC
-endpoint) is recorded separately and passed 30 of 30.
+endpoint) is recorded separately and passed 38 of 38.
 
 Properties restated for external genesis / $DOLL-only accounting, all passing at this run:
 
