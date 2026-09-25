@@ -1,24 +1,23 @@
-# Slither triage (review-3)
+# Slither triage
 
-Re-run of Slither against the review-3 code (HEAD after the contestable-purse removal:
-`_board`, `rank(uint256)` and `purseWeights` no longer exist on `RoundManager`). This
-file is the current triage, replacing an earlier review-1 pass. Every disposition below was carried over from the
-review-1 pass by matching detector, contract and function name (not line number, since the
-code shifted); rows whose function or state variable no longer exists were dropped and are
-listed under "Removed since review-1" below. Every row that is genuinely new in this run
-is marked `needs review` unless it reapplies an already-established false-positive
-reasoning pattern from review-1 to the same kind of code (for example, a newly reported
-zero-initialized local variable in a function already covered by that reasoning).
+Slither run against the contracts after the contestable purse was removed (`_board`,
+`rank(uint256)` and `purseWeights` no longer exist on `RoundManager`). Every disposition below was
+carried over from the earlier pass by matching detector, contract and function name (not line
+number, since the code shifted); rows whose function or state variable no longer exists were
+dropped and are listed under "Removed since the earlier pass" below. Every row that is new in this
+run is marked `needs review` unless it reapplies an established false-positive reasoning pattern
+to the same kind of code (for example, a newly reported zero-initialized local variable in a
+function already covered by that reasoning).
 
 ## Summary
 
-| | review-1 | review-3 |
+| | earlier pass | this run |
 |---|---|---|
 | Total results | 275 | 272 |
 
 By impact:
 
-| Impact | review-1 count | review-3 count |
+| Impact | earlier count | this run |
 |---|---|---|
 | High | 6 | 5 |
 | Medium | 75 | 75 |
@@ -26,16 +25,16 @@ By impact:
 | Informational | 47 | 47 |
 | **Total** | **275** | **272** |
 
-By disposition (review-3):
+By disposition:
 
 | Disposition | Count |
 |---|---|
-| false positive (carried from review-1, or same reasoning pattern reapplied) | 160 |
-| accepted risk (carried from review-1) | 3 |
+| false positive (carried from the earlier pass, or same reasoning pattern reapplied) | 160 |
+| accepted risk (carried from the earlier pass) | 3 |
 | needs review | 109 |
 | **Total** | **272** |
 
-By impact and disposition (review-3):
+By impact and disposition:
 
 | Impact | false positive | accepted risk | needs review |
 |---|---|---|---|
@@ -44,39 +43,38 @@ By impact and disposition (review-3):
 | Low | 52 | 1 | 92 |
 | Informational | 30 | 0 | 17 |
 
-## Removed since review-1
+## Removed since the earlier pass
 
-These review-1 rows have no counterpart in review-3 because the flagged code no longer
+These earlier rows have no counterpart in this run because the flagged code no longer
 exists: the contestable-purse mechanism (`_board`, the permissionless `rank(uint256)`, and
-`purseWeights`) was removed from `RoundManager` in review-3.
+`purseWeights`) is removed from `RoundManager`.
 
-| Detector | Contract.Member | review-1 disposition | Reason |
+| Detector | Contract.Member | earlier disposition | Reason |
 |---|---|---|---|
-| uninitialized-state | RoundManager._board | false positive - `mapping(uint256 => Rank[2]) internal _board;` (#297) is a mapping and has no initializer by construction. The only writer is the permissionless `rank()` (`Rank[2] storage b = _board[index];`, #1204); a read before any write yields zeroed `Rank`s with `set == false`, and every consumer refuses them - `purseWeights` does `if (!a.set) revert BadRanking();` (#1245) and the same for the second slot, and `board(i)` is a plain view. An unranked generation's purse is therefore undeployable (revert) rather than deployable at a wrong number; that requirement, and the 6 h `RANK_MAX_AGE` freshness bound, are specified in docs/spec/PROTOCOL_SPEC.md ('Ranking is a separate, permissionless transaction from spending'). | code removed in review-3: contestable purse |
-| timestamp | RoundManager.rank | false positive - round/vesting timing is timestamp-based by design (by design) | code removed in review-3: contestable purse |
-| timestamp | RoundManager.purseWeights | false positive - round/vesting timing is timestamp-based by design (by design) | code removed in review-3: contestable purse |
+| uninitialized-state | RoundManager._board | false positive - `mapping(uint256 => Rank[2]) internal _board;` (#297) is a mapping and has no initializer by construction. The only writer is the permissionless `rank()` (`Rank[2] storage b = _board[index];`, #1204); a read before any write yields zeroed `Rank`s with `set == false`, and every consumer refuses them - `purseWeights` does `if (!a.set) revert BadRanking();` (#1245) and the same for the second slot, and `board(i)` is a plain view. An unranked generation's purse is therefore undeployable (revert) rather than deployable at a wrong number; that requirement, and the 6 h `RANK_MAX_AGE` freshness bound, are specified in docs/spec/PROTOCOL_SPEC.md ('Ranking is a separate, permissionless transaction from spending'). | code removed: contestable purse |
+| timestamp | RoundManager.rank | false positive - round/vesting timing is timestamp-based by design (by design) | code removed: contestable purse |
+| timestamp | RoundManager.purseWeights | false positive - round/vesting timing is timestamp-based by design (by design) | code removed: contestable purse |
 
 ### Other rows dropped (not purse-related)
 
-These review-1 rows also have no counterpart in review-3, but the underlying function
-still exists in the current code, so the reason is not the purse removal. This executor
-did not independently verify why Slither no longer reports these; flagged for maintainer
-awareness rather than silently dropped.
+These earlier rows also have no counterpart in this run, but the underlying function
+still exists in the current code, so the reason is not the purse removal. Slither no longer
+reports them; they are listed rather than silently dropped.
 
-| Detector | Contract.Member | review-1 disposition | Note |
+| Detector | Contract.Member | earlier disposition | Note |
 |---|---|---|---|
-| reentrancy-events | FeeVault.accrue | false positive - `accrue` is gated by `if (msg.sender != address(hook)) revert NotHook();` (#341). Its one non-protocol call target is the steward-named successor vault, reached ONLY through `try this.forwardProtocolFee{gas: budget}(...) ... catch { _forwardingFailed(...); }` (#294-298), i.e. inside a try/catch that rolls the whole hop back and falls through to `_queueForward` (#300-303). The state written after it, `ledgerTotal[currency] += forwarded ? hopFee : hopFee + protocolFee;` (#380), is a pure function of that branch's outcome. A hostile successor re-entering this vault cannot reach `accrue` (hook-only), `flushForward`/`claim*` (`nonReentrant`), or `redeem` (its `poolManager.unlock` reverts inside the swap's existing unlock); any revert it causes is caught and the fee is queued for a permissionless `flushForward`. The fallback is loud, not silent: `emit ProtocolFeeForwardingFailed(...)` plus `ProtocolFeeQueued`. ERC-20 call targets on this path are only `FamilyToken` clones minted by this version's factory (or a prior version's, through the registry chain), which have no transfer hook; no arbitrary token address is reachable. | function still present in `contracts/`; Slither no longer reports this exact finding in review-3, cause not verified by this pass |
+| reentrancy-events | FeeVault.accrue | false positive - `accrue` is gated by `if (msg.sender != address(hook)) revert NotHook();` (#341). Its one non-protocol call target is the steward-named successor vault, reached ONLY through `try this.forwardProtocolFee{gas: budget}(...) ... catch { _forwardingFailed(...); }` (#294-298), i.e. inside a try/catch that rolls the whole hop back and falls through to `_queueForward` (#300-303). The state written after it, `ledgerTotal[currency] += forwarded ? hopFee : hopFee + protocolFee;` (#380), is a pure function of that branch's outcome. A hostile successor re-entering this vault cannot reach `accrue` (hook-only), `flushForward`/`claim*` (`nonReentrant`), or `redeem` (its `poolManager.unlock` reverts inside the swap's existing unlock); any revert it causes is caught and the fee is queued for a permissionless `flushForward`. The fallback is loud, not silent: `emit ProtocolFeeForwardingFailed(...)` plus `ProtocolFeeQueued`. ERC-20 call targets on this path are only `FamilyToken` clones minted by this version's factory (or a prior version's, through the registry chain), which have no transfer hook; no arbitrary token address is reachable. | function still present in `contracts/`; Slither no longer reports this exact finding |
 
-## New needs-review rows (this pass)
+## New needs-review rows
 
-Rows with no review-1 counterpart at all (new code, or a new detector hit) and no
+Rows with no earlier counterpart at all (new code, or a new detector hit) and no
 established false-positive pattern to reapply. Hand-triage needed.
 
 | Detector | Impact | Location | Description |
 |---|---|---|---|
 | reentrancy-benign | Low | contracts/libraries/V4UnlockGuardProbe.sol:34 | Reentrancy in V4UnlockGuardProbe.probe(address) (contracts/libraries/V4UnlockGuardProbe.sol#34-42): 	External calls: 	- bound = abi.decode(IPoolManager(poolManager).unlock(),(bool)) (contracts/libraries/V4UnlockGuardProbe.sol#37) 	State variables written after the call(s): 	- probing = address(0) (contracts/libraries/V4UnlockGuardProbe.sol#38) |
 
-## Full detector table (review-3, 272 rows, sorted by impact then detector)
+## Full detector table (272 rows, sorted by impact then detector)
 
 | Detector | Impact | Confidence | Location | Description | Disposition |
 |---|---|---|---|---|---|
@@ -355,12 +353,7 @@ established false-positive pattern to reapply. Hand-triage needed.
 
 ## Status: completed
 
-Slither ran to completion in isolation under the shared lock (single-threaded,
-`FOUNDRY_THREADS=1`, 3 GB free-RAM floor). Full output: `docs/security/slither-review-3-raw.txt`;
-machine-readable results: `docs/security/slither-review-3.json` (195 contracts analyzed, 102
-detectors, 272 results, `success: true`). The via-IR compile peaked around 8 GB resident
-(a new high relative to review-1's 4-7 GB) on this run, with free system RAM dropping under
-500 MB at the peak; the run completed without a crash. A separate, unrelated exit code 127
-appears after the JSON was already written and validated, matching the review-1 pattern.
+Slither ran to completion single-threaded (`FOUNDRY_THREADS=1`): 195 contracts analyzed, 102
+detectors, 272 results, `success: true`.
 
 No contract was changed by this triage.

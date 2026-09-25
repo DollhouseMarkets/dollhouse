@@ -1,33 +1,22 @@
-# Dollhouse (codename Family Chain): Protocol Specification
+# Dollhouse: Protocol Specification
 
-Status: post-audit, pre-mainnet. This document describes **the code in `contracts/` at the tree that
-adopts an externally launched genesis token and denominates the whole protocol in it** (design
-decision 2026-09-14: canonical index 0 is `GENESIS_TOKEN`, an
-18-decimal ERC-20 launched and graduated on Pons V2 outside this protocol, adopted once, inside
-`FamilyFactory.wire()`, by the factory-only `RoundManager.adoptGenesis` (review 5b: there is no
-public `adoptGenesis` entry point on the factory any more, and front-running the adoption is
-inert, see below); the chain this protocol owns starts at link one, priced in that
-token; `DevVesting` and the genesis developer allocation are deleted, there is no founder
-allocation of any family token), **346 tests passed, 0 failed, 1 skipped** across 52 suites
-(`docs/security/full-suite-review-5g.txt`; fork tier recorded separately, 30 of 30 passed), superseding the 183-test tree that added the developer vesting allocation and the transferable
-steward/developer/beneficiary roles, which itself superseded the 162-test tree that closed the
-gas-optimization pass, which superseded the 160-test tree that closed the final external contract
-review, which superseded the 145-test tree that closed the earlier final independent contract
-review. Where the code and `docs/DEPLOY_CONSTANTS.md` differ, the code is described and the
-difference is flagged inline as **[DIFF n]**. `script/Deploy.s.sol` binds the deploy constants; no
-run of the review-5 (external-genesis, $DOLL-only) design has fired on any public chain yet, see
-§T for the pre-review-5 testnet record and its caveats. Nothing has run on mainnet 4663.
+This document describes the code in `contracts/`. Canonical index 0 is `GENESIS_TOKEN`, an
+18-decimal ERC-20 launched and graduated on Pons V2 outside this protocol and adopted once, inside
+`FamilyFactory.wire()`, by the factory-only `RoundManager.adoptGenesis` (there is no public adoption
+entry point, and front-running the adoption is inert, see below); the chain this protocol owns starts
+at link one, priced in that token. There is no founder allocation of any family token. Where the
+code and `docs/DEPLOY_CONSTANTS.md` differ, the code is described and the difference is flagged
+inline as **[DIFF n]**. `script/Deploy.s.sol` binds the deploy constants.
 
 Contracts: `FamilyToken`, `FamilyFactory`, `FamilyHook`, `Locker`, `RoundManager`, `FeeVault`,
 `BidDeployer`, `FamilyRouter`, `FamilyLens`; libraries `CurveMath`, `StandardCurve`,
 `FenwickRangeAdd`; types `CurveRange`, `CurveSegment`; cross-version interfaces `IPriorRegistry`,
-`IVersionFactory`, `IBidDeployer`. `DevVesting` and `DevVestingDeployer` are deleted from the tree
-(review 5).
+`IVersionFactory`, `IBidDeployer`.
 
-**Treasury split (this change).** The keeper/bid machinery (the TWAP band guard, the active-range
+**Treasury split.** The keeper/bid machinery (the TWAP band guard, the active-range
 size cap, the bid geometry, the cold-start curve fallback and cross-version forwarding) now lives
 in its own contract, `BidDeployer`, because `FeeVault` plus the keeper machinery together were
-25,550 bytes and could not be deployed under EIP-170 (the private run log). `FeeVault` keeps the
+25,550 bytes and could not be deployed under EIP-170. `FeeVault` keeps the
 ledgers, accrual, forwarding and the dev/creator claims, and exposes four tightly scoped hooks (`consumeAncestorClaim`, `consumeReinforcement`, `consumeEdgeEarmark`, `payKeeper`) that only
 `BidDeployer` may call (`onlyBidDeployer`, checked against the immutable `feeVault.bidDeployer()`).
 `payKeeper` is leashed by `deployerCredit`: $DOLL can leave the vault on the keeper path only against
@@ -54,11 +43,11 @@ stack including an adopted genesis and one candidate token, exactly as `CodeSize
 | `FamilyToken` | 1,961 | 22,615 |
 
 Every deployed contract fits comfortably under the limit, `BidDeployer` included, the split leaves
-over 6.2 KB of headroom on the largest piece even after the audit fixes, versus the pre-split `FeeVault` at 25,550 B, which
+over 6.2 KB of headroom on the largest piece, versus the pre-split `FeeVault` at 25,550 B, which
 exceeded the limit outright. `CodeSize.t.sol::test_everyDeployedContractFitsUnderEip170` asserts
 `0 < size <= 24_576` for every one of these at once, against a stack deployed exactly the way the
-deploy script deploys it (`forge test` runs with the contract-size check disabled, which is how the
-pre-split regression passed 119 tests and then failed the real deploy, see the private run log).
+deploy script deploys it (`forge test` runs with the contract-size check disabled, so this test is
+what catches an oversized contract before a deploy).
 
 ---
 
@@ -71,8 +60,8 @@ over by the clock, and only `finalize()` needs a caller.
 
 | # | State | Transition | Trigger (function) | Who can call | Guards enforced in code |
 |---|---|---|---|---|---|
-| 1 | Unlaunched | → Idle(head=#0) | `FamilyFactory.wire()` | anyone, once | **Review 5, adoption entry point changed at review 5b:** replaces `createGenesis`. Adoption runs inside `wire()` itself, not through a separate public `adoptGenesis(token)` call, since the old standalone entry point was front-runnable for the creator attribution and is now gone; `wire()` calls the factory-internal `_adoptGenesis()`, which calls the factory-only `RoundManager.adoptGenesis(token, creator)` with `creator` fixed to the deployer recorded at construction, so whoever sends the `wire()` transaction, the outcome is identical. `priorRegistry == address(0)` else `ContinuationHasGenesis`; `genesisAdopted == false` else `GenesisAlreadyAdopted`; `token == GENESIS_TOKEN` else `WrongGenesisToken`; the token must answer 18 decimals and a nonzero `totalSupply()` else `BadGenesisToken`. **No curve, no price and no pool are computed or created**: index 0 is an external, already-graduated ERC-20 with no pool key in this deployment (`poolKeyOf(0)` is a zero key), and the chain this protocol owns starts at link one |
-| 2 | Idle(head=#N) | → Registration(round R) | `FamilyFactory.registerCandidate` → `RoundManager.openRoundIfIdle` | anyone paying the round's bond | `wire()`; `headIndex + 1 <= FenwickRangeAdd.MAX_INDEX` else `FamilyFactory.ChainDepthLimit`; `head != address(0)` else `NoGenesis`; the previous round must be `finalized`; **not sunset** else `Sunset(successor)`; a **continuation** must be able to adopt the trunk else `PriorNotHandedOver`, and, **transitively**: the prior registry itself must be a root or already `adopted()` else `PriorNotAdopted()` (audit 2); `headIndex + 1 <= MAX_INDEX` (when non-zero) else `RoundManager.ChainDepthLimit`; then `registerCandidate` (no longer payable) pulls the round's own `bondFor(headIndex+1)` in the adopted edge token by `safeTransferFrom(msg.sender, roundManager, bondAmount)`, called AFTER `openRoundIfIdle` so `RegistrationClosed` is checked before any allowance problem (review 5) |
+| 1 | Unlaunched | → Idle(head=#0) | `FamilyFactory.wire()` | anyone, once | replaces `createGenesis`. Adoption runs inside `wire()` itself, not through a separate public `adoptGenesis(token)` call, since the old standalone entry point was front-runnable for the creator attribution and is now gone; `wire()` calls the factory-internal `_adoptGenesis()`, which calls the factory-only `RoundManager.adoptGenesis(token, creator)` with `creator` fixed to the deployer recorded at construction, so whoever sends the `wire()` transaction, the outcome is identical. `priorRegistry == address(0)` else `ContinuationHasGenesis`; `genesisAdopted == false` else `GenesisAlreadyAdopted`; `token == GENESIS_TOKEN` else `WrongGenesisToken`; the token must answer 18 decimals and a nonzero `totalSupply()` else `BadGenesisToken`. **No curve, no price and no pool are computed or created**: index 0 is an external, already-graduated ERC-20 with no pool key in this deployment (`poolKeyOf(0)` is a zero key), and the chain this protocol owns starts at link one |
+| 2 | Idle(head=#N) | → Registration(round R) | `FamilyFactory.registerCandidate` → `RoundManager.openRoundIfIdle` | anyone paying the round's bond | `wire()`; `headIndex + 1 <= FenwickRangeAdd.MAX_INDEX` else `FamilyFactory.ChainDepthLimit`; `head != address(0)` else `NoGenesis`; the previous round must be `finalized`; **not sunset** else `Sunset(successor)`; a **continuation** must be able to adopt the trunk else `PriorNotHandedOver`, and, **transitively**: the prior registry itself must be a root or already `adopted()` else `PriorNotAdopted()` (audit 2); `headIndex + 1 <= MAX_INDEX` (when non-zero) else `RoundManager.ChainDepthLimit`; then `registerCandidate` (no longer payable) pulls the round's own `bondFor(headIndex+1)` in the adopted edge token by `safeTransferFrom(msg.sender, roundManager, bondAmount)`, called AFTER `openRoundIfIdle` so `RegistrationClosed` is checked before any allowance problem |
 | 3 | Registration | → Registration (more entries) | same | anyone | `block.timestamp < r.registrationEnd` else `RegistrationClosed`; unlimited candidates |
 | 3b | Trading (late entry, §2) | → Trading (new candidate) | `FamilyFactory.registerCandidate` → `RoundManager.addCandidate` | anyone paying the round's pinned bond | permitted **only when `durationFor(n) >= 1 hour`**, and only through `lateEntryUntil(n)` (a third of trading); refused outright on a short round (`RegistrationClosed`); the late entrant's own pool opens and its own 3-second snipe tax starts at THIS moment, not at `tradingStart`; scored over the identical closing window as every other candidate (§F) |
 | 4 | Registration | → Trading | none, implicit at `r.registrationEnd` | clock | `FamilyHook.beforeSwap` reverts `TradingNotStarted` while `block.timestamp < p.tradingStart` |
@@ -90,12 +79,9 @@ over by the clock, and only `finalize()` needs a caller.
 | 13 | Sunset effective | → no further rounds | `openRoundIfIdle` | - | `isSunset()` reverts `Sunset(successor)`, **but only in the "open a new round" branch**: a round already open still registers, trades, is scored, finalizes and crowns a head (`Sunset.t.sol::test_aRoundOpenWhenTheSunsetLandsStillFinishesAndCrowns`) |
 | 14 | any | trading on a canonical or losing pool | `PoolManager.swap` | anyone | never gated after `tradingStart`; losers' pools live forever and keep paying hop fees |
 
-**The 2026-09-12 design decisions inserted phases 3b and
-6b/6c above** on top of the state machine already described. Nothing about the ORIGINAL phases moved:
-registration still opens the round, trading still starts at `registrationEnd`, and `finalize()` is
-still the only place the head moves. What changed is (i) a long round (`durationFor(n) >= 1 hour`)
-now accepts new candidates during trading itself, and (ii) the fixed public `T_end` of the old design
-is now a **nominal** end `T`, with the **true** end settled afterwards by a verifiable drand relay or,
+Phases 3b and 6b/6c: registration opens the round, trading starts at `registrationEnd`, and
+`finalize()` is the only place the head moves. A long round (`durationFor(n) >= 1 hour`) also
+accepts new candidates during trading itself, and the public end is a **nominal** end `T`, with the **true** end settled afterwards by a verifiable drand relay or,
 failing that, a disclosed deterministic fallback (§C, §F). Every one of `durationFor`, `registrationFor`,
 `lateEntryUntil` and `closingWindowFor` is a pure function of the round number alone
 (`Schedule.t.sol::test_theScheduleTableIsExact`), so nobody (steward included) can change any round's
@@ -108,7 +94,7 @@ writer of `_canonical`, `headIndex`, `head`, `_parentOf`, `_indexOf`, `_isCanoni
 `_priorIndex` (event `ContinuationAdopted`). It is a *copy at a moment the prior head can no longer
 move*, never a rewrite of an index.
 
-**[DIFF 1]** The brief lists a standalone `openRound()`. The code has none: a round is opened as a
+**[DIFF 1]** There is no standalone `openRound()`: a round is opened as a
 side effect of the first `registerCandidate`, through the factory-only `openRoundIfIdle()`.
 
 **Continuation (forward upgrade), with LAZY HEAD ADOPTION (audit F1).** A deployment constructed
@@ -182,19 +168,16 @@ back in its own constructor (`implementation.factory() == address(this)`, else
 `BadTokenImplementation`), so a mismatched implementation/factory pair can never be wired up.
 
 1. `FamilyFactory` clones the implementation (`Clones.clone(tokenImplementation)`) and calls
-   `initialize(name, symbol, uri, address(locker))` on the clone. **Review 5:** the dev-recipient
+   `initialize(name, symbol, uri, address(locker))` on the clone. the dev-recipient
    and dev-amount arguments are gone; the whole fixed supply is minted straight to the Locker, for
    every candidate this factory launches, with no exceptions. `initialize` is **factory-only**
    (`NotFactory`) and **one-shot** (`AlreadyInitialized`). `name`/`symbol` live in the clone's own
    storage (`_tokenName`/`_tokenSymbol`, read back by `name()`/`symbol()` overrides) rather than the
    ERC20 base's, because the base's constructor (the only place vanilla `ERC20` can set them) never runs on a clone.
-2. **There is no developer allocation anywhere in this deployment (review 5).** `DevVesting` and
-   `DevVestingDeployer` are deleted from the tree along with `FamilyFactory.createGenesis`, the
-   curve that used to carve a dev share out of genesis, and every argument that used to plumb a
-   `devAmount` through `initialize`. Canonical index 0 is adopted from outside this protocol (§A)
-   and mints nothing here; every family token this factory launches, link one included, sells its
-   whole supply on the curve. Founders and the artist share described in the design brief are an
-   off-chain arrangement, with no on-chain mechanism.
+2. **There is no developer allocation of any family token.** `initialize` takes no dev-recipient
+   or dev-amount argument. Canonical index 0 is adopted from outside this protocol (§A) and mints
+   nothing here; every family token this factory launches, link one included, sells its whole
+   supply on the curve.
 3. The factory registers the exact `PoolKey` + `initSqrtPriceX96` with the hook, calls
    `PoolManager.initialize`, then `Locker.placeStandardCurve`.
 4. The Locker mints the curve positions through `PoolManager.modifyLiquidity` inside one
@@ -216,22 +199,9 @@ with the same locked curve, and keep paying hop fees into their parent's reinfor
 
 ---
 
-## B.1 Developer vesting: REMOVED (review 5)
-
-`DevVesting` and `DevVestingDeployer` are deleted from the tree, along with the genesis developer
-allocation they paid out. There is no vesting schedule, no beneficiary role, and no developer
-allocation of any family token, genesis included, anywhere in this deployment. The developer is
-compensated by the fee share alone (§I): 20% of the protocol's 1% edge fee, claimed through
-`FeeVault.claimDev`, nothing else. Every reference elsewhere in this document to the vesting
-beneficiary role, the `DevVesting` contract, or a genesis-supply allocation describes a prior
-revision and no longer applies to the code at `HEAD`.
-
----
-
 ## C. Round lifecycle: timestamps, phases, functions
 
-**The 2026-09-12 design decisions supersede the fixed `TRADING_S = 900` / fixed public
-end below with an adaptive schedule and a random true end.** Every value is a pure function of the
+**The round uses an adaptive schedule and a random true end.** Every value is a pure function of the
 round number `n`, computed once (`RoundManager.durationFor/registrationFor/lateEntryUntil/
 closingWindowFor/scoreSlotFor`), and, apart from the mainnet-vs-testnet `DURATION_SCALE_DIV`
 constructor divisor described below, none of it can be changed after deploy.
@@ -302,7 +272,7 @@ had never fired in production). Test: `Continuation.t.sol::test_sunsetDelayIsACo
 
 **The bond is depth-scaled (audit F6), not a single constant.** `bondFor(targetIndex) =
 min(BOND_BASE << (targetIndex / BOND_DOUBLING_EVERY), BOND_MAX)`, with the three parameters
-immutable constructor arguments. **Review 5: `BOND_BASE` and `BOND_MAX` are amounts of the adopted
+immutable constructor arguments. **`BOND_BASE` and `BOND_MAX` are amounts of the adopted
 edge token (18 decimals), not wei**, `script/Deploy.s.sol` sets both to a placeholder `25_000e18`
 that MUST be recalibrated at deploy time from the graduated Pons launch price
 (`BOND_DOUBLING_EVERY == 0` disables the schedule and makes `BOND_MAX` the flat bond). The shift
@@ -360,12 +330,12 @@ conditions for entering a round:
   registered one (`WrongInitialPrice`); `beforeAddLiquidity` rejects any adder except the Locker
   (`OnlyLocker`). A candidate pool is therefore, by construction, a fixed-supply factory token on
   the standard curve at the standard price.
-- **Bond.** **Review 5:** `registerCandidate` is no longer payable. It calls `openRoundIfIdle` first
+- **Bond.** `registerCandidate` is no longer payable. It calls `openRoundIfIdle` first
   (so `RegistrationClosed` is reported before any allowance problem would be) and then pulls the
   round's own `bondFor(headIndex + 1)` (§C) in the adopted edge token by
   `IERC20(GENESIS_TOKEN).safeTransferFrom(msg.sender, address(roundManager), bondAmount)`, forwarding
   it to `RoundManager.addCandidate`, which stores it per candidate. The caller must have approved
-  the factory beforehand. **Review 5b:** `registerCandidate(name, symbol, uri, maxBond)` takes a
+  the factory beforehand. `registerCandidate(name, symbol, uri, maxBond)` takes a
   fourth argument, the most the caller will pay in the edge currency, checked against the pinned
   `bondAmount` before the pull (`revert BondTooHigh(bondAmount, maxBond)` if it is exceeded), since
   the bond doubles with the index the round competes for, so a blanket allowance left standing across a
@@ -384,16 +354,16 @@ conditions for entering a round:
   raised (`Depth.t.sol::test_maxIndexRefusesTheRoundThatWouldGoPastIt`,
   `DeployConstants.t.sol` asserts the testnet value is 0).
 - **Wiring.** `wire()` asserts the FeeVault and the router have code before any launch
-  (`NotWired`, `GenesisCurve.t.sol::test_wireRefusesAHalfDeployedStack`).
+  (`NotWired`).
 - **Numeraire.** The pool is always `candidate ⇄ current head`. The child address may sort either
   side of the parent, so `tokenIsCurrency0 = token < parent` and both curve orientations are built
   by `StandardCurve.build(..., tokenIsCurrency0)` (`Mirrored.t.sol`).
 - **No cap** on entries per round or per address. Sybil entry costs `n × r.bondAmount` of the edge
-  currency (review 5: renamed from `bondWei`, and no longer native value) plus gas.
+  currency (renamed from `bondWei`, and no longer native value) plus gas.
 
-**Genesis is external and has no curve at all (review 5).** Adoption computes no curve, no ranges
+**Genesis is external and has no curve at all.** Adoption computes no curve, no ranges
 and no `initSqrtPriceX96`, and initializes no pool. Index 0's market lives entirely outside this
-protocol (the venue it graduated on). **Review 5b:** adoption is no longer a separate,
+protocol (the venue it graduated on). adoption is no longer a separate,
 permissionlessly-callable `adoptGenesis(token)` entry point on the factory; it runs inside
 `FamilyFactory.wire()`, with the `genesisCreator` attribution fixed at construction to the
 deployer, so there is no front-running window at all: whoever sends the `wire()` transaction,
@@ -409,7 +379,7 @@ because adoption places none. `FamilyLens.hasPool(0)` answers `false` forever.
 `currency1`, pool price `P = amount1/amount0 = supply/FDV`, so a *higher* valuation is a *lower*
 tick, unsold inventory is `currency1`-only liquidity strictly below spot, and buying is
 `zeroForOne`. Mirrored (`tokenIsCurrency0 == true`), higher FDV is a higher tick and inventory sits
-above spot. **Review 5:** the child token's address may sort either side of the adopted edge token,
+above spot. the child token's address may sort either side of the adopted edge token,
 same as any other link, since there is no native-ETH sentinel to force an orientation.
 
 **Closed forms.**
@@ -448,7 +418,7 @@ At the threshold a winner has sold ≈38% of supply with ≈11% embedded backing
 Design analysis on MID measures a median 60.2% of float sold for the 9.0×-of-threshold *total* absorption an
 actual win requires.
 
-**Genesis pool, REMOVED (review 5).** There is no genesis curve, no `GENESIS_UNIT` and no
+**Genesis pool, REMOVED.** There is no genesis curve, no `GENESIS_UNIT` and no
 `genesisTokensForSale()`: index 0 is adopted, not launched, and has no pool of any kind in this
 deployment (§D). Every candidate this factory launches, link one included, calls
 `StandardCurve.build` with `saleSupply == FAMILY_TOTAL_SUPPLY`, because there is no developer
@@ -509,8 +479,7 @@ Exact `R` is pinned in all four orientations and inside the snipe window by `tes
 | `test_snipeWindowBuyScoresPoolDeltaAndNeverGoesNegative` | at `tradingStart`, with a 99% snipe tax plus the hop fee, a 1e18 buy scores exactly `0.009e18`, positive, never negative |
 | `test_snipeDecayMovesTheScoreNotTheSign` | the same buy 2 s later scores strictly more |
 
-**The 2026-09-12 design decisions replace the freeze-at-`T_end`/full-round-average model
-below with a closing-window average read out of a checkpoint ring, because `T_end` is no longer known
+**The score is a closing-window average read out of a checkpoint ring, because `T_end` is no longer known
 in advance and the accumulator is never frozen at all, see below and §J for why: the same running
 accumulator keeps running after the round as a public support measure.**
 
@@ -519,9 +488,9 @@ accumulating exactly as described above (buys add, sells subtract, fee-exclusive
 (C1)) with no clamp on the accumulator itself: a swap after the round's nominal end `T` keeps
 updating the same accumulator `trailingAverage` reads from for the rest of the chain's life (§J).
 
-What DOES stop at `T` is the writing of checkpoints (review 4b, F1). Every pool carries the
+What DOES stop at `T` is the writing of checkpoints (F1). Every pool carries the
 published end of the round that launched it (`RegisteredPool.nominalEnd`, passed by the
-RoundManager through the factory at `registerPool`; **review 5: every registered pool, edge pools
+RoundManager through the factory at `registerPool`; **Every registered pool, edge pools
 included, has a real `nominalEnd > tradingStart` and freezes, the old `nominalEnd == 0` exemption
 is gone, since there is no genesis pool of this protocol's own to exempt**, and a LATE ENTRANT
 carries the round's `T`, not its own start plus the duration). Past that instant a
@@ -544,15 +513,13 @@ round can be scored at, `T − W − RANDOM_END_S`. With `W` flat at 15 min the 
 900 + 180 = 1080 s on every round, met by `ceil(1080/63) = 18` s slots and 63 × 18 = 1134 s of ring;
 on the testnet divisor of 5 it is 180 + 180 = 360 s and `ceil(360/63) = 6` s slots.
 
-The SETTLEMENT TAIL (`END_TIMEOUT + SUBMIT_S`) used to be part of this span, because the ring had to
-survive being overwritten while a round was settled and scored: review 2 raised the spacing to 51 s
-for exactly that. Review 4b's freeze removes the need, a swap during settlement writes nothing, so
-the ring has to REACH the scored span but no longer has to SURVIVE churn on top of it
+The SETTLEMENT TAIL (`END_TIMEOUT + SUBMIT_S`) is not part of this span: ring writes freeze at `T`,
+a swap during settlement writes nothing, so the ring has to REACH the scored span but no longer has to SURVIVE churn on top of it
 (`Review2.t.sol::test_theRingIsUnchangedByAFullBeaconTimeoutOfPostBellDust`,
 `test_theRingIsUnchangedByASubmissionWindowOfDustAfterAPromptFulfil`). The finer slot is not free
 elegance: it is what cuts the far-edge dilution bound below.
 
-**Resolving an edge, and the exact-sample fallback (review 4).** An edge `t` is resolved in one of
+**Resolving an edge, and the exact-sample fallback.** An edge `t` is resolved in one of
 three ways, in this order.
 
 1. **Live state.** Nothing has been swapped since `t` (`tLast <= t`): the running accumulator already
@@ -576,19 +543,19 @@ of drift per edge, and zero whenever a bracket exists, which is the ordinary cas
 because the coarse slot containing `t` always carries an entry in the fallback case: had it carried
 none, the first swap after `t` would have written one whose `tState` precedes `t`, and that is a
 bracket. Both instants actually used are RETURNED by `averageOver` and carried in
-`RoundManager.ScoreSubmitted` as `tStartUsed` / `tEndUsed` (review 4b, F5), so a fallback resolution
+`RoundManager.ScoreSubmitted` as `tStartUsed` / `tEndUsed` (F5), so a fallback resolution
 is a fact in the log rather than something only a re-run of the view could reveal. When the two
 collapse onto the SAME instant the call reverts `BadScoreWindow` instead of answering zero (F6); that
 needs `W ≤ scoreSlotFor(n)` and is unreachable on either accepted schedule (900 > 18, 180 > 6),
 which `DeployConstants.t.sol` asserts.
 
-**Manipulation bound (review 4b, F1/F4).** Nothing swapped after the published end `T` writes a
+**Manipulation bound (F1/F4).** Nothing swapped after the published end `T` writes a
 checkpoint, so post-bell flow can change neither the instants the two edges resolve to nor the value
 (`Review4b.t.sol::test_postRevealDustCannotSelectADifferentScore`,
 `test_theRingIsByteIdenticalAfterPostBellDust`). What an adversary retains is a PRE-BELL dilution of
 the FAR edge: by dusting across the coarse slot containing `T_end − W` it can make that edge resolve
 to a sample up to one coarse slot earlier, never later, which stretches the measured window from 900 s
-to at most 918 s, a **2.0%** dilution of the level, against **5.7%** (951/900) at the review-4 spacing
+to at most 918 s, a **2.0%** dilution of the level, against **5.7%** (951/900) at a 51 s spacing
 of 51 s. It cannot move the near edge at all, and it cannot make the window SHORTER
 (`Review4b.t.sol::test_farEdgeDriftIsAtMostOneCoarseSlot`).
 
@@ -597,7 +564,7 @@ FIXED wall-clock time (`tSwap / slotS`), not relative to the round: a pool regis
 lands on the same boundaries as every other pool of the round, so all candidates of a round alias
 their far edge identically and no candidate can be advantaged by the alignment of its own open.
 
-Before review 4 case 3 reverted, and the round's whole score became unreadable: a single 1-wei swap
+Without case 3 the read would revert, and the round's whole score would become unreadable: a single 1-wei swap
 placed in the bell's own 5-second slot, or three minutes of one-per-slot dust after the reveal, denied
 every candidate of the round its score and the round finalized with no winner
 (`Review4.t.sol::test_aSecondSwapInTheBellsOwnSlotCannotDenyTheScore`,
@@ -659,7 +626,7 @@ now also records that generation's round (`_roundOfIndex[newIndex] = roundId`, �
 crowns.
 
 Order of operations: set `r.finalized = true` (effects first) → decide the winner → mutate the head
-or decay `hWad` → emit `RoundFinalized` → then the only external calls, all **review-5 token
+or decay `hWad` → emit `RoundFinalized` → then the only external calls, all **token
 transfers, not native value**: the bonds were already pulled into `RoundManager` at registration
 (§D), so forfeiting is `edge.safeTransfer(feeVault, forfeited)` then the non-payable
 `feeVault.depositEdgeBidEarmark(forfeited)`, tried through `pushForfeit` so a failing token or a
@@ -679,22 +646,16 @@ link one by `deployEdgeBid()`.
 **Threshold.** `threshold() = head.totalSupply() · hWad / 1e18`, i.e. `H` is an *average* absorption
 in parent tokens. On a failed round `hWad = max(hWad·9/10, H_MIN_FRAC_WAD)`. **On a win
 `hWad = H_FRAC_WAD`**: the decay compounds only across *consecutive* failed rounds.
-Deploy values: `H_FRAC_WAD = 1.5e15` (0.15% of parent supply) and `H_MIN_FRAC_WAD = 3.75e14`
-(0.0375%, i.e. 0.25·h), both `RoundManager` constructor arguments, immutable thereafter
-(`Round.t.sol::test_noWinnerDecaysThresholdToTheFloor`).
-
-**[DIFF 3, narrowed]** The internal engineering model now runs the MID configuration with
-`--reset-on-win` (its deploy-configuration table states "H snaps back to H0 on a win, in both the
-real `RoundConfig` and the model's reduced form"), so the deployed rule and the modelled rule agree,
-supported by executable tests and reviews. That model's own *modelling note* still reads "H persists
-across wins (brief section 2 only ever decays it)", a stale sentence contradicting the report's own
-configuration table. The liveness figures quoted in §S are the MID/reset numbers from the summary
-table.
+Deploy values: `H_FRAC_WAD = 0` and `H_MIN_FRAC_WAD = 0`, both `RoundManager` constructor
+arguments, immutable thereafter — the threshold is disabled in this deployment, so the highest
+average net buying always wins; the decay mechanics above stay in the code but never bind
+(`Round.t.sol::test_noWinnerDecaysThresholdToTheFloor`, `DeployConstants.t.sol` pins the zero
+value).
 
 **L10, accepted and documented.** `H` is a fraction of the head's **live** `totalSupply()`, and
 `FamilyToken.burn` is permissionless, so a head holder can lower the next bar by burning. Burning
-`x` costs full market value and lowers `H` by only `h·x` (15 bps at deploy) (~667× the relief
-bought) while making every remaining holder richer per token
+`x` costs full market value and lowers `H` by only `h·x` (in this deployment `h = 0`, so burning
+has no effect on `H`) while making every remaining holder richer per token
 (`RoundGuards.t.sol::test_burningHeadSupplyLowersThreshold`).
 
 ---
@@ -702,7 +663,7 @@ bought) while making every remaining holder richer per token
 ## H. Routing
 
 `FamilyRouter` is immutable, permissionless and **not fee-privileged**; it pays exactly the fees a
-direct `PoolManager.swap` pays. **Review 5: the router is $DOLL-only.** There is no native-ETH
+direct `PoolManager.swap` pays. **The router is $DOLL-only.** There is no native-ETH
 sentinel, no `msg.value` anywhere, and no native settle branch; every entrypoint pulls `amountIn` as
 an ERC-20 from the caller (approval required first).
 
@@ -745,11 +706,11 @@ an ERC-20 from the caller (approval required first).
   maximum; the real ceiling is gas and price impact. `buyCandidateWithParent` takes no `maxHops`: its
   route is always exactly one hop.
 
-**Value checks (M1), restated for review 5.** Every entrypoint pulls exactly `amountIn` of the
+**Value checks (M1).** Every entrypoint pulls exactly `amountIn` of the
 relevant ERC-20 from `msg.sender`; there is no `msg.value` path anywhere in the router to check
 against it. **There is no `receive()`**: a plain native transfer to the router reverts outright, so
 nothing can be parked there to be swept later (`RouterGuards.t.sol::test_routerHeldEthCannotBeSwept`,
-updated at review 5 to assert the transfer itself fails).
+updated to assert the transfer itself fails).
 
 **Settlement.** The whole route runs inside **one** `unlock` (nested unlocks revert in v4). Each leg
 is exact-in against the extreme price limit. Both terminal deltas are read *before* either is acted
@@ -760,7 +721,7 @@ residual (including the candidate tail currency) to `to`, while a **negative** o
 `IntermediateDeficit(pathIndex, amount)` rather than an opaque `CurrencyNotSettled`
 (M5, `test_midRoutePartialFillSettlesEveryCurrency`). `minOut` is checked after the unlock returns.
 
-**`sync(native)` before native settlement, REMOVED (review 5).** There is no native settle branch
+**`sync(native)` before native settlement, REMOVED.** There is no native settle branch
 left in this router or the Locker: every settlement is an ERC-20 `sync`/`settle`/`take` cycle, so
 the native-currency snapshot hazard this section used to describe (audit 7B) no longer applies to
 either contract.
@@ -806,12 +767,12 @@ currency, on an edge pool). The pool LP fee is 0. **Every rate is in parts per m
 
 | fee | rate | where | applies to |
 |---|---|---|---|
-| protocol fee | `PROTOCOL_FEE_PPM = 10_000` (1%) | `_collect`, `protocolPpm = (p.isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` | the $DOLL side of every edge-pool swap (a pool whose parent is canonical index 0, i.e. every round-one pool, forever), entry **and** exit, EXCEPT during that same pool's own 3-second snipe window, where it is suppressed rather than summed (review 5) |
+| protocol fee | `PROTOCOL_FEE_PPM = 10_000` (1%) | `_collect`, `protocolPpm = (p.isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` | the $DOLL side of every edge-pool swap (a pool whose parent is canonical index 0, i.e. every round-one pool, forever), entry **and** exit, EXCEPT during that same pool's own 3-second snipe window, where it is suppressed rather than summed |
 | hop fee | `hopFeePpm` (immutable ctor arg; **deploy value 750 ppm = 7.5 bps**, capped at `MAX_HOP_FEE_PPM = 10_000` = 100 bps, else `HopFeeTooHigh`) | `_collect`, every pool | the parent side of every family swap, edge leg included |
-| snipe tax | `SNIPE_START_PPM = 990_000` → `SNIPE_END_PPM = 10_000` linearly over `SNIPE_S = 3` s, then 0 | `_snipeTaxPpm(p.tradingStart)` | every pool's own first 3 s of trading, edge pools included (review 5: the old `GenesisHasNoSnipeWindow` exemption is deleted, every registered pool has a real `tradingStart`) |
+| snipe tax | `SNIPE_START_PPM = 990_000` → `SNIPE_END_PPM = 10_000` linearly over `SNIPE_S = 3` s, then 0 | `_snipeTaxPpm(p.tradingStart)` | every pool's own first 3 s of trading, edge pools included (the old `GenesisHasNoSnipeWindow` exemption is deleted, every registered pool has a real `tradingStart`) |
 
 `total = hopFee + protocolFee + snipeFee`, all computed on the same `parentAmount`, and the two
-review-5 rules keep the sum at or under `hopFeePpm + max(PROTOCOL_FEE_PPM, SNIPE_START_PPM)`: a
+the rules keep the sum at or under `hopFeePpm + max(PROTOCOL_FEE_PPM, SNIPE_START_PPM)`: a
 round-one pool is both edge-fee-eligible and snipe-taxed for its own first 3 s, and
 `protocolPpm = (isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` is what stops the two being summed
 on the same swap, restating FEE-01 as "one edge fee per traversal of an edge pool" and FEE-06 as a
@@ -838,7 +799,7 @@ is **grossed up first**: `basis = poolCost / (1 − rate)`, fee `= poolCost · r
 old code added `poolCost · rate` on top instead, which made the effective rate only `rate / (1 + rate)`, 49.7% instead of 99% at the snipe start, and half the intended tax on an exact-output sell. A
 parent-paying exact-output swap whose rates sum to ≥ 100% has no finite gross-up and is refused with
 `SnipeExactOutputTooLarge`. At the deploy constants the protocol fee and the snipe tax are never
-summed on one swap (review 5: `protocolPpm` is zero whenever `snipePpm != 0`), so the reachable
+summed on one swap (`protocolPpm` is zero whenever `snipePpm != 0`), so the reachable
 worst case is `hopFeePpm + SNIPE_START_PPM = 750 + 990_000 = 990_750` ppm (99.075%) at the deploy
 hop fee (reachable only in the first second of any pool's own snipe window, and only summing to
 100% or more with `hopFeePpm` at its `MAX_HOP_FEE_PPM` ceiling) `SnipeTax.t.sol::test_exactOutRevertsWhenRatesReachOneHundredPercent`.
@@ -895,7 +856,7 @@ reinforce = rest − sleeve                      → reinforcementEdge[M]       
 Anything else (including the `UNATTRIBUTED = type(uint256).max` sentinel a forwarded-but-untrusted
 fee carries) is unattributed: `creator = 0`, `M = 0`, so the whole flywheel share lands on index 0
 of the sleeve, the adopted edge token (`Fees.prop::testFuzz_FEE12_unattributedFeesFallBackToIndexZero`,
-renamed at review 5 from `..._FallBackToGenesis`). The developer's 20% is paid on every protocol fee,
+renamed from `..._FallBackToGenesis`). The developer's 20% is paid on every protocol fee,
 attributed or not.
 
 **Head-creator season cut.** When a co-creditee exists the creator share is split **50/50**:
@@ -942,13 +903,12 @@ sending (CEI), decrement `ledgerTotal`, redeem claims, then send the adopted edg
 ### The purse (§1): `BidDeployer.deployAncestor`
 
 **The ancestor sleeve (§ above) is deployed under exactly one pool: `canonical(j)`, the trunk link
-that won round `j`.** Review 3 (maintainer decision 2026-09-13) removed the contest: there is no
-ranking, no board, no staleness and no split. A generation is still the round winner plus every
+that won round `j`.** There is no ranking, no board, no staleness and no split. A generation is still the round winner plus every
 candidate that lost the same round (`RoundManager.roundOfIndex(i)`), and pairing rights and the
 season cut still lock at finalization (§A/§G) and stay with the round winner permanently. The purse
-now does the same.
+does the same.
 
-**The call is `BidDeployer.deployAncestor(uint256 j, uint256 parentAmount)`.** **Review 5:** it
+**The call is `BidDeployer.deployAncestor(uint256 j, uint256 parentAmount)`.** it
 reverts `NoPoolAtIndex` for `j == 0` (index 0 is quoted outside this protocol and has no pool to
 deploy into) and `UnknownGeneration` for an unminted `j`. It prices `parentAmount` at
 `min(spot, TWAP30, TWAP7d)` walking links `1..j-1` (identity at `j <= 1`, so a link-one deployment
@@ -966,7 +926,7 @@ spot tick), are never withdrawn, and are a bid, not a lock-up: the coin's own ho
 them at those prices at any time. Two limits keep a deployment from being usable as a shove: the
 active-range size cap (`MAX_RESERVE_BPS = 200`, 2% of the target range's parent reserve per
 deployment) and the vault's 24-hour drawdown bucket (`DAILY_DRAW_BPS = 1000`, 10% of the
-generation's accrued $DOLL per day). This is not a property review 3 introduced: the reinforcement
+generation's accrued $DOLL per day). This is not specific to the purse: the reinforcement
 share (20% of the fee, § fee split) has been deployed as locked bids under the parent from the
 start, and making the ancestor sleeve uncontested extends the same property from 20% to 40% of the
 fee. Keeping the value on the canonical chain in that form is the intended design outcome.
@@ -974,7 +934,7 @@ fee. Keeping the value on the canonical chain in that form is the intended desig
 **Pricing, precisely (correction).** Two different prices are involved and they are not the same
 walk. (1) **How much $DOLL leaves the sleeve** is decided by pricing `parentAmount` along the links
 `1..j-1` (index 0 never enters the walk; identity at `j <= 1`), each hop at `min(spot, TWAP30,
-TWAP7d)` (`dollValueOfParent`, renamed at review 5 from `ethValueOfParent`), the conservative
+TWAP7d)` (`dollValueOfParent`, renamed from `ethValueOfParent`), the conservative
 direction for the vault. (2) **Where the bid sits** is decided by the trunk pool itself: `_requireWithinBand`
 requires its spot *sqrt* price to be within `TWAP_BAND_BPS = 300` (3%, about 6% in price terms) of
 its OWN 30-minute TWAP, and `_bidTicks` then reads the live spot tick from the PoolManager and
@@ -987,12 +947,7 @@ places the range immediately beneath it. The trunk pool's 7-day TWAP does not se
 trades through it; one sentence to publish instead of five; and a dumped or abandoned trunk coin is
 for its own community to take over rather than for the protocol to penalise.
 
-**Previously (review 2, superseded).** `RoundManager.rank(candidateId)` measured a sibling's
-trailing support out of the hook into a two-seat board per generation; `purseWeights(j, idA, idB)`
-verified the pair, refused a board older than `RANK_MAX_AGE = 6 h` with `BadRanking`, and returned
-the weights the purse split by; `deployAncestor` took `(j, amount, idA, idB)` and placed two bids,
-emitting `PurseSplit`. All of it is removed in review 3. `FamilyHook.trailingAverage` remains, as a
-public view that nothing pays out on.
+`FamilyHook.trailingAverage` is a public view that nothing pays out on.
 
 Tests: `Purse.t.sol::test_thePurseIsDeployedUnderTheTrunkCoin`,
 `test_aLosingSiblingNeverReceivesPurseLiquidity`, `test_theDestinationIsNotAKeeperChoice`,
@@ -1018,17 +973,16 @@ payout   = dollValue + bounty
 deposit  = parentAmount + consumeReinforcement(parent, cap − parentAmount)
 ```
 
-**Review 5: `dollValueOfParent` walks links `1..j-1`, index 0 never enters** (it is external and
+**`dollValueOfParent` walks links `1..j-1`, index 0 never enters** (it is external and
 has no price this protocol reads), and is the identity at `j <= 1`, link one's own deployment,
 `deployAncestor(1, amount)`, needs no oracle at all, and generations 0 and 1 fund together through
 `deployEdgeBid()` instead of the amount-walking machinery below (see "The purse" above).
-**Review 5b:** the `j = 1` self-funded branch pays the proportional 1% bounty only, with no
+the `j = 1` self-funded branch pays the proportional 1% bounty only, with no
 `MIN_BOUNTY_DOLL` floor: the keeper brings no capital and takes no inventory risk there, so a floor
 would just be a repeatable drain on the generation's daily drawdown allowance for nothing.
 
 **Bounty floor and cap (audit 5), from generation 2 on.** The plain 1% bounty is negative-sum at
-small deployment sizes, Run 2 measured gas ≈215× the bounty at `j = 1` and 121 wei of bounty at
-`j = 8` under the pre-review-5 design. `bounty = max(1% of dollValue, MIN_BOUNTY_DOLL)`, a
+small deployment sizes. `bounty = max(1% of dollValue, MIN_BOUNTY_DOLL)`, a
 `BidDeployer` constructor argument (an amount of $DOLL, calibrated at deploy from the graduated
 Pons price; `script/Deploy.s.sol` placeholder `1_000e18`), still paid **on top of** the deployment
 out of the same generation's $DOLL entitlement. The floor is capped so it can never eat the whole
@@ -1041,7 +995,7 @@ disclosed, not fixed, because the floor cannot be raised further without eating 
 generation's sleeve. Tests: `Keeper.t.sol::test_theBountyFloorIsPaidAtRunTwoSizes`,
 `test_belowTheFloorTheBountyIsCappedAtTwentyPercent`.
 
-**Pricing walks the AMOUNT, not a rate (audit F3, fixed; review 5 walks `1..j-1`).**
+**Pricing walks the AMOUNT, not a rate (audit F3, fixed; it walks `1..j-1`).**
 `dollValueOfParent(j, amount)` starts with `dollValue = amount` and walks links `k = 1..j-1`,
 applying each link's parent-per-token factor as **two independent full-precision
 `FullMath.mulDiv`s**: `(Q96/twap)²` when the parent is currency0, `(twap/Q96)²` when it is
@@ -1078,7 +1032,7 @@ Tests: `Keeper.t.sol::test_aThirtyMinutePumpCannotRaiseWhatTheSleevePays`,
 `test_aYoungPoolPricesOnTheFastAverageAndSaysSo`, `test_aCrashedConversionPoolIsPricedAtSpot`.
 
 - **`BidDeployer.deployAncestor(j, parentAmount)` - permissionless, `nonReentrant` (signature
-  narrowed by §1 in review 3).** **Review 5:** reverts `NoPoolAtIndex` for `j == 0`
+  narrowed by §1).** reverts `NoPoolAtIndex` for `j == 0`
   (index 0 is quoted outside this protocol) or `UnknownGeneration` for an unminted `j`. The keeper
   must have approved `BidDeployer` (not the vault) for `parentAmount` of `canonical(j − 1)`, except
   at `j = 1`, self-funded, where the keeper brings nothing at all. The whole deposit goes into `j`'s
@@ -1155,13 +1109,13 @@ Tests: `Keeper.t.sol::test_aThirtyMinutePumpCannotRaiseWhatTheSleevePays`,
   `test_coldPoolAcceptsALockedBid`, `test_coldPoolStillHasASizeCap`).
 - **Partial pot draws (H2/L5).** The pool's own parent-denominated hop pot is drawn **partially**,
   `min(pot, cap − parentAmount)`, never all-or-nothing, so a pot larger than the cap can no longer
-  brick the generation forever. **Review 5:** `BidDeployer.deployEdgeBid()` /
+  brick the generation forever. `BidDeployer.deployEdgeBid()` /
   `deployEdgeBid(sleeveAmount)` (renamed from `deployGenesisBid`) do the same for link one with
   FOUR independent pots: generation 0's ancestor sleeve, generation 1's ancestor sleeve (each
   capped at `sleeveAmount` in the one-argument form), the link-one hop pot, and the forfeited-bond
   earmark, each drawn up to the remaining room; any non-empty combination deploys
   (`Review5.t.sol::test_deployEdgeBidFundsFromAllFourPots`). **The bounty is paid on top of the
-  deposit on BOTH keeper paths, never out of it (this change).** The size cap bounds the DEPOSIT:
+  deposit on BOTH keeper paths, never out of it.** The size cap bounds the DEPOSIT:
   `deposited = potTotal · BPS / (BPS + BOUNTY_BPS)` (clamped to the reserve room), `bounty =
   deposited · BOUNTY_BPS / BPS`, and the four pots are drawn up to `need = deposited + bounty`, in
   order: generation 0's sleeve, generation 1's sleeve, the link-one hop fees, then the forfeited
@@ -1191,7 +1145,7 @@ Tests: `Keeper.t.sol::test_aThirtyMinutePumpCannotRaiseWhatTheSleevePays`,
   orientation.
 
 **`BidDeployer.depositExternalBid(token, parentAmount)`** (`IBidDeployer`), permissionless,
-**not payable (review 5: an ERC-20 pull, not native value)**, no bounty and no ledger: a gift of
+**not payable (an ERC-20 pull, not native value)**, no bounty and no ledger: a gift of
 parent liquidity under one of *this version's* links (`NotOurLink` otherwise), subject to the same
 band and size guards. It is also the cross-version payout path: when generation `j`'s pool belongs
 to an earlier version (whose hook accepts only its own Locker), `deployAncestor` / `deployEdgeBid`
@@ -1249,7 +1203,7 @@ Anyone can push up to `max` of what is queued under `attribution` on to the *imm
 vault, paying the gas themselves: it resolves the successor vault, decrements `pendingForward` and
 `ledgerTotal`, redeems the claim into a real token balance if it is not already (`redeem`, since this
 runs outside a swap and can safely unlock), transfers the tokens, and calls
-`receiveForward(attribution, amount)`: **review 5: a non-payable token deposit, not `{value:
+`receiveForward(attribution, amount)`: **A non-payable token deposit, not `{value:
 amount}`**: on the successor. `receiveForward` is checked against `ledgerTotal[EDGE] <=
 holdings(EDGE)` exactly like `depositEdgeBidEarmark`, and is the twin of `accrueForwarded`, same
 booking rule, same queue-if-still-sunset behaviour, `_isPriorVault`-gated. So a chain of any length
@@ -1318,10 +1272,9 @@ Split values are `FeeVault` constructor arguments validated by `DEV_BPS + creato
 `ancestorBps + reinforceBps == BPS` (of the remainder), with a non-zero `developer` and code checks
 on the factory/locker/hook/roundManager (`BadSplit`, `NoCode`). `script/Deploy.s.sol` binds
 `CREATOR_BPS = 4000`, `ANCESTOR_BPS = 5000`, `REINFORCE_BPS = 5000`, dev 20% / creator 40% /
-ancestor 20% / reinforcement 20% of the fee, exactly the `DEPLOY_CONSTANTS.md` row Sims 1/6/10
-measured. **[DIFF 5]** The *test* deployment still uses creator 10% with the remainder at
+ancestor 20% / reinforcement 20% of the fee, exactly the `DEPLOY_CONSTANTS.md` row. **[DIFF 5]** The *test* deployment still uses creator 10% with the remainder at
 71.43/28.57 (`FamilyTestBase.CREATOR_BPS/ANCESTOR_BPS/REINFORCE_BPS`), so every fee-split assertion
-in `FeeVault.t.sol` is proven at a split the protocol is not deployed with. The arithmetic is
+in `FeeVault.t.sol` is proven at a split other than the deploy split. The arithmetic is
 split-agnostic, but the suite does not cover the live numbers.
 
 ---
@@ -1334,7 +1287,7 @@ Every position in every family pool is owned by the `Locker`, forever.
   range inside one `unlock`, requires that the parent side is never owed (`ParentOwed`, because the
   Locker holds no parent currency), settles the token side, burns the dust.
 - `depositBid(key, parentAmount, tickLower, tickUpper)`, `BidDeployer` only (`NotBidDeployer`).
-  **Review 5: not payable.** Orientation is derived from the pool's own tick rather than trusted
+  **Not payable.** Orientation is derived from the pool's own tick rather than trusted
   from the caller: entirely above spot ⇒ currency0-only, entirely at or below spot ⇒ currency1-only,
   anything straddling reverts `BidStraddlesSpot`. Every currency this contract ever settles is an
   ERC-20: `WrongValue` and `receive()` are both removed. The child side must never be owed
@@ -1383,16 +1336,12 @@ path through `registerCandidate`/`addCandidate` are every one of them permission
 `submitScore`/`finalize` already were, the adaptive schedule, the closing window and the purse split
 are pure functions of on-chain state that nobody can steer by calling from a particular address. Four
 kinds of address have any privilege at all, and each has a
-short, fixed list of things it may do. **The final external review's fixes (deployHopPot, flushForward,
-deployAncestor's dead-zone bounty, the token-bucket allowance, transitive-adoption checking,
-creator-accrued sweeping, min-of-three pricing, and the dirty-word guard) add none of
-these as functions requiring a role, every one of them is permissionless.** **Review 5 removes one
-of the three privileged addresses**: `DevVesting` and its beneficiary role are deleted along with
-the developer allocation they paid, leaving steward and developer. Both remaining roles are
-**transferable on an identical public delay**, added on top of the sunset switch and the dev claim
-below (design decision 2026-09-11: a single cold-signer hardware wallet for the steward and the
-developer, not a multisig, with pathways to security upgradability if they are needed, this is that
-pathway).
+short, fixed list of things it may do. `deployHopPot`, `flushForward`, `deployAncestor`'s dead-zone bounty, the token-bucket allowance,
+transitive-adoption checking, creator-accrued sweeping, min-of-three pricing, and the dirty-word
+guard are all permissionless. The two privileged addresses are the steward and the developer. Both
+roles are **transferable on an identical public delay**, on top of the sunset switch and the dev
+claim below; each is held by a single cold-signer hardware wallet, and the transfer delay is the
+recovery path if a key must move.
 
 - **steward → `RoundManager.announceSunset(successor)` / `cancelSunset()`, and
   `announceStewardTransfer(to)` / `executeStewardTransfer()` / `cancelStewardTransfer()`, and
@@ -1417,7 +1366,7 @@ pathway).
 - **developer → `FeeVault.claimDev(to)`, and `announceDeveloperTransfer(to)` /
   `executeDeveloperTransfer()` / `cancelDeveloperTransfer()`, and nothing else.** `claimDev`
   withdraws only the 20% $DOLL already accrued to the *current* holder of the role. **The developer
-  address is no longer immutable** (superseding the earlier "no transfer function" design): it moves
+  address is transferable**: it moves
   on the identical `FeeVault.ROLE_TRANSFER_DELAY = 7 days` announce/execute/cancel triple, with the
   same current-holder-announces / anyone-executes / current-holder-cancels shape as the steward
   above. **Disclosure:** the developer ledger is a single balance, not a per-holder one, so whatever
@@ -1427,11 +1376,8 @@ pathway).
   `RoleTransfer.t.sol::test_developerTransferWaitsOutTheDelayAndIsPermissionlessToExecute`,
   `test_accruedDevBalanceIsClaimableByWhoeverHoldsTheRoleAtClaimTime`,
   `test_onlyTheDeveloperAnnouncesOrCancelsAndOnePendingAtATime`.
-- **the `DevVesting` beneficiary role, REMOVED (review 5).** `DevVesting` and
-  `DevVestingDeployer` are deleted from the tree along with the developer allocation they paid; there
-  is no vesting beneficiary anywhere in this deployment.
 - **creators → `FeeVault.claimCreator(token, to)` and `transferCreatorRecipient(token, to)`**, for
-  their own token only (unaffected by this change).
+  their own token only.
 
 **The transfer triple, stated once because it is used by both roles above.** Every
 `announce*Transfer(to)` is current-holder-only, refuses `to == address(0)`, and refuses to overwrite
@@ -1447,10 +1393,10 @@ Complete inventory of every external/public function, by caller check:
 
 | contract | function | caller check | privilege |
 |---|---|---|---|
-| `FamilyFactory` | `registerCandidate`, `wire` | **none** | permissionless launch; `wire()` adopts the genesis token once, inside the same call, computing no curve and no price (review 5, replaces `createGenesis`); review 5b removed the separate public `adoptGenesis(token)` entry point that used to sit alongside `wire()` |
+| `FamilyFactory` | `registerCandidate`, `wire` | **none** | permissionless launch; `wire()` adopts the genesis token once, inside the same call, computing no curve and no price ; there is no separate public adoption entry point |
 | `FamilyFactory` | `curveSpec`, `startFdv`, `genesisToken`, `genesisCreator`, `wired`, immutables | view | - |
 | `FamilyToken` | `burn`, ERC-20 | **none** (own balance only) | holder-initiated burn |
-| `FamilyHook` | `registerPool(PoolKey key, bool isEdge, uint160 initSqrtPriceX96, uint64 tradingStart, uint64 nominalEnd, uint32 scoreSlotS, bool parentIsCurrency0)` | `== factory` | register a key once; cannot re-register (`PoolAlreadyRegistered`). **Review 5:** renamed from `isGenesis`; `isEdge = parent == canonical(0)`, computed once at registration. `GenesisHasNoSnipeWindow` and the `nominalEnd == 0` freeze exemption are both deleted, every registered pool, edge pools included, has a real `tradingStart`/`nominalEnd` and freezes; the protocol fee and the snipe tax stay mutually exclusive per swap through `protocolPpm = (isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` instead (§7.8 restated in `PROPERTIES.md`) |
+| `FamilyHook` | `registerPool(PoolKey key, bool isEdge, uint160 initSqrtPriceX96, uint64 tradingStart, uint64 nominalEnd, uint32 scoreSlotS, bool parentIsCurrency0)` | `== factory` | register a key once; cannot re-register (`PoolAlreadyRegistered`). renamed from `isGenesis`; `isEdge = parent == canonical(0)`, computed once at registration. `GenesisHasNoSnipeWindow` and the `nominalEnd == 0` freeze exemption are both deleted, every registered pool, edge pools included, has a real `tradingStart`/`nominalEnd` and freezes; the protocol fee and the snipe tax stay mutually exclusive per swap through `protocolPpm = (isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` instead (§7.8 restated in `PROPERTIES.md`) |
 | `FamilyHook` | `beforeInitialize`, `beforeAddLiquidity`, `beforeRemoveLiquidity`, `beforeSwap`, `afterSwap`, `beforeDonate` | `== poolManager` | callback authenticity only; the unused `IHooks` entrypoints revert `HookNotImplemented` and their permission bits are not set |
 | `FamilyHook` | `poolInfo`, `scoreState`, `consult`, **`consultSlow`**, `observationCount`, **`slowObservationCount`**, `successorRouter`, **`successorUnresolvable`**, `roundManager` | view (`_successorRouter` caches positively *and negatively* on first use, each leg a 30k-gas staticcall) | - |
 | `Locker` | `placeStandardCurve` | `== factory` | add locked curve liquidity |
@@ -1468,21 +1414,20 @@ Complete inventory of every external/public function, by caller check:
 | `FeeVault` | `accrue` | `== hook` | ledger write |
 | `FeeVault` | `accrueForwarded` | `== a prior vault in this stack's registry chain` (`_isPriorVault`) | book a forwarded $DOLL-edge fee |
 | `FeeVault` | `forwardProtocolFee` | `== address(this)` (`NotSelf`) | one handover hop, `try/catch`-wrapped by `accrue` |
-| `FeeVault` | `depositEdgeBidEarmark` | `== roundManager` | earmark forfeited bonds (review 5: renamed from `depositGenesisBidEarmark`, non-payable ERC-20 deposit) |
-| `FeeVault` | `receiveForward` | **none**, checked against `ledgerTotal[EDGE] <= holdings(EDGE)` | non-payable receipt of a flushed forward (review 5: no longer `{value: amount}`) |
+| `FeeVault` | `depositEdgeBidEarmark` | `== roundManager` | earmark forfeited bonds (renamed from `depositGenesisBidEarmark`, non-payable ERC-20 deposit) |
+| `FeeVault` | `receiveForward` | **none**, checked against `ledgerTotal[EDGE] <= holdings(EDGE)` | non-payable receipt of a flushed forward (no longer `{value: amount}`) |
 | `FeeVault` | **`claimDev`** | **`== developer`** | withdraw the *current* developer's accrued $DOLL |
 | `FeeVault` | **`announceDeveloperTransfer`, `cancelDeveloperTransfer`** | **`== developer`, one pending at a time** | announce/cancel a transfer of the developer role, executable 7 days after announcement |
 | `FeeVault` | **`executeDeveloperTransfer`** | **none** (only once the delay has elapsed) | move the developer role to the announced address |
 | `FeeVault` | **`claimCreator`, `transferCreatorRecipient`** | **`== creatorRecipient(token)`** | withdraw / assign that token's own accrued $DOLL; a transfer sweeps what has already accrued to the OLD recipient's `creatorAccrued` ledger and refuses `to == address(0)` |
 | `FeeVault` | **`claimCreatorAccrued`** | **none** (pays `creatorAccrued[msg.sender]` only) | pull whatever a creator-right transfer swept to the caller before it moved on |
 | `FeeVault` | `redeem` | **none** | permissionless claim-to-balance conversion |
-| `FeeVault` | `consumeAncestorClaim`, `consumeReinforcement`, `consumeEdgeEarmark`, `payKeeper` | **`== bidDeployer` (immutable, `NotBidDeployer`)** | draw an already-owed ledger amount into `deployerCredit`, or pay it out; `BidDeployer` can never move more than a generation's own money (the `deployerCredit` leash). `consumeEdgeEarmark` renamed at review 5 from `consumeGenesisEarmark` |
+| `FeeVault` | `consumeAncestorClaim`, `consumeReinforcement`, `consumeEdgeEarmark`, `payKeeper` | **`== bidDeployer` (immutable, `NotBidDeployer`)** | draw an already-owed ledger amount into `deployerCredit`, or pay it out; `BidDeployer` can never move more than a generation's own money (the `deployerCredit` leash). `consumeEdgeEarmark` renamed from `consumeGenesisEarmark` |
 | `FeeVault` | `claimableAncestor`, `claimableEdge`, **`drawableEdge`, `drawdownWindow`**, `holdings`, `creatorRecipient`, `ancestorPointQueryWad`, **`forwardingFailed`, `successorVault`**, ledger getters | view | - |
-| `BidDeployer` | **`deployAncestor(j, parentAmount)`**, `deployEdgeBid()`, `deployEdgeBid(uint256)`, **`deployHopPot`**, `depositExternalBid` | **none** | permissionless keeper / gift paths (bounty-paid on the first three, none on `depositExternalBid`; `deployHopPot`'s bounty is paid in the parent token, not $DOLL); `deployAncestor`'s destination is `canonical(j)` and is not an argument (§1); each call is `nonReentrant` and every token it draws leaves in the same call. Renamed at review 5 from `deployGenesisBid` |
+| `BidDeployer` | **`deployAncestor(j, parentAmount)`**, `deployEdgeBid()`, `deployEdgeBid(uint256)`, **`deployHopPot`**, `depositExternalBid` | **none** | permissionless keeper / gift paths (bounty-paid on the first three, none on `depositExternalBid`; `deployHopPot`'s bounty is paid in the parent token, not $DOLL); `deployAncestor`'s destination is `canonical(j)` and is not an argument (§1); each call is `nonReentrant` and every token it draws leaves in the same call. Renamed from `deployGenesisBid` |
 | `BidDeployer` | **`dollValueOfParent`, `parentForDollValue`**, `dollPerTokenWad`, `bidCap`, `maxParentForDeploy` | view | - |
-| `FamilyRouter` | `buyExactIn`, `sellExactIn`, `swapPath`, `buyCandidate`, `sellCandidate`, `buyCandidateWithParent` | **none** | attribution only, never fee-privileged; **no `receive()`, no `msg.value` anywhere** (review 5) |
+| `FamilyRouter` | `buyExactIn`, `sellExactIn`, `swapPath`, `buyCandidate`, `sellCandidate`, `buyCandidateWithParent` | **none** | attribution only, never fee-privileged; **no `receive()`, no `msg.value` anywhere** |
 | `FamilyLens` | `roundView`, `candidateView`, `chainView`, `hasPool` | view | - |
-| `DevVesting` / `DevVestingDeployer` | REMOVED (review 5) | - | deleted from the tree along with the developer allocation they paid; there is no vesting beneficiary anywhere in this deployment |
 
 Every non-permissionless entry is either a contract-to-contract authenticity check between immutable
 addresses fixed at deployment (`factory`, `locker`, `feeVault`, `bidDeployer`, `router`,
@@ -1504,8 +1449,8 @@ continued.
 
 One residual centralisation: the hook address is CREATE2-mined from a salt supplied to the factory
 constructor, and the FeeVault / router addresses are passed in as *predictions*. `wire()` proves
-they have code, but not that they are the *intended* code; the deploy script must assert every
-address equality and `deployments/46630.json` must record them.
+they have code, but not that they are the *intended* code; the deploy script asserts every
+address equality and `deployments/<chainid>.json` records them.
 
 ---
 
@@ -1517,7 +1462,7 @@ Two independent accumulators live in `FamilyHook.RegisteredPool`.
 exactly four slots instead of the pre-optimization layout's larger footprint:
 
 ```
-slot 0: registered, isEdge, parentIsCurrency0, frozen, tradingStart, tradingEnd, tFrozenAt   (every flag/window a swap READS; one SLOAD, one SSTORE on freeze; isEdge renamed from isGenesis at review 5)
+slot 0: registered, isEdge, parentIsCurrency0, frozen, tradingStart, tradingEnd, tFrozenAt   (every flag/window a swap READS; one SLOAD, one SSTORE on freeze; isEdge renamed from isGenesis)
 slot 1: R, tLast                                                                                  (the score-rate pair every accumulation writes together)
 slot 2: acc                                                                                        (needs the whole word — see ranges below)
 slot 3: cumSqrtP, tObs                                                                             (the observation pair every price update writes together)
@@ -1642,8 +1587,7 @@ What a hook bug means in practice, by blast radius:
   entirely (e.g. a mis-set `onlyBidDeployer` leash), permanently; there is no rescue path and no
   setter to repoint either address.
 
-Beyond continuation, the only recovery is social. That is a disclosed, accepted risk, and the
-strongest argument for a third-party audit before mainnet.
+Beyond continuation, the only recovery is social. That is a disclosed, accepted risk.
 
 ---
 
@@ -1657,7 +1601,7 @@ strongest argument for a third-party audit before mainnet.
    gifts) and can never be withdrawn by anyone.
 4. A trader pays the 1% protocol fee exactly once per traversal of an edge pool (a pool whose parent
    is canonical index 0), regardless of route depth, EXCEPT during that pool's own 3-second snipe
-   window, where the edge fee is suppressed rather than summed with the snipe tax (review 5);
+   window, where the edge fee is suppressed rather than summed with the snipe tax;
    family↔family hops pay only `hopFeePpm`. A full-line route costs `1% + hops · 7.5 bps` outside the
    snipe window (design analysis: 1.75% at 10 links, 8.50% at 100 links).
 5. `dev + creator + ancestorSleeve + reinforcement == protocolFee` exactly, per fee.
@@ -1684,8 +1628,8 @@ strongest argument for a third-party audit before mainnet.
    such floor (`Depth.t.sol`). Floored Fenwick coefficients still leave a few wei per fee
    permanently unclaimable in the vault, that is invariant 6 and it is what makes solvency hold by
    construction.
-10. `H ≤ 25%` of the standard curve's absorption at the wall FDV (the brief's reachability
-    invariant; `curves.assert_threshold_below_max_absorption`). Design analysis shows it is necessary and
+10. `H ≤ 25%` of the standard curve's absorption at the wall FDV (the reachability
+    invariant). Design analysis shows it is necessary and
     **not sufficient**: it bounds the average while the round consumes the total (9.0× at MID).
 11. Score is refundable: no sunk slice, no lock, no seasoning, so slot capture costs approximately
     the round-trip fee (design analysis: 0.15% of capital cycled). Disclosed, not mitigated.
@@ -1694,19 +1638,8 @@ strongest argument for a third-party audit before mainnet.
 
 ## Q. Contract invariants and the tests that assert them
 
-**Review 5 note:** the genesis-launch tests this table cites (`Genesis.t.sol`, `GenesisCurve.t.sol`,
-`DevAllocation.t.sol`, `DevVesting.t.sol`) are deleted along with `createGenesis`, the genesis curve
-and `DevVesting`; the mechanisms they tested are described as removed or restated elsewhere in this
-document (§A, §B, §B.1, §D, §E). The rows below are kept as the historical record of what the
-pre-review-5 tree asserted; the claim text for genesis-specific rows is corrected where it is now
-simply false, but the test-file citations are not individually re-verified against `HEAD`.
-
-**Current totals (review 5, tag `review-5`):** 346 passed, 0 failed, 1 skipped across 52 suites,
-plus 30 fork tests recorded separately (`docs/security/FORK_RESULTS.md`) and 54 keeper
-decision tests run against the reference operator implementation (out of scope for this
-package). The
-paragraphs after the table below are the test-tree history of EARLIER trees and are kept as a
-record; none of them describes `HEAD`.
+**Totals:** 346 passed, 0 failed, 1 skipped across 52 suites, plus 30 fork tests recorded
+separately (`docs/security/FORK_RESULTS.md`).
 
 | invariant | asserted by |
 |---|---|
@@ -1720,19 +1653,14 @@ record; none of them describes `HEAD`.
 | **The deterministic fallback is refused before the timeout, and an unrelayed beacon ends the round at `T` loudly, even if nobody ever requested the end** | `Schedule.t.sol::test_theDeterministicFallbackIsRefusedBeforeTheTimeout`, `test_anUnrelayedBeaconEndsTheRoundAtTLoudly`, `test_theFallbackWorksEvenIfNobodyEverRequestedTheEnd` |
 | **The drand verifier checks real, live beacons on chain, refuses a wrong round or a tampered signature, and always pins a future round** | `Drand.t.sol::test_svdwConstantsAreConsistent`, `test_realSignaturesAreOnTheCurve`, `test_hashToPointLandsOnTheCurve`, `test_realBeaconVerifies`, `test_aSecondRealBeaconVerifies`, `test_aBeaconForAnotherRoundIsRefused`, `test_aTamperedSignatureIsRefused`, `test_pinIsAlwaysInTheFuture`, `test_fulfilBeforeTheBeaconExistsIsRefused`, `test_unknownIdIsRefused` |
 | **The purse is locked under the trunk coin of its generation, in one bid, and a losing sibling never receives purse liquidity** | `Purse.t.sol::test_thePurseIsDeployedUnderTheTrunkCoin`, `test_aLosingSiblingNeverReceivesPurseLiquidity`, `test_theDestinationIsNotAKeeperChoice`, `fork/Purse.fork.t.sol::testFork_PUR02_thePurseGoesToTheTrunkAndLosersGetNothing` |
-| **Index 0 (`j == 0`) and an uncrowned generation are refused (review 5: `NoPoolAtIndex` / `UnknownGeneration`); the amount conserves; the daily bucket and the bounty rule are unchanged** | `Purse.t.sol::test_genesisIsNotAnAncestorDeployment`, `test_anUnknownGenerationIsRefused`, `test_theAmountConserves`, `test_theDailyBucketStillBounds`, `test_theBountyRuleIsUnchanged` |
-| Fixed supply, no mint | `Invariants.t.sol::invariant_supplyIsConstant`; `Genesis.t.sol::test_supplyIsEntirelyLocked` |
+| **Index 0 (`j == 0`) and an uncrowned generation are refused (`NoPoolAtIndex` / `UnknownGeneration`); the amount conserves; the daily bucket and the bounty rule are unchanged** | `Purse.t.sol::test_genesisIsNotAnAncestorDeployment`, `test_anUnknownGenerationIsRefused`, `test_theAmountConserves`, `test_theDailyBucketStillBounds`, `test_theBountyRuleIsUnchanged` |
+| Fixed supply, no mint | `Invariants.t.sol::invariant_supplyIsConstant` |
 | Locker positions never shrink | `Invariants.t.sol::invariant_lockedPositionsNeverDecrease` |
-| Only the Locker may add liquidity | `Genesis.t.sol::test_addLiquidityRevertsForNonLocker` |
-| Liquidity can never be removed | `Genesis.t.sol::test_removeLiquidityAlwaysReverts`, `test_lockerHasNoExit` |
-| Donations refused | `Genesis.t.sol::test_donateReverts` |
-| Only factory-registered keys initialize, at the registered price | `Genesis.t.sol::test_initializeRevertsForUnregisteredKey`, `test_initializeRevertsAtWrongPrice`, `test_poolIsRegisteredAndPriced`, `test_registerPoolOnlyFactory` |
-| Genesis adoption is once-only, inside `wire()` (review 5: replaces `createGenesis`; review 5b: adoption moved off the separate public `adoptGenesis(token)` entry point, and the creator attribution is fixed at construction rather than written by whoever calls it) | `Review5.t.sol::test_adoptionHappensOnceInsideWiringAndCreditsTheDeployer` |
-| **REMOVED (review 5): there is no genesis curve.** Adoption computes no curve and places no pool; caller-independence is trivial since `wire()`'s outcome, including the `genesisCreator` attribution, does not depend on who calls it (review 5b) | `Review5.t.sol::test_adoptionHappensOnceInsideWiringAndCreditsTheDeployer`, `test_indexZeroHasNoPoolAndEveryConsumerGuardsOnIt` |
-| **A half-deployed stack cannot be launched into** | `GenesisCurve.t.sol::test_wireRefusesAHalfDeployedStack` |
-| Curve ranges contiguous and token-only | `Genesis.t.sol::test_curveRangesAreContiguousAndTokenOnly`; `CurveMath.t.sol::test_rangeHoldsItsShare` |
+| Genesis adoption is once-only, inside `wire()` (there is no separate public adoption entry point, and the creator attribution is fixed at construction rather than written by whoever calls it) | `Review5.t.sol::test_adoptionHappensOnceInsideWiringAndCreditsTheDeployer` |
+| **REMOVED: there is no genesis curve.** Adoption computes no curve and places no pool; caller-independence is trivial since `wire()`'s outcome, including the `genesisCreator` attribution, does not depend on who calls it | `Review5.t.sol::test_adoptionHappensOnceInsideWiringAndCreditsTheDeployer`, `test_indexZeroHasNoPoolAndEveryConsumerGuardsOnIt` |
+| Curve ranges contiguous and token-only | `CurveMath.t.sol::test_rangeHoldsItsShare` |
 | Curve closed form `s·sqrt(Fa·Fb)` | `CurveMath.t.sol::test_buyingOutARangeCostsSqrtFaFb`, `test_fdvRoundTrip`, `test_higherFdvIsLowerTick` |
-| Bond required to register | `Genesis.t.sol::test_registerCandidateRequiresTheBond`; `Round.t.sol::test_registrationEscrowsBondsAndOpensTheRound` |
+| Bond required to register | `Round.t.sol::test_registrationEscrowsBondsAndOpensTheRound` |
 | Chain-depth limit refused at registration (L6) | `RoundGuards.t.sol::test_registrationRefusesToExceedTheChainDepthLimit` |
 | **Bond doubles with depth, is capped, and is refunded/forfeited at the amount actually posted (F6)** | `Depth.t.sol::test_bondDoublesEveryFourLinksAndIsCapped`, `test_theBondIsEnforcedRefundedAndForfeitedAtTheScheduledAmount` |
 | **The beta depth cap `MAX_INDEX` refuses the round that would go past it** | `Depth.t.sol::test_maxIndexRefusesTheRoundThatWouldGoPastIt` |
@@ -1750,7 +1678,7 @@ record; none of them describes `HEAD`.
 | Burning head supply lowers `H` (L10, documented) | `RoundGuards.t.sol::test_burningHeadSupplyLowersThreshold` |
 | Next round is quoted in the new head | `Round.t.sol::test_secondRoundIsQuotedInTheNewHead` |
 | ≤1 winner per index; append-only history with consistent reverse index | `Invariants.t.sol::invariant_canonicalHistoryIsAppendOnly` |
-| Protocol fee only on an edge pool, once per edge leg, suppressed during that pool's own snipe window (review 5) | `Fees.prop::testFuzz_FEE01_oneEdgeFeePerTraversal`; `Invariants.prop::invariant_FEE08_familyLedgersAreHopFeesOnly` |
+| Protocol fee only on an edge pool, once per edge leg, suppressed during that pool's own snipe window | `Fees.prop::testFuzz_FEE01_oneEdgeFeePerTraversal`; `Invariants.prop::invariant_FEE08_familyLedgersAreHopFeesOnly` |
 | Fee correct for exact-in and exact-out, on either side | `Swap.t.sol::test_buyExactIn_chargesEthSideFees`, `test_sellExactIn_chargesEthSideFees`, `test_buyExactOut_chargesEthSideFees` |
 | **Exact-output SELLS are grossed up to the same fee basis as exact-in (F9)** | `Swap.t.sol::test_sellExactOut_chargesTheSameFeeBasisAsExactIn` |
 | **The snipe tax is identical in both swap modes, decays to the hop fee alone, and an exact-output swap at ≥100% total rate is refused** | `SnipeTax.t.sol::test_snipeTaxIdenticalForExactInAndExactOut`, `test_afterWindowBothModesPayOnlyTheHopFee`, `test_exactOutRevertsWhenRatesReachOneHundredPercent` |
@@ -1763,7 +1691,7 @@ record; none of them describes `HEAD`.
 | **Candidate trades split the creator share 50/50 with the head creator, during the round only** | `RouterGuards.t.sol::test_candidateBuySplitsTheCreatorShareWithTheHeadCreator`, `test_canonicalBuyPaysTheWholeCreatorShareToThatLinksCreator`, `test_losingCandidateCreatorKeepsTheirHalf` |
 | Vault solvency in every currency | `Invariants.t.sol::invariant_vaultIsSolvent` |
 | **Keeper model: parent from the keeper, priced by the TWAP chain, no swap** | `FeeVault.t.sol::test_deployAncestorBuysParentFromTheKeeperAndLocksTheBid`, `test_deployAncestorDoesNotSwap` |
-| **Sleeve and 2%-of-active-range caps; partial pot draws (review 5: `deployEdgeBid`, four pots)** | `FeeVault.t.sol::test_deployAncestorRespectsSleeveAndSizeCap`, `Review5.t.sol::test_deployEdgeBidFundsFromAllFourPots` |
+| **Sleeve and 2%-of-active-range caps; partial pot draws (`deployEdgeBid`, four pots)** | `FeeVault.t.sol::test_deployAncestorRespectsSleeveAndSizeCap`, `Review5.t.sol::test_deployEdgeBidFundsFromAllFourPots` |
 | **TWAP must actually cover the window and have ≥2 observations (M2)** | `FeeVault.t.sol::test_deployRevertsWhenTheTwapIsNotReady`, `test_deployAncestorRevertsOutsideTheTwapBand` |
 | **A 30-minute pump cannot raise, and a crash immediately lowers, what the sleeve pays: every link is priced at `min(spot, TWAP_30m, TWAP_7d)` (F4, audit 1)** | `Keeper.t.sol::test_aThirtyMinutePumpCannotRaiseWhatTheSleevePays`, `test_aCrashedConversionPoolIsPricedAtSpot` |
 | **A pool without a 7-day average is priced on the fast one and says so (`SlowTwapUnavailable`)** | `Keeper.t.sol::test_aYoungPoolPricesOnTheFastAverageAndSaysSo` |
@@ -1776,7 +1704,7 @@ record; none of them describes `HEAD`.
 | **Every deployed contract, `BidDeployer` included, fits under the EIP-170 runtime limit** | `CodeSize.t.sol::test_everyDeployedContractFitsUnderEip170` |
 | **`Locker.depositBid` and `FeeVault`'s four keeper hooks accept only `BidDeployer`** | `Bid.t.sol`, `FeeVault.t.sol` `NotBidDeployer`/`onlyBidDeployer` assertions |
 | **The FeeVault/BidDeployer address-prediction handshake fails loudly if deployed out of order** | `BidDeployer` constructor checks (`NoCode`, `NotWired`), `test_deployAncestorBuysParentFromTheKeeperAndLocksTheBid` setup |
-| Router: multi-hop, slippage, depth cap, family-only path, $DOLL-only (review 5: no native leg) | `Router.t.sol::test_buyAndSellThroughThreeLinks`, `test_minOutReverts`, `test_depthCapRejectsTooManyHops`, `test_swapPathBetweenFamilyLinks` |
+| Router: multi-hop, slippage, depth cap, family-only path, $DOLL-only (no native leg) | `Router.t.sol::test_buyAndSellThroughThreeLinks`, `test_minOutReverts`, `test_depthCapRejectsTooManyHops`, `test_swapPathBetweenFamilyLinks` |
 | **Router value checks, no sweepable native balance, round-trip output, mid-route partial fill (M1/M5/L12)** | `RouterGuards.t.sol::test_routerHeldEthCannotBeSwept`, `test_roundTripPathReportsItsOutput`, `test_midRoutePartialFillSettlesEveryCurrency` |
 | **Candidate routes exist and are round-gated (M4)** | `RouterGuards.t.sol::test_buyAndSellCandidateWithEth`, `test_unknownCandidateIsRejected` |
 | **Sunset is steward-only, once, 7 days, contract-successor, and changes nothing else** | `Sunset.t.sol::test_onlyTheStewardMayAnnounce`, `test_announceIsOnceAndForever`, `test_successorMustBeAContract`, `test_zeroStewardMeansNoSunsetIsPossible`, `test_theDelayIsSevenDaysAndRoundsOpenThroughout`, `test_aRoundOpenWhenTheSunsetLandsStillFinishesAndCrowns`, `test_openingANewRoundRevertsAfterTheSunset`, `test_everythingElseKeepsWorkingAfterTheSunset` |
@@ -1787,7 +1715,7 @@ record; none of them describes `HEAD`.
 | **Handover: the edge forwards after sunset, stays before it, queues rather than books locally on a broken successor, and only a prior vault may push it** | `Continuation.t.sol::test_afterTheHandoverTheEdgeIsBookedByV2AndAttributedToItsCreator`, `test_beforeTheHandoverTheEdgeStaysInV1sVaultUnattributed`, `test_v1DevClaimsAccruedBeforeTheHandoverSurviveIt`, `test_theEdgeForwardsTwoHopsFromV1ThroughV2ToV3`, `test_aBrokenSuccessorQueuesInsteadOfBookingLocally`, `test_accrueForwardedOnlyAcceptsAPriorVaultInTheChain` |
 | Score and observation accumulators advance | `Swap.t.sol::test_scoreAndObservationAccumulate` |
 | Lens views (paginated round, chain view) | `Round.t.sol::test_lensViews` |
-| Gas envelopes (logged, not asserted; pre-review-5 names, see `docs/DEPLOY_CONSTANTS.md`) | `test_gas_swapBuyExactIn`, `test_gas_roundLifecycle`, `test_gas_routedThreeHopBuy`, `test_gas_deployAncestor`, `test_gas_deployAncestorConsultChain`, `test_gas_announceSunset` |
+| Gas envelopes (logged, not asserted) | `test_gas_swapBuyExactIn`, `test_gas_roundLifecycle`, `test_gas_routedThreeHopBuy`, `test_gas_deployAncestor`, `test_gas_deployAncestorConsultChain`, `test_gas_announceSunset` |
 | **A continuation cannot adopt through an unadopted intermediate, and an unadopted continuation cannot announce its own sunset (audit 2)** | `Continuation.t.sol::test_v3CannotAdoptThroughAnUnadoptedV2`, `test_adoptionRefusesASunsetButUnadoptedPrior` |
 | **`sunsetDelay` is a constructor parameter, floored at `MIN_SUNSET_DELAY`, mainnet 7 days / testnet 1 hour** | `Continuation.t.sol::test_sunsetDelayIsAConstructorParameter` |
 | **A post-sunset swap with too little gas queues the fee instead of booking it locally, and a permissionless flush delivers it; the queue reaches a sixth version through one flush per hop (audit 4)** | `Continuation.t.sol::test_aLowGasPostSunsetSwapQueuesTheEdgeAndAFlushDeliversIt`, `test_theEdgeReachesTheSixthVersionThroughFlushes`, `test_aBrokenSuccessorQueuesInsteadOfBookingLocally` |
@@ -1795,82 +1723,12 @@ record; none of them describes `HEAD`.
 | **The keeper bounty is floored at `MIN_BOUNTY_DOLL` and capped at 20% of the $DOLL a call consumes (audit 5)** | `Keeper.t.sol::test_theBountyFloorIsPaidAtRunTwoSizes`, `test_belowTheFloorTheBountyIsCappedAtTwentyPercent` |
 | **`deployHopPot` deploys the terminal generation's hop pot with no separate $DOLL entitlement, permissionless (audit 3)** | `Keeper.t.sol::test_theHeadsHopPotDeploysWithNoEthEntitlement` |
 | **The drawdown allowance is a continuously refilling token bucket, not a resetting window (audit 6)** | `Keeper.t.sol::test_theDailyDrawdownLimitBindsAndRefills` |
-| **REMOVED (review 5): there is no native settlement anywhere in the router or the Locker to break.** | - |
+| **REMOVED: there is no native settlement anywhere in the router or the Locker to break.** | - |
 | **A dirty-word successor answer is treated as no answer, not a reverting `abi.decode` (audit 7A)** | `Sunset.t.sol::test_aDirtyWordSuccessorCannotBrickRoutes` |
 | **A creator-right transfer leaves what already accrued with the old recipient (`creatorAccrued`/`claimCreatorAccrued`) and rejects the zero address** | `FeeVault.t.sol::test_transferringTheCreatorRightLeavesAccruedFeesBehind` |
 | **A v4 protocol-fee accrual (if the controller ever configures one) is subtracted from the score, not counted as absorption (audit 9)** | `HookScore.t.sol::test_aV4ProtocolFeeDoesNotInflateTheScore` |
 | **Candidate routes stay hop-capped and attributed after the round, walking the round's recorded parent (audit 8)** | `RouterGuards.t.sol::test_candidateRoutesAreHopCapped` |
-| **The vesting schedule releases nothing before the cliff, unlocks the amount accrued since `start` at the cliff, is linear onward, and never pays more than the allocation** | `DevVesting.t.sol::test_nothingVestsBeforeTheCliff`, `test_theCliffUnlocksWhatAccruedSinceStart`, `test_linearBetweenCliffAndEnd`, `test_everythingVestedAtTheEndAndNeverMore`, `test_releaseTwicePaysTheDeltaOnly` |
-| **The genesis developer allocation is 3% of supply, minted to the vesting contract, and candidates get none** | `DevAllocation.t.sol::test_genesisSupplyIsConserved`, `test_vestingIsWiredToTheGenesisTokenAndTheDeveloper`, `test_theAllocationVestsOnTheAnnouncedSchedule`, `test_candidatesHaveNoAllocationAtAll`, `test_genesisEmitsTheDevAllocationEvent` |
-| **The steward, developer and vesting-beneficiary roles each move on an identical 7-day announce/permissionless-execute/cancel delay, and no new power appears when they do** | `RoleTransfer.t.sol::test_stewardTransferWaitsOutTheDelayAndIsPermissionlessToExecute`, `test_sunsetPowersFollowTheNewSteward`, `test_onlyTheStewardAnnouncesOrCancelsAndOnePendingAtATime`, `test_developerTransferWaitsOutTheDelayAndIsPermissionlessToExecute`, `test_accruedDevBalanceIsClaimableByWhoeverHoldsTheRoleAtClaimTime`, `test_onlyTheDeveloperAnnouncesOrCancelsAndOnePendingAtATime`, `DevVesting.t.sol::test_beneficiaryTransferWaitsOutTheDelay` |
 | **The factory's deployment transaction stays under the EIP-3860 initcode limit with the `DevAllocation` argument added** | `CodeSize.t.sol::test_factoryDeploymentTransactionFitsUnderEip3860` |
-| **`DevVesting` and `DevVestingDeployer` fit under EIP-170 alongside the rest of the deployed stack** | `CodeSize.t.sol::test_everyDeployedContractFitsUnderEip170` |
-
-`forge test` at the tree that adds the adaptive round mechanism (the adaptive schedule, the random end, the
-contestable purse): **226 passed, 0 failed** across **27 suites**: three new: `Schedule.t.sol` (21
-tests: the duration/registration/late-entry/closing-window schedule, the checkpoint rings, the
-request/fulfil/timeout end lifecycle), `Drand.t.sol` (10 tests: the BN254 verifier against two real,
-live beacons plus refusal cases), `Purse.t.sol` (12 tests: ranking, the top-2 split, staleness and
-edge weights, all rewritten in review 3 for the uncontested purse), superseding the 183-test, 24-suite tree below. No existing test was changed, renamed
-or removed for this tranche; `RoundManager`, `FamilyHook` and `BidDeployer` each gained the new
-functions described in §A/§C/§F/§J, with no behaviour change to anything that predates them.
-
-`forge test` at the tree that adds the developer vesting allocation and the role-transfer paths:
-**183 passed, 0 failed** across **24 suites** (Bid 8, **CodeSize 2**, Continuation 24, CurveMath 4,
-DeployConstants 3, Depth 4, **DevAllocation 5**, **DevVesting 9**, FeeVault 19, Genesis 13,
-GenesisCurve 3, HookScore 8, Invariants 1, Keeper 8, Mirrored 3, **RoleTransfer 6**, Round 13,
-RoundGuards 3, Router 7, RouterGuards 15, SnipeTax 2 + SnipeTaxCeiling 1, Sunset 14, Swap 8), superseding the 162-test, 21-suite tree that closed the gas-optimization pass. `CodeSize` gains a
-second test (`test_factoryDeploymentTransactionFitsUnderEip3860`, §T) alongside the existing
-`test_everyDeployedContractFitsUnderEip170`, which now also asserts `DevVesting` and
-`DevVestingDeployer` fit under EIP-170. The three new suites are entirely additive, no existing test
-was changed, renamed or removed for this tranche, and no behaviour change is intended or observed
-outside the new vesting contract and the three new transfer-triple functions on `RoundManager` and
-`FeeVault`.
-
-`forge test` at the tree after the gas-optimization pass: **162 passed, 0 failed** across the same
-21 suites as the 160-test tree (Bid 8, CodeSize 1, Continuation 24, CurveMath 4, DeployConstants 3,
-Depth 4, **FeeVault 19**, Genesis 13, GenesisCurve 3, HookScore 8, Invariants 1, Keeper 8, Mirrored
-3, Round 13, RoundGuards 3, Router 7, RouterGuards 15, SnipeTax 2 + SnipeTaxCeiling 1, Sunset 14,
-Swap 8), with no behaviour change intended or observed. The two added tests both close the run-3
-sizing-view finding (§J, `BidDeployer.maxParentForDeploy`) and land in `FeeVault.t.sol`:
-`test_maxParentForDeployIsTheRealMaximumBelowTheBountyFloor` (the view's quote is the real maximum
-in every branch of the piecewise bounty inverse, not just the proportional one) and
-`test_deployAncestorAcceptsTheBelowFloorQuote` (the quote a below-floor allowance produces is fed
-straight into a real `deployAncestor` and accepted).
-
-`forge test` at the tree that closes the final external contract review: **160 passed, 0 failed** across the same
-21 suites as the 145-test tree (Bid 8, CodeSize 1, **Continuation 24**, CurveMath 4,
-DeployConstants 3, Depth 4, **FeeVault 17**, Genesis 13, GenesisCurve 3, **HookScore 8**, Invariants 1,
-**Keeper 8**, Mirrored 3, Round 13, RoundGuards 3, Router 7, **RouterGuards 15**, SnipeTax 2 +
-SnipeTaxCeiling 1, **Sunset 14**, Swap 8), no new suite file this tranche, all fifteen new tests land
-inside existing suites, one per finding of the final external contract review:
-
-- **`Continuation`** 19 → 24 (+5): the transitive adoption guard
-  (`test_v3CannotAdoptThroughAnUnadoptedV2`, `test_adoptionRefusesASunsetButUnadoptedPrior`, audit 2),
-  `sunsetDelay` as a constructor parameter (`test_sunsetDelayIsAConstructorParameter`, audit 2), and
-  the queue-and-flush forwarding model replacing local booking
-  (`test_aLowGasPostSunsetSwapQueuesTheEdgeAndAFlushDeliversIt`,
-  `test_theEdgeReachesTheSixthVersionThroughFlushes`, audit 4), `test_aBrokenSuccessorFallsBackToBookingLocally`
-  is renamed `test_aBrokenSuccessorQueuesInsteadOfBookingLocally` to match the new behaviour, not an
-  added test.
-- **`Keeper`** 3 → 8 (+5): `test_aCrashedConversionPoolIsPricedAtSpot` (min-of-three pricing, audit
-  1), `test_theBountyFloorIsPaidAtRunTwoSizes` / `test_belowTheFloorTheBountyIsCappedAtTwentyPercent`
-  (`MIN_BOUNTY_WEI`, renamed `MIN_BOUNTY_DOLL` at review 5, + the 20% ceiling, audit 5), `test_theHeadsHopPotDeploysWithNoEthEntitlement`
-  (`deployHopPot`, audit 3), `test_theDailyDrawdownLimitBindsAndResets` is renamed
-  `test_theDailyDrawdownLimitBindsAndRefills` to match the token-bucket allowance (audit 6).
-- **`Sunset`** 12 → 14 (+2): `test_aSuccessorSyncingAnErc20DoesNotBreakNativeSettlement`
-  (`sync(native)` before native settlement, audit 7B) and
-  `test_aDirtyWordSuccessorCannotBrickRoutes` (raw-word validation instead of a reverting
-  `abi.decode`, audit 7A).
-- **`FeeVault`** 16 → 17 (+1): `test_transferringTheCreatorRightLeavesAccruedFeesBehind`
-  (`creatorAccrued` / `claimCreatorAccrued`, zero-address rejected).
-- **`HookScore`** 7 → 8 (+1): `test_aV4ProtocolFeeDoesNotInflateTheScore` (audit 9).
-- **`RouterGuards`** 14 → 15 (+1): `test_candidateRoutesAreHopCapped`, extended to cover a
-  post-round candidate route (audit 8).
-
-Earlier tranches added `Depth.t.sol` (F3/F6, the bond schedule and `MAX_INDEX`), `SnipeTax.t.sol`
-(F9), `CodeSize.t.sol` (the EIP-170 regression) and `DeployConstants.t.sol` (the locked deploy
-constants); those suite counts are unchanged in this tranche.
 
 **Invariant campaign (M6).** `foundry.toml` sets `runs = 32`, `depth = 64`, `fail_on_revert = false`
 , 2048 calls, 6 reverts in the last run. Because a handler that silently swallows every revert can
@@ -1887,18 +1745,17 @@ twice pays twice.
 
 ## R. Known unavoidable risks (measured)
 
-Numbers are the MID deploy configuration at the 900 s window, per design analysis at deploy-configuration
-lock (2026-09-10), consistent with the property-test and fork evidence in §S, unless a row says otherwise.
+Numbers are the MID deploy configuration at the 900 s window, per design analysis at the deploy configuration, consistent with the property-test and fork evidence in §S, unless a row says otherwise.
 
-**Review 5 risks (2026-09-14), new with the external genesis:**
+**Risks of the external genesis:**
 
 | risk | measured number | source |
 |---|---|---|
-| **Pons is a hard external dependency for entry and exit.** The chain this protocol owns functions internally without it (swaps, fees, rounds, keeper deployments all run) but it has no door: the only way in or out of $DOLL itself is the external venue it graduated on, which this stack never calls and cannot influence | design decision (2026-09-14) |
-| **`BOND_BASE`/`BOND_MAX` and `MIN_BOUNTY_DOLL` are set against a price that is hours old.** Both are immutable constructor arguments calibrated from the graduated Pons price at deploy time; if that price moves sharply before or shortly after deployment, the bond and the bounty floor are mispriced for the life of the deployment. The only fix is a continuation deployment (§J "Continuation") | design decision (2026-09-14) |
+| **Pons is a hard external dependency for entry and exit.** The chain this protocol owns functions internally without it (swaps, fees, rounds, keeper deployments all run) but it has no door: the only way in or out of $DOLL itself is the external venue it graduated on, which this stack never calls and cannot influence | design |
+| **`BOND_BASE`/`BOND_MAX` and `MIN_BOUNTY_DOLL` are set against a price that is hours old.** Both are immutable constructor arguments calibrated from the graduated Pons price at deploy time; if that price moves sharply before or shortly after deployment, the bond and the bounty floor are mispriced for the life of the deployment. The only fix is a continuation deployment (§J "Continuation") | design |
 | **The vault's $DOLL balance can be inflated by an unsolicited donation.** Solvency is checked as `ledgerTotal[EDGE] <= holdings(EDGE)`, an inequality, so a donation cannot break it; but a donation is never credited to any ledger and is never sweepable by any function, it simply sits, permanently unclaimable, the same shape as the Fenwick sleeve's floored residue (§J) | `Review5.t.sol::testFuzz_aVaultDonationIsNeverSweepable` |
-| **The 3-second edge-fee suppression is a small, bounded fee loss.** A round-one pool is both edge (1%) and snipe-taxed (99% falling to 1%) for its own first 3 seconds; `protocolPpm` is zero for that whole window rather than summed with the snipe tax, so the protocol forgoes the edge fee on whatever trades happen in those 3 seconds. Bounded in size (3 seconds, one pool, once per link-one launch) and in kind (a fee never charged, not a fee lost after collection) | design decision (2026-09-14) |
-| **An external token that changes behaviour would break the chain's door.** This design assumes the adopted genesis token is a plain ERC-20 with no pause, no fee-on-transfer, no blacklist, no transfer hook and no upgradeable logic. **Review 5b:** this was verified, not merely assumed, by reading the Pons V2 launcher token source in full: it is a plain ERC-20 (with holder-initiated burn) overriding no transfer or update path, immutable and unadministered, minted once at construction; supply can only fall, through holder burns, never rise. Adoption itself checks decimals and total supply only; it cannot verify the token's future behaviour, and a continuation deployment could be pointed at a different edge currency that does not hold to this assumption, which would not be caught by any on-chain guard | assumption, verified against the deployed token source at review 5b |
+| **The 3-second edge-fee suppression is a small, bounded fee loss.** A round-one pool is both edge (1%) and snipe-taxed (99% falling to 1%) for its own first 3 seconds; `protocolPpm` is zero for that whole window rather than summed with the snipe tax, so the protocol forgoes the edge fee on whatever trades happen in those 3 seconds. Bounded in size (3 seconds, one pool, once per link-one launch) and in kind (a fee never charged, not a fee lost after collection) | design |
+| **An external token that changes behaviour would break the chain's door.** This design assumes the adopted genesis token is a plain ERC-20 with no pause, no fee-on-transfer, no blacklist, no transfer hook and no upgradeable logic. This is verified, not merely assumed, by reading the Pons V2 launcher token source in full: it is a plain ERC-20 (with holder-initiated burn) overriding no transfer or update path, immutable and unadministered, minted once at construction; supply can only fall, through holder burns, never rise. Adoption itself checks decimals and total supply only; it cannot verify the token's future behaviour, and a continuation deployment could be pointed at a different edge currency that does not hold to this assumption, which would not be caught by any on-chain guard | assumption, verified against the deployed token source |
 
 | risk | measured number | source |
 |---|---|---|
@@ -1906,35 +1763,29 @@ lock (2026-09-10), consistent with the property-test and fork evidence in §S, u
 | Dynastic capture | the dynastic-incumbent variant can end the round with a mark-to-market gain, capture is not even a cost | design analysis |
 | Last-second spikes | a late spike tops the round **0%** of the time; one second of capital contributes 1/900 of itself to the average | design analysis |
 | Block-1 snipers | the 99% tax prices the sweep, it does not forbid it: 98% of first-second fills with the tax on, mean **+$445/round** P&L (vs $8,110 with the tax off), at $311/round of tax paid | design analysis (MID) |
-| Win-then-dump | no lock, no seasoning: a winner may sell immediately | design decision |
+| Win-then-dump | no lock, no seasoning: a winner may sell immediately | design |
 | Weak old links as routing bottlenecks | after a 99% dump at #6 the full line costs **57.7%** (vs 13.1% healthy); best-routing through an external venue brings it to 10.8% | design analysis (MID) |
 | Reinforcement is not a shock absorber | three rounds of sleeve = 0.713% of #6's parent reserve, moving a 99%-dump drawdown 94.6% → 94.6%; even at the 2% cap, 94.5% | design analysis |
 | Embedded parent released on the way down | every descendant of a dumped link inherits the drawdown through the telescoping price product; ancestors untouched | design analysis |
 | Wall discontinuity | at 66% of float a wall-shaped curve takes **4.0%** off FDV in one clip, 8.24× trend; the cliff is computable in advance from the deploy constants by anyone | design analysis |
-| External pools bypass the edge fee | BEST and DEPTH_CAPPED(5) send **100%** of quoted deep routes to an external market, the mitigation and the revenue leak are one mechanism. Review 5 makes this structural at the door itself: entering or leaving canonical index 0 always happens on Pons, entirely outside this protocol's fee accounting | design analysis |
+| External pools bypass the edge fee | BEST and DEPTH_CAPPED(5) send **100%** of quoted deep routes to an external market, the mitigation and the revenue leak are one mechanism. This is structural at the door itself: entering or leaving canonical index 0 always happens on Pons, entirely outside this protocol's fee accounting | design analysis |
 | Deep routes degrade on impact, not fees | full-line effective loss rises 17.14% → **67.17%** from 10 to 100 links at a constant 0.5%-of-FDV trade | design analysis (MID) |
 | Hop fee is the ceiling on chain length | at 7.5 bps a 100-hop route pays 7.5% in hop fees, the same order as the edge fee itself | design analysis |
 | Curve vs threshold | at h = 0.15% the median MID winner ends the round with 60.2% of float sold, having absorbed 9.0× the threshold in total | design analysis (MID) |
 | **Closing-window sniper** | a **window sniper**: capital equal to the leader's, bought at the start of the closing window `W` and held, beats a leader still spreading its buys ≈82% of the time in a 4-hour round and ≈93% of 15-minute rounds, fixed or random end alike. This is the closing-window rule working exactly as defined (highest average at the end wins; late money that stays counts fully), not a bug, and is disclosed as "a long-time leader can lose to money that arrives for the closing window" | design analysis |
 | **Random end's actual value** | on a 15-minute round the random end cuts a last-second sniper's flip rate 2.4% → 0.2%; spreading a buy across the last 3 minutes instead of dropping it at once keeps 67% of its value and still cuts the flip rate 18.2% → 7.6%. On a 12-hour round a fixed end already flips 0.00%, so the random end mainly protects SHORT rounds, it is kept uniform across all durations for simplicity, not because it matters equally everywhere | design analysis |
-| **Purse capture by parked capital, SUPERSEDED 2026-09-13** | measured against the contested purse: parking capital equal to the leader's trailing support for one day was break-even at the modelled fee flow (breakeven multiple 0.61×). Review 3 fixes the destination at the round result, so there is nothing left to park for | design analysis |
-| **Dump penalty on the purse works, SUPERSEDED 2026-09-13** | measured against the contested purse: a winner dumping 90% lost the lead 92% of the time. Review 3 removes the penalty deliberately (§1) | design analysis |
 | **Curve-exhaustion caveat, disclosed, no constant change** | at rounds ≥ 8 h the demand model (∝ √D) implies absorbing more parent tokens than exist; the reported curve exhaustion at high rounds is a modelling artefact, not a contract behaviour, real rounds are bounded by the parent's actual float. Monitor on mainnet | design analysis |
 | **Each link is worth a small fraction of its parent** | measured winners land at **5–8% of parent value in $DOLL**; this is the weakest assumption in the whole design, and keeper precision, threshold meaning, route impact and "value flows to index 0" all rest on it | audit §3 |
 | **The threshold stops being a real cost at depth** | `H` is 0.15% of the *parent's supply*, so clearing it for 900 s costs ≈$100 at generation 1, ≈$7 at generation 2 and **< $1 from generation 3**; from there the **bond** is the binding cost of extending the chain, which is why it now doubles every 4 links (§C) | audit F6 |
-| **Keeper economics are volunteer economics, and are still negative at small sizes** | the bounty is `max(1% of what is deployed, MIN_BOUNTY_DOLL)`, capped at 20% of the $DOLL a call consumes (audit 5); sized against the first curve range so a `deployEdgeBid` beats the gas of the call at beta scale (≈3.8× at 0.01 gwei), but Run 2 measured gas ≈215× the (pre-fix) bounty at generation 1 and 121 wei of bounty at generation 8, the floor and cap narrow this but do not eliminate it, nothing *obliges* anyone to call, and an ancestor's sleeve sits idle until somebody does | audit F7, audit 5, `Bid.t.sol::test_genesisBidBountyBeatsTheGasOfTheCall`, `Keeper.t.sol::test_theBountyFloorIsPaidAtRunTwoSizes`, `test_belowTheFloorTheBountyIsCappedAtTwentyPercent` |
+| **Keeper economics are volunteer economics, and are still negative at small sizes** | the bounty is `max(1% of what is deployed, MIN_BOUNTY_DOLL)`, capped at 20% of the $DOLL a call consumes (audit 5); sized against the first curve range so a `deployEdgeBid` beats the gas of the call at beta scale (≈3.8× at 0.01 gwei); the floor and cap narrow the gap at small sizes but do not eliminate it, nothing *obliges* anyone to call, and an ancestor's sleeve sits idle until somebody does | audit F7, audit 5, `Bid.t.sol::test_genesisBidBountyBeatsTheGasOfTheCall`, `Keeper.t.sol::test_theBountyFloorIsPaidAtRunTwoSizes`, `test_belowTheFloorTheBountyIsCappedAtTwentyPercent` |
 | Thin-demand stalling | at 0.20× demand 10.8% of rounds fail and #20 takes 23.1 rounds instead of 20; every chain still gets there | design analysis (MID) |
 | Creator / developer revenue is linear in edge volume and nothing else | $250k edge volume per round over 20 generations: developer $10,000, creators $20,000 in total | design analysis |
 | Reinforcement beats burn only narrowly | 74.6% drawdown vs 76.5% (burn) vs 77.7% (nothing), +10.96% parent bid within 50% of spot | design analysis (MID) |
-| No paid third-party audit | two independent adversarial passes (the final independent contract review and the final external contract review) and a testnet run, not a commercial audit | manual review record |
-| Liveness: the **whole upgrade path** has never fired on a public chain | **CLOSED by Run 3 (2026-09-11, pre-review-5 design):** `announceSunset`, a real 3600 s delay, `cancelSunset` (on a disposable stack), lazy adoption, both branches of the edge handover, and both cross-version payout paths all fired live. Only the 7-day slow-TWAP floor remains never-fired; per the Audit Standard, still reported as broken until it does. **No live run of the review-5 (external-genesis, $DOLL-only) design exists yet** | the private run log |
-| **Run 3 finding: the advertised keeper sizing view reads 0 below the bounty floor** | `maxParentForDeploy(j)` early-returns 0 whenever `drawableEdge(j) <= MIN_BOUNTY_DOLL`, which is true at beta sleeve sizes even though `deployAncestor` itself succeeds there (its own bounty floor lets it accept the call). An honest keeper reading only the sizing view would conclude nothing is deployable and never call. Fix pending in the gas pass | Run 3 phase A, `deployAncestor(1, …)`; the private run log |
-| **Run 3 finding: the in-swap forward needs ~1.5M gas of headroom** | The post-sunset in-swap fee forward only succeeds if the caller supplies ~1.5M gas above what the swap itself uses; an ordinary estimated-gas trade always takes the QUEUE branch instead. The queue is designed for exactly this, but it means post-sunset fees routinely need a permissionless `flushForward` call, and `flushForward` is therefore routine operator work, not an edge case | Run 3 phase B, steps p/q1/q2; the private run log |
-| No off switch | a hook revert bug bricks every pool permanently (§O); continuation only helps future pools | design decision |
+| **The in-swap forward needs ~1.5M gas of headroom** | The post-sunset in-swap fee forward only succeeds if the caller supplies ~1.5M gas above what the swap itself uses; an ordinary estimated-gas trade always takes the QUEUE branch instead. The queue is designed for exactly this, but it means post-sunset fees routinely need a permissionless `flushForward` call, and `flushForward` is therefore routine operator work, not an edge case | measured |
+| No off switch | a hook revert bug bricks every pool permanently (§O); continuation only helps future pools | design |
 
-**Plain-language disclosure items (final audit §5, a–i) and their current status.** The auditor
-listed nine things a non-technical user must be told and none of which the documentation said.
-Each is either fixed in code or is an accepted risk that the UI must state in these words.
+**Plain-language disclosure items and their status.** Each is either fixed in code or is an
+accepted risk that the UI states in these words.
 
 | # | what a trader must be told | status |
 |---|---|---|
@@ -1942,21 +1793,21 @@ Each is either fixed in code or is an accepted risk that the UI must state in th
 | (b) | **Each new coin is typically worth only 5–8% of the one before it in $DOLL** | **Disclosed.** Structural; it is the weakest assumption in the design (row above). |
 | (c) | **Roughly a third of the fees attributed to deep coins used to be payable to nobody** | **Fixed (audit F3).** The conversion walks the amount instead of a normalised rate, so no generation's sleeve is arithmetically unspendable; what remains is a *rate* limit and a *size* cap, spelled out in §P invariant 9. |
 | (d) | **Ancestor payouts depend on volunteer keepers, and the average price they are paid at can be gamed** | **Partly fixed, rest disclosed (audit F4/F7, sharpened by audit 1/5/6).** Every link is priced at `min(spot, TWAP_30m, TWAP_7d)`, a generation can be drawn down at most 10% of a continuously refilling bucket, and the bounty is floored at `MIN_BOUNTY_DOLL` and capped at 20% of the $DOLL consumed, but nobody is obliged to call, a *patient* drag of both averages is still possible, and at the smallest deployment sizes the bounty (even at the 20% cap) can still be below mainnet gas: a disclosed dead zone, not a fixed one. |
-| (e) | **The upgrade switch is irreversible once it takes effect, moves all future edge fees to the new version, and the steward key is a single point of failure** | **Partly fixed, rest accepted (and the 2026-09-11 design decision supersedes the earlier multisig recommendation).** A faulty successor can no longer freeze trading on any old pool (gas-bounded forwarding and 30k-gas staticcalls, audit F2), and the steward can take an announcement back once, before it lands (`cancelSunset`). After it lands it is permanent, the fee redirection is real, and the steward is deliberately a **single cold-signer address, not a multisig** ("Multi-sig and cold developer address are too much to do for this... single cold signer ledger wallet, but add pathways to security upgradability"): the mitigation for the single-key risk is that the steward role itself is now transferable on a public 7-day announce/execute/cancel delay (§M), so a compromised or lost steward key can be replaced without ever needing a multisig, and `address(0)` still removes the power and the upgrade path together for a deployment that wants neither. |
+| (e) | **The upgrade switch is irreversible once it takes effect, moves all future edge fees to the new version, and the steward key is a single point of failure** | **Partly fixed, rest accepted.** A faulty successor can no longer freeze trading on any old pool (gas-bounded forwarding and 30k-gas staticcalls, audit F2), and the steward can take an announcement back once, before it lands (`cancelSunset`). After it lands it is permanent, the fee redirection is real, and the steward is deliberately a **single cold-signer address, not a multisig** ("Multi-sig and cold developer address are too much to do for this... single cold signer ledger wallet, but add pathways to security upgradability"): the mitigation for the single-key risk is that the steward role itself is now transferable on a public 7-day announce/execute/cancel delay (§M), so a compromised or lost steward key can be replaced without ever needing a multisig, and `address(0)` still removes the power and the upgrade path together for a deployment that wants neither. |
 | (f) | **The upgrade as coded created two competing chains** | **Fixed (audit F1).** Lazy head adoption: a continuation opens no round until the prior version is sunset-effective, names it, and is idle, so two versions can never crown the same index (§A). |
-| (g) | **The developer address can never be changed** | **Accepted.** It is immutable in `FeeVault` with no setter and no transfer. The deploy script now *requires* a `DEVELOPER` env var and refuses the broadcasting key unless `ALLOW_DEV_EQ_DEPLOYER=1` (audit F8), so it is at least a deliberate choice. |
+| (g) | **The developer address moves only on a public delay** | **Accepted.** It moves only by the current holder's announcement on `FeeVault`'s 7-day announce/execute/cancel delay (§M). The deploy script *requires* a `DEVELOPER` env var and refuses the broadcasting key unless `ALLOW_DEV_EQ_DEPLOYER=1` (audit F8). |
 | (h) | **Uniswap's own protocol-fee controller may add up to 0.1% to every pool** | **Disclosed.** Not ours to control (§T, §U). |
 | (i) | **Score is second-granular** | **Disclosed.** The chain's ~100 ms blocks mean up to ten blocks share a timestamp; both accumulators integrate zero time across them (§N limit 3). |
 
-**Final external contract review disclosure additions and their status.**
+**Further disclosure items and their status.**
 
 | # | what a trader must be told | status |
 |---|---|---|
 | (j) | **Winning the round returns the whole bond; a larger bond at depth means more capital tied up for the round, not a higher price** | **Fixed and disclosed.** The prior wording ("non-refundable bond floor") was simply false for winners; `docs/DEPLOY_CONSTANTS.md` is corrected. Only losers forfeit their bond. |
-| (k) | **Collected support (hop fees, snipe tax, the ancestor sleeve) may sit undeployed for a long time, and the keepers who deploy it currently lose money at small sizes** | **Partly mitigated, rest disclosed.** `MIN_BOUNTY_DOLL` plus the 20% cap (audit 5) close the worst cases (Run 2: gas ≈215× the old bounty at j=1, 121 wei of bounty at j=8) but the disclosed dead zone remains at the smallest deployment sizes from generation 2 on; generations 0 and 1 fund together through `deployEdgeBid()` with no oracle needed at all (review 5). |
+| (k) | **Collected support (hop fees, snipe tax, the ancestor sleeve) may sit undeployed for a long time, and the keepers who deploy it currently lose money at small sizes** | **Partly mitigated, rest disclosed.** `MIN_BOUNTY_DOLL` plus the 20% cap (audit 5) close the worst cases but the disclosed dead zone remains at the smallest deployment sizes from generation 2 on; generations 0 and 1 fund together through `deployEdgeBid()` with no oracle needed at all. |
 | (l) | **After a price crash, a keeper deployment used to be able to overpay for a parcel at close to the pre-crash price** | **Fixed (audit 1).** Every conversion link is priced at `min(spot, TWAP_30m, TWAP_7d)`, so a crash lowers the payout immediately instead of waiting up to 30 minutes for the fast average, and up to 7 days for the slow one. |
 | (m) | **A losing candidate's coin used to lose its supported exit (and its creator's fee share) the moment its round ended** | **Fixed (audit 8).** Candidate routes resolve the round's recorded parent forever and pay the candidate's own creator 100% after the round. |
-| (n) | **Upgrades used to be able to produce two competing histories, or leave fees permanently stuck with an older version depending on the gas of the swap that triggered them** | **Fixed (audit 1/2/4 in this tranche, on top of F1/F2 earlier).** Transitive adoption checking closes the remaining fork path (audit 2); post-sunset fees are queued and flushed rather than stranded by gas (audit 4). |
+| (n) | **Upgrades used to be able to produce two competing histories, or leave fees permanently stuck with an older version depending on the gas of the swap that triggered them** | **Fixed (audit 1/2/4, F1/F2).** Transitive adoption checking closes the remaining fork path (audit 2); post-sunset fees are queued and flushed rather than stranded by gas (audit 4). |
 | (o) | **Fees can apply to a requested amount that does not fully trade (partial fills)** | **Disclosed, unchanged.** A route that fills half still pays the fee on the whole request (§I L1). |
 | (p) | **Transferring creator rights used to transfer the recipient's already-earned, unclaimed balance too** | **Fixed.** A transfer now sweeps what has accrued to the OLD recipient's own claimable ledger (`creatorAccrued`); the new recipient starts from zero and the zero address is refused. |
 | (q) | **The block-1 snipe schedule, measured second by second** | **Disclosed.** ≈99%, 66.33%, 33.67%, then 0% at +3 s, plus the hop fee on top throughout (§I). |
@@ -1974,7 +1825,7 @@ Each is either fixed in code or is an accepted risk that the UI must state in th
 3. **A candidate trade after the sunset loses its creator share, and here is exactly who loses
    it.** A candidate-sentinel attribution (`CANDIDATE_ATTRIBUTION | candidateId`) is an index into
    the *charging version's own* `candidates` array and means nothing in the successor's, where the
-   same number is some other coin. Review 4 therefore made such an attribution cross the handover
+   same number is some other coin. Such an attribution therefore crosses the handover
    as `UNATTRIBUTED` rather than as a number the successor would resolve against its own list.
 
    **Who loses value.** On every $DOLL-edge trade through a v1 candidate pool made after v1's sunset
@@ -2012,33 +1863,23 @@ Each is either fixed in code or is an accepted risk that the UI must state in th
 
 ## S. Evidence and results
 
-The mechanism's claims are backed by the property-test suite, the fork tests, the
-full-suite run, and the independent tool passes, not by a narrative report:
+The mechanism's claims are backed by the test suites and the independent tool passes:
 
 - `docs/security/PROPERTY_RESULTS.md`: the property/invariant test results (curve
   monotonicity, threshold-below-max-absorption, fee-split exactness, reinforcement
   accounting, sleeve conservation, and the other properties enumerated in
-  `docs/spec/PROPERTIES.md`).
-- `docs/security/FORK_RESULTS.md`: mainnet-fork checks against live Uniswap v4
-  infrastructure.
-- `docs/security/full-suite-review-5g.txt`, the current full test-suite run (346 passed, 0
-  failed, 1 skipped, 52 suites; fork tier recorded separately, 30 of 30 passed), superseding the
-  earlier review-5 runs (`full-suite-review-5.txt` ... `full-suite-review-5f.txt`) and
-  `docs/security/full-suite-review-4.txt` at the current deploy configuration (curve 20/25/35/20,
-  `h = 0.15%`, hop 7.5 bps, 900 s trading window, reset-on-win).
-- Slither, Halmos, and Medusa records under `docs/security/` (`slither-*`,
-  `halmos-*`, `medusa-*`), and the Certora rules and results under `certora/`
-  (`certora/specs/`, `certora/RESULTS-review-5.md`, `certora/PROPERTY_MAP.md`). The review-5
-  symbolic pass is `docs/security/halmos-review-5.md` (23 checks, 23 passed); the review-5 deep
-  fuzz and invariant run is `docs/security/PROPERTY_RESULTS.md` §4 (71 tests, 0 failed).
-- The testnet runs recorded in the deploy history (`docs/DEPLOY_CONSTANTS.md` and the
-  changelog kept internally for this project).
+  `docs/spec/PROPERTIES.md`), and the full-suite run (346 passed, 0 failed, 1 skipped, 52 suites).
+- `docs/security/FORK_RESULTS.md`: fork tests against live Uniswap v4 infrastructure (30 of 30
+  passed).
+- Slither and Halmos records under `docs/security/`, and the Certora rules and results under
+  `certora/` (`certora/specs/`, `certora/RESULTS.md`, `certora/PROPERTY_MAP.md`).
+- `docs/security/README.md`: the audit record, one row per method.
 
 Headline figures quoted elsewhere in this document (slot-capture cost, reinforcement's
 effect on drawdown, deep-route degradation, block-1 sniper profitability, and so on)
-were established by design analysis at deploy-configuration lock (2026-09-10) and are
-consistent with the property-test and fork evidence above; nothing in this section
-supersedes the constants in `docs/DEPLOY_CONSTANTS.md`.
+come from design analysis at the deploy configuration and are consistent with the property-test
+and fork evidence above; nothing in this section supersedes the constants in
+`docs/DEPLOY_CONSTANTS.md`.
 
 ---
 
@@ -2068,148 +1909,19 @@ top-level `lib/v4-core`, so exactly one `PoolManager` / `IHooks` type exists in 
 
 **Chain addresses** (verified 2026-09-10 by JSON-RPC):
 
-| item | mainnet 4663 | testnet 46630 |
-|---|---|---|
-| chain id | `0x1237` | `0xb626` |
-| RPC | `https://rpc.mainnet.chain.robinhood.com` | `https://rpc.testnet.chain.robinhood.com` |
-| Uniswap v4 PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` (24,009 bytes) | code-identical, 24,009 bytes |
-| PositionManager | `0x58daec3116aae6d93017baaea7749052e8a04fa7` | - |
-| StateView | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` | - |
-| UniversalRouter | `0x8876789976decbfcbbbe364623c63652db8c0904` | - |
-| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` | - |
-| PoolManager owner / protocol-fee controller | `<testnet-addr>` / `<testnet-addr>` | - |
+| item | mainnet 4663 |
+|---|---|
+| chain id | `0x1237` |
+| RPC | `https://rpc.mainnet.chain.robinhood.com` |
+| Uniswap v4 PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` (24,009 bytes) |
+| PositionManager | `0x58daec3116aae6d93017baaea7749052e8a04fa7` |
+| StateView | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` |
+| UniversalRouter | `0x8876789976decbfcbbbe364623c63652db8c0904` |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
 
 Chain properties: Arbitrum Orbit / Nitro, gas token ETH, ~100 ms average block time.
 `block.prevrandao` is unusable as randomness on Orbit (finding 6), which is why the trading
 window has a fixed, public end.
-
-**Round-mechanism contracts (new, `RUN 6 IN PROGRESS`, not yet deployed anywhere).**
-`contracts/randomness/DrandSource.sol` (the live, deploy-default `IRandomnessSource`; verifies drand
-`evmnet` on chain, §N/`contracts/DEPENDENCIES.md`) and `contracts/randomness/BN254.sol` (the pairing
-and hash-to-curve library it uses, written from public specifications, no vendored dependency, §N)
-are deployed once per `RoundManager` construction, referenced by the `RANDOMNESS_SOURCE` env var
-(unset deploys a fresh `DrandSource` with the deploy constants above; `USE_MOCK_RANDOMNESS=1` deploys
-`MockRandomnessSource` instead, testnet only). **`RoundManagerDeployer`** is a new one-function CREATE
-helper, deployed at deployer nonce n+2 immediately before the factory (exactly the same pattern as
-`DevVestingDeployer`) because the adaptive schedule and the random-end fields pushed the
-`RoundManager`'s own constructor arguments, and therefore the factory's deployment transaction, over
-the EIP-3860 initcode limit; moving those bytes into their own transaction restored roughly 13 kB of
-headroom. It passes `msg.sender` as the `RoundManager`'s `factory`, so it can only ever produce a
-contract wired to its own caller, and the factory verifies that at construction. New env vars:
-`RANDOMNESS_SOURCE` (optional), `USE_MOCK_RANDOMNESS` (optional, testnet only), `END_TIMEOUT_S`
-(optional, default 30 min, a `RoundManager` constructor parameter), `DURATION_SCALE_DIV` (optional,
-default 1 on mainnet; the deploy script refuses any value other than 1 unless
-`ALLOW_SCALED_SCHEDULE=1` is also set). `RoundManagerDeployer` will be recorded in
-`deployments/<chainid>.json` as `roundManagerDeployer`, and `DrandSource`'s address (or
-`MockRandomnessSource`'s) as `randomnessSource`, once run 6 actually deploys. **No addresses exist
-yet for any of this**: every run recorded below predates the adaptive round mechanism entirely (fixed 900 s trading,
-no drand, no purse deployment) and must not be read as evidence that the schedule, the random end or the
-purse have ever executed on any chain.
-
-**Review 5 note:** Run 4 below deployed the pre-review-5 tree (`createGenesis`, a native-ETH genesis
-pool, `DevVesting`). It is kept as the historical live-fire record; it is not evidence about the
-external-genesis, $DOLL-only design, which has not yet run on any public chain.
-
-**Live testnet deployment (chain 46630), RUN 4 (2026-09-11), current, FINAL gas-optimized
-bytecode, pre-review-5.** The private run log is the authoritative round log,
-read there, not this file, for confirmed tx
-hashes. Run 4 is a single fresh trunk (`continuesFrom = address(0)`) deployed from the gas-pass
-build (token clones, packed hook storage, route memoization, the fixed `maxParentForDeploy` sizing
-view, 162 tests); it ran one normal round (genesis buy, three candidates, a candidate sale, three
-scores, finalize with a head change, `claimDev`, a second round finalized with no winner, both
-keeper paths, `claimCreator`) and is idle. **Runs 1, 2, and 3 are all STALE**: earlier bytecode;
-their addresses must not be pointed at for anything new. Run 1's record is
-`deployments/46630.v1-stale.json`, run 2's is `deployments/46630.run2-stale.json`, run 3's is
-`deployments/46630.run3-stale.json`. **Concrete addresses, pool IDs and tx hashes are withheld
-from this public tree, see `private/` (untracked) for the canonical deployment records.** The
-tables below keep the contract roles and the placeholders `<deployer>` / `<testnet-addr>` /
-`<pool-id>` / `<tx>` in their place.
-
-| contract | address |
-|---|---|
-| tokenImplementation (FamilyToken, EIP-1167 base, deployer nonce n+0) | `<testnet-addr>` |
-| factory | `<testnet-addr>` |
-| hook | `<testnet-addr>` |
-| locker | `<testnet-addr>` |
-| roundManager | `<testnet-addr>` |
-| feeVault | `<testnet-addr>` |
-| bidDeployer | `<testnet-addr>` |
-| router | `<testnet-addr>` |
-| lens | `<testnet-addr>` |
-| genesisToken (FAM0, EIP-1167 clone) | `<testnet-addr>` |
-| poolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
-| genesisPoolId | `<pool-id>` |
-| deployer / developer / steward | `<deployer>` (all three, a throwaway testnet key with `ALLOW_DEV_EQ_DEPLOYER=1`; **mainnet: a single cold-signer (hardware wallet) address for both developer and steward, per the 2026-09-11 design decision, not a multisig, relying on the 7-day transfer delay (§M) rather than key-sharing for recoverability**) |
-| continuesFrom / startIndex | `address(0)` / `0`: fresh trunk |
-
-Candidate tokens (Run 4, all EIP-1167 clones of `tokenImplementation`): CAND-A, **head, canonical
-index 1**: `<testnet-addr>`; CAND-B `<testnet-addr>`;
-CAND-C `<testnet-addr>`; CAND-D (round 2, no winner)
-`<testnet-addr>`.
-
-**No handover was run on Run 4's bytecode.** Run 3 (functionally identical contracts, one gas pass
-earlier) is kept as the **handover evidence**: it is the only run in which
-`announceSunset`/`cancelSunset`/the delay/adoption/in-swap forwarding/queue+`flushForward`/cross-
-version bids actually fired on chain. Its full record is `deployments/46630.run3-stale.json`
-(v1/v2/v3 stacks); the v2 (continuation, live-at-the-time) addresses are kept here for reference:
-
-| item | v2 (Run 3 continuation, handover evidence only, STALE bytecode) |
-|---|---|
-| factory | `<testnet-addr>` |
-| hook | `<testnet-addr>` |
-| locker | `<testnet-addr>` |
-| roundManager | `<testnet-addr>` |
-| feeVault | `<testnet-addr>` |
-| bidDeployer | `<testnet-addr>` |
-| router | `<testnet-addr>` |
-| lens | `<testnet-addr>` |
-| head token (CAND-E, canonical index 2) | `<testnet-addr>` |
-| continuesFrom / startIndex | Run 3's v1 RoundManager `<testnet-addr>` / `1` |
-
-The artefact records the constants the script bound (same values across runs 3 and 4), including
-the depth-scaled bond schedule and the depth cap: `bondBaseWei 1e15`, `bondDoublingEvery 4`,
-`bondMaxWei 6.4e16`, `maxIndex 0` (uncapped, the testnet value), alongside `hopFeePpm 750`,
-`protocolFeePpm 10000`, `devBps 2000`, `creatorBps 4000`, `ancestorBps 5000`, `reinforceBps 5000`,
-`hFracWad 1.5e15`, `hMinFracWad 3.75e14`, `registrationS 180`, `tradingS 900`, `submitS 300`,
-**`sunsetDelayS 3600`** (both runs deployed at the contract floor rather than the mainnet 7-day
-value, deliberately, so the handover could be exercised live instead of only on a fork, mainnet must use 604800), `snipeS 3`, `tickSpacing 60`, `genesisUnitWei 1e21`, `supply 1e27`.
-
-`deployments/` also contains `46630.v1-stale.json`, `46630.run2-stale.json`,
-`46630.run3-stale.json` (all three of Run 3's stacks), `46630.fork-rehearsal-run4.json`, and older
-`46630.fork-rehearsal*.json` files. Those are superseded or **anvil-fork** records (some with stale
-constants blocks (`hopFeeBps 10`, `tradingS 600`)) and must not be read as deploy records.
-
-**Gas (post-optimization; `docs/DEPLOY_CONSTANTS.md` is authoritative).** Measured with
-`forge test --gas-report` at the deployed settings (`optimizer_runs = 200`, `via_ir = true`,
-`evm_version = cancun`); no behaviour change is intended or observed (162/162 tests green). **This
-table predates review 5**, see the equivalent note in `docs/DEPLOY_CONSTANTS.md`: `createGenesis`
-and `deployGenesisBid` no longer exist (`adoptGenesis` replaces the former and runs no curve or
-swap; `deployEdgeBid` replaces the latter), and every ETH-denominated leg below is now $DOLL. A
-fresh gas pass against review-5 `HEAD` has not been recorded here.
-
-| Action | Before | After | Delta |
-| --- | ---: | ---: | ---: |
-| `registerCandidate` | 1,607,652 | 1,275,852 | **−331,800 (−20.6%)** |
-| `createGenesis` (pre-review-5) | 1,390,171 | 1,052,179 | **−337,992 (−24.3%)** |
-| Routed 3-hop buy (pre-review-5) | 1,403,824 | 1,283,514 | **−120,310 (−8.6%)** |
-| Routed 2-link buy (pre-review-5) | 670,872 | 591,780 | **−79,092 (−11.8%)** |
-| Genesis exact-in buy (pre-review-5, incl. test router) | 637,029 | 630,650 | −6,379 (−1.0%) |
-| Candidate-pool swap during a round (score path) | 495,944 | 489,516 | −6,428 (−1.3%) |
-| `submitScore` | 194,151 | 194,157 | +6 |
-| `finalize` | 265,154 | 267,820 | +2,666 |
-| `deployAncestor(j=1)` | 570,185 | 559,696 | −10,489 |
-| `deployGenesisBid` (pre-review-5) | 448,461 | 443,343 | −5,118 |
-| `claimDev` (report avg) | 50,862 | 50,200 | −662 |
-| Cross-version 3-hop route | 1,638,865 | 1,478,106 | **−160,759 (−9.8%)** |
-
-Sources: (1) tokens are EIP-1167 clones instead of full deployments (§B); (2) `RegisteredPool` and
-the TWAP ring entries are repacked so a scored swap touches four slots and a ring write is one
-`SSTORE` (§N); (3) the router resolves each path index's currency once per route instead of once
-per use; (4) the gas-capped `isSunsetEffective` probe is cached in transient storage per
-transaction; (5) the audit-9 `protocolFeesAccrued` snapshot is skipped when the pool's v4 protocol
-fee is zero. `finalize` and `registerCandidate` each pay one extra cold `SSTORE`
-for `initSqrtPriceX96`/`tFrozenAt` moving out of the hot flag slot, a one-time launch cost traded
-against every swap.
 
 **Optimizer runs stay at 200.** `1000` and `10000` were tried: with `via_ir` the pinned `v4-core`
 `Pool.swap` fails to compile ("stack too deep") at anything above roughly 210 runs (a dependency
@@ -2217,15 +1929,13 @@ ceiling in the vendored library, not a size one) so 200 is the practical ceiling
 re-pinned. At 200 runs every contract is well under EIP-170 (largest: `BidDeployer` 20,353 B, 4,223
 B of margin) and the factory's init code has 4,680 B of EIP-3860 margin.
 
-**Deploy nonce chain, REVIEW 5: shortened by one, hook salt re-mined** (`script/Deploy.s.sol`,
+**Deploy nonce chain** (`script/Deploy.s.sol`,
 `FamilyTestBase` mirrors it): every CREATE below comes from the deployer, in this fixed order,
 forced by the hook's constructor args referencing the FeeVault and the router before either exists, `nonce n+0` **`FamilyToken`** (the single sealed implementation every family token clones,
 deployed with the factory's *predicted* address baked in as its `factory` immutable, it must exist
 before the factory, which verifies the link back in its own constructor), `n+1`
 **`RoundManagerDeployer`** (a one-function, permissionless helper that CREATEs the `RoundManager`,
-out of the factory's own initcode; `DevVestingDeployer` is DELETED from this slot, there is no
-genesis launch to fund, so every offset from here on moved back by one and the CREATE2 hook salt had
-to be re-mined against the factory address this shorter ladder predicts), `n+2` the randomness
+out of the factory's own initcode), `n+2` the randomness
 source (`MockRandomnessSource` / `DrandSource`, only deployed when `RANDOMNESS_SOURCE` is unset),
 `k+0` `FamilyFactory` (which itself deploys `Locker` by CREATE and `FamilyHook` by CREATE2, mined
 against the factory's own predicted address, verifies `tokenImplementation.factory() ==
@@ -2245,14 +1955,14 @@ Constants the deploy script binds (`script/Deploy.s.sol`): `hopFeePpm 750`, `pro
 `MIN_SUNSET_DELAY = 1 hours` floor, audit 2), **`roleTransferDelayS`** (7 days / `604800`, a
 constant shared by `RoundManager` and `FeeVault`, not a per-deployment parameter),
 **`minBountyDoll`** (an amount of the adopted edge token, calibrated at deploy from the graduated
-Pons price; `script/Deploy.s.sol` placeholder `1_000e18`, review 5, renamed from `minBountyWei`),
+Pons price; `script/Deploy.s.sol` placeholder `1_000e18`),
 `snipeS 3`, `tickSpacing 60`, `supply 1e27`, and (once the round-mechanism fields are exercised) **`endTimeoutS`** (mainnet `1800`), **`durationScaleDiv`** (mainnet `1`, refused otherwise without
 `ALLOW_SCALED_SCHEDULE=1`), and the resolved `randomnessSource` / `roundManagerDeployer` addresses.
 Every one of them, plus the bond schedule and `maxIndex`, is written into
-`deployments/<chainid>.json`. **Review 5 removes `genesisUnitWei` (there is no genesis curve) and
+`deployments/<chainid>.json`. **Removes `genesisUnitWei` (there is no genesis curve) and
 every `devVesting`/`devVestingDeployer`/`devAllocationBps`/`vestingCliffS`/`vestingDurationS` field
 (there is no developer allocation), and adds `genesisToken`, `entrancePool`, `minBountyDoll`,
-`bondBaseDoll`, `bondMaxDoll`. **Review 5b adds two further keys, `entrancePoolId` and
+`bondBaseDoll`, `bondMaxDoll`. **Adds two further keys, `entrancePoolId` and
 `stateView`**, the venue pool's identifier and its `StateView` reader address, which is what a
 reader actually needs to price the entrance pool; `entrancePool` stays as the pool's own address
 reference and answers no call on its own. `script/check-artefact-keys.mjs` asserts every key the
@@ -2264,15 +1974,15 @@ web build reads is one the deploy script actually writes, closing the seam that 
 | var | required? | meaning / guard |
 |---|---|---|
 | `POOL_MANAGER` | **required** | must have code |
-| `GENESIS_TOKEN` | **required (review 5)** | the already-graduated, 18-decimal ERC-20 this deployment adopts as canonical index 0; the script requires it to have code and `adoptGenesis` additionally checks its `decimals()` and `totalSupply()` on chain. There is no default and no way to launch a new genesis token from this script |
-| `ENTRANCE_POOL` | optional (review 5) | an EXTERNAL REFERENCE ONLY, the venue pool the adopted edge currency trades in (e.g. its Pons graduation pool). Recorded in `deployments/<chainid>.json` as `entrancePool`; this stack never calls it and the address alone answers no call |
-| `ENTRANCE_POOL_ID` | optional (review 5b) | the entrance pool's identifier, recorded as `entrancePoolId`. Together with `STATE_VIEW` this is what the web build actually reads to price the entrance pool through `StateView`; `script/check-artefact-keys.mjs` checks that the deploy script writes every key the web build reads |
-| `STATE_VIEW` | optional (review 5b) | the `StateView` reader address for the entrance pool's venue, recorded as `stateView` |
-| `DEVELOPER` | **required** | the initial payee of the 20% dev share of the protocol fee. `require(developer != address(0))`, and the script **refuses the broadcasting deployer key** unless `ALLOW_DEV_EQ_DEPLOYER=1` is also set. **No longer immutable**: it is transferable on `FeeVault`'s 7-day announce/execute/cancel delay (§M). Mainnet: a single cold-signer (hardware wallet) address, by design decision, not a multisig. Review 5: there is no genesis vesting allocation for this address to also receive |
-| `STEWARD` | **required, no default** | the only other privileged address. `address(0)` is a *legitimate deliberate choice* (it means the deployment can never be sunset and therefore never continued) which is exactly why the variable has no default: "deliberately nobody" must not be confusable with "forgot to set it". Also transferable on `RoundManager`'s 7-day announce/execute/cancel delay (§M). Mainnet: a single cold-signer (hardware wallet) address, by design decision, not a multisig. |
+| `GENESIS_TOKEN` | **required** | the already-graduated, 18-decimal ERC-20 this deployment adopts as canonical index 0; the script requires it to have code and `adoptGenesis` additionally checks its `decimals()` and `totalSupply()` on chain. There is no default and no way to launch a new genesis token from this script |
+| `ENTRANCE_POOL` | optional | an EXTERNAL REFERENCE ONLY, the venue pool the adopted edge currency trades in (e.g. its Pons graduation pool). Recorded in `deployments/<chainid>.json` as `entrancePool`; this stack never calls it and the address alone answers no call |
+| `ENTRANCE_POOL_ID` | optional | the entrance pool's identifier, recorded as `entrancePoolId`. Together with `STATE_VIEW` this is what the web build actually reads to price the entrance pool through `StateView`; `script/check-artefact-keys.mjs` checks that the deploy script writes every key the web build reads |
+| `STATE_VIEW` | optional | the `StateView` reader address for the entrance pool's venue, recorded as `stateView` |
+| `DEVELOPER` | **required** | the initial payee of the 20% dev share of the protocol fee. `require(developer != address(0))`, and the script **refuses the broadcasting deployer key** unless `ALLOW_DEV_EQ_DEPLOYER=1` is also set. **Transferable** on `FeeVault`'s 7-day announce/execute/cancel delay (§M). Mainnet: a single cold-signer (hardware wallet) address, not a multisig. |
+| `STEWARD` | **required, no default** | the only other privileged address. `address(0)` is a *legitimate deliberate choice* (it means the deployment can never be sunset and therefore never continued) which is exactly why the variable has no default: "deliberately nobody" must not be confusable with "forgot to set it". Also transferable on `RoundManager`'s 7-day announce/execute/cancel delay (§M). Mainnet: a single cold-signer (hardware wallet) address, not a multisig. |
 | `MAX_INDEX` | optional, default `0` | the beta depth cap (0 = unlimited, the testnet value). Immutable; can never be raised. |
-| `BOND_BASE` / `BOND_DOUBLING_EVERY` / `BOND_MAX` | optional | the depth-scaled bond schedule (§C), in the adopted edge token's own 18 decimals (review 5, renamed from `BOND_BASE_WEI`/`BOND_MAX_WEI`), MUST be recalibrated from the graduated Pons price at deploy time; `script/Deploy.s.sol` placeholder `25_000e18` for both. |
-| `MIN_BOUNTY_DOLL` | optional | the keeper bounty floor (§J), in the adopted edge token's own 18 decimals (review 5, renamed from `MIN_BOUNTY_WEI`), calibrate from the graduated Pons price so the floor is 3–5× the gas of a keeper call. |
+| `BOND_BASE` / `BOND_DOUBLING_EVERY` / `BOND_MAX` | optional | the depth-scaled bond schedule (§C), in the adopted edge token's own 18 decimals (renamed from `BOND_BASE_WEI`/`BOND_MAX_WEI`), MUST be recalibrated from the graduated Pons price at deploy time; `script/Deploy.s.sol` placeholder `25_000e18` for both. |
+| `MIN_BOUNTY_DOLL` | optional | the keeper bounty floor (§J), in the adopted edge token's own 18 decimals (renamed from `MIN_BOUNTY_WEI`), calibrate from the graduated Pons price so the floor is 3–5× the gas of a keeper call. |
 | `CONTINUE_FROM` | optional, default `address(0)` | the prior `RoundManager` this deployment continues; must have code. Unset = a fresh trunk, the only mode that adopts a genesis |
 | `ALLOW_DEV_EQ_DEPLOYER` | optional | throwaway testnet runs only. |
 | `RANDOMNESS_SOURCE` | optional | the `IRandomnessSource` `RoundManager` verifies drand relays against; unset deploys a fresh `DrandSource` with the deploy-constant beacon parameters (§N). Immutable once deployed. |
@@ -2284,8 +1994,6 @@ The script asserts every address prediction against the address `new` actually r
 mined hook encodes exactly `HOOK_FLAGS`, and on a continuation asserts head continuity against
 `CONTINUE_FROM`.
 
-The live round log is kept privately; the private run log is the authority on which
-links have fired. **Mainnet 4663: not deployed.**
 
 ---
 
@@ -2298,28 +2006,28 @@ links have fired. **Mainnet 4663: not deployed.**
 | **Last-second spiker** | large capital in the closing seconds | average over the closing window `W`; the window average is read back from checkpoint rings at whatever `T_end` the random end settles on, so a spike inside the window is diluted exactly as before | Arithmetically ineffective at spike scale: 0% win rate at the original 900 s window; the random end additionally cuts a last-second flip rate 2.4% → 0.2% (design analysis). |
 | **Window sniper (disclosed working-as-designed)** | capital equal to the leader's, bought at the start of the closing window `W` and held through it | none by design, this is the rule (highest average at `T_end` wins); the random end removes the pure last-seconds spike game only | **Accepted and disclosed.** ≈82% win rate in a 4-h round, ≈93% in a 15-min round (design analysis); the leader's only defences are the random end (nobody knows `T_end` in advance), the requirement to HOLD capital through the window rather than flash it, and the leader's community's time to respond during `W`, longer windows favour defenders, so the safe tuning direction is up. **Re-accepted 2026-09-12 when `W` was flattened to 15 min on every round** (it had been up to 3 h on a 12-hour round, which is the direction the analysis calls safer): the random end already removes the last-seconds game, and a window sniper must EXIT into the market it has just pumped (a pool whose only depth is the locked curve and the family's own bids) which the design analysis does not model at all, so the measured 82–93% is an upper bound on a real edge. Disclosed, not mitigated. |
 | **Beacon withholder / non-relayer** | the League of Entropy threshold colludes to withhold a signature, or simply nobody bothers to relay one | `END_TIMEOUT = 30 min` permissionless `finalizeDeterministic()` settles `T_end = T` regardless; the round never hangs | **Accepted and disclosed, and self-defeating for the attacker:** the only achievable outcome of withholding is `T_end = T`, which is exactly the outcome a late buyer could already plan for, a withheld beacon cannot bias a round in anyone's favour, only remove the randomness. Never fired in production (§ Links with liveness evidence). |
-| **Purse parker** | parked capital equal to a sibling's trailing support to move the top-2 ranking and claim purse share | - | **Closed by removal (review 3, 2026-09-13).** The purse is no longer contestable: a generation's whole share is locked under `canonical(j)`, decided by the round result and by nothing measured afterwards. There is no ranking to move. |
-| **Purse-wall seller (review 3, disclosed working-as-designed)** | holders of the round winner sell into the purse's own bid range, so fee-funded liquidity buys them out | none by design, and none intended: the purse is a **permanent buy wall under the coin that won the round**, placed from just under spot to about 6% below it, and being able to sell into it is what makes it support rather than a lock-up. The bounds are the per-deployment size cap (2% of the target range's parent reserve) and the 24-hour drawdown bucket (10% of the generation's accrued $DOLL), so no single moment can be used to shove the pool | **Accepted and disclosed.** The reinforcement share (20% of the fee) has worked exactly this way since the first version; review 3 extends the same property from 20% to 40% of the fee by making the ancestor sleeve uncontested. Keeping the value on the canonical chain in bid form is the intent. |
+| **Purse parker** | parked capital equal to a sibling's trailing support to move the top-2 ranking and claim purse share | - | **Closed by removal (2026-09-13).** The purse is no longer contestable: a generation's whole share is locked under `canonical(j)`, decided by the round result and by nothing measured afterwards. There is no ranking to move. |
+| **Purse-wall seller (disclosed working-as-designed)** | holders of the round winner sell into the purse's own bid range, so fee-funded liquidity buys them out | none by design, and none intended: the purse is a **permanent buy wall under the coin that won the round**, placed from just under spot to about 6% below it, and being able to sell into it is what makes it support rather than a lock-up. The bounds are the per-deployment size cap (2% of the target range's parent reserve) and the 24-hour drawdown bucket (10% of the generation's accrued $DOLL), so no single moment can be used to shove the pool | **Accepted and disclosed.** The reinforcement share (20% of the fee) has worked exactly this way; the purse extends the same property from 20% to 40% of the fee by making the ancestor sleeve uncontested. Keeping the value on the canonical chain in bid form is the intent. |
 | **Block-1 sniper** | the first swap at `tradingStart` | linear snipe tax 99% → 1% over 3 s; proceeds go to the parent's reinforcement pot; the score counts only what the pool absorbed, so a sniped buy scores small and positive | Priced, not prevented: mean +$445/round (design analysis). |
 | **Score-sign attacker (C1)** | one exact-in buy inside the 99% window to drive a rival's `R` negative | closed: `R` is the pool's own parent delta, fee-exclusive by construction; pinned in four orientations and inside the snipe window | Closed (`HookScore.t.sol`). |
-| **Genesis squatter (C2), REMOVED (review 5, tightened at review 5b)** | watches the factory deploy and front-runs adoption at a near-zero FDV | there is no FDV to front-run: adoption places no curve and no price at all, only checks the adopted token against the fixed `GENESIS_TOKEN` deploy constant. Review 5b removed the public `adoptGenesis(token)` entry point entirely; adoption runs inside `wire()` with `genesisCreator` fixed at construction to the deployer | Closed by construction. There is no first caller to race: the attribution is fixed before any transaction can be sent, and it carries no fee stream. |
+| **Genesis squatter (C2), REMOVED** | watches the factory deploy and front-runs adoption at a near-zero FDV | there is no FDV to front-run: adoption places no curve and no price at all, only checks the adopted token against the fixed `GENESIS_TOKEN` deploy constant. There is no public `adoptGenesis(token)` entry point; adoption runs inside `wire()` with `genesisCreator` fixed at construction to the deployer | Closed by construction. There is no first caller to race: the attribution is fixed before any transaction can be sent, and it carries no fee stream. |
 | **Submission-order attacker** | submits a weak score and finalizes atomically | `submitScore` confined to `[T_end, T_end+300)`; `finalize()` refused until `submitEnd`; scores are `T_end` snapshots | Closed (`test_submitOrderingAttackCannotWin`). |
 | **Submission griefer** | withholds a rival's `submitScore` or spams submissions | permissionless and per-candidate idempotent; anyone may submit for anyone | Residual: if *nobody* submits, a qualifying round still finalizes with no winner and all bonds are forfeited. |
 | **Finalization stalker** | refuses to call `finalize()` | permissionless, idempotent, no deadline | Residual liveness dependency: succession halts until someone pays the gas. Trading continues. |
 | **Pool poisoner** | pre-initializes the predictable `PoolKey` | `beforeInitialize` requires factory pre-registration at the exact registered price; the factory registers, initializes and places in one transaction | Closed (finding 8). |
-| **Malicious candidate token** | tries to enter a non-standard token as a candidate (index 1 and deeper) | tokens at index 1 and deeper are deployed by the factory itself; no external token can be a candidate | Closed for every candidate this protocol launches. **Residual (review 5): index 0 is external by design**: the whole chain's door is a token this protocol did not deploy; see the "external token that changes behaviour" risk in §R and the Pons-plain-ERC-20 assumption it states. |
+| **Malicious candidate token** | tries to enter a non-standard token as a candidate (index 1 and deeper) | tokens at index 1 and deeper are deployed by the factory itself; no external token can be a candidate | Closed for every candidate this protocol launches. **Residual: index 0 is external by design**: the whole chain's door is a token this protocol did not deploy; see the "external token that changes behaviour" risk in §R and the Pons-plain-ERC-20 assumption it states. |
 | **Liquidity thief** | tries to remove, migrate or donate into locked liquidity | `beforeRemoveLiquidity` reverts unconditionally; `beforeAddLiquidity` is Locker-only; `beforeDonate` reverts; the Locker has no exit | Closed permanently, in both directions (a bug is equally unfixable). |
-| **Fee dodger** | avoids the 1% edge fee | the hook charges at the pool, not the router; direct `PoolManager` swaps pay identically | Open by construction: external markets (including Pons, the only door in or out of index 0 at all (review 5)) pay the family nothing. Bounded only by hop fees on the family side; deep routes are expected to route almost entirely external. |
+| **Fee dodger** | avoids the 1% edge fee | the hook charges at the pool, not the router; direct `PoolManager` swaps pay identically | Open by construction: external markets (including Pons, the only door in or out of index 0 at all) pay the family nothing. Bounded only by hop fees on the family side; deep routes are expected to route almost entirely external. |
 | **Attribution forger** | passes a fake `terminalIndex` or candidate id | trusted only when `sender == router` or the post-sunset successor router; downgraded when `terminalIndex > headIndex` or `candidateId >= candidateCount` | Closed. A copycat router simply loses attribution. See §R continuation caveats 2–3 for the two cross-version windows. |
-| **Router native-value sweeper (M1), REMOVED (review 5)** | funds `amountIn` out of native value parked in the router | there is no `msg.value` path anywhere in the router and no `receive()`; a plain transfer reverts outright | Closed (`RouterGuards.t.sol::test_routerHeldEthCannotBeSwept`). |
+| **Router native-value sweeper (M1), REMOVED** | funds `amountIn` out of native value parked in the router | there is no `msg.value` path anywhere in the router and no `receive()`; a plain transfer reverts outright | Closed (`RouterGuards.t.sol::test_routerHeldEthCannotBeSwept`). |
 | **Keeper sandwicher / TWAP dragger (F4, audit 1/6)** | pumps or crashes a thin ancestor pool, waits out or exploits the 30-minute average, then drains a generation's sleeve at the wrong rate | Five independent brakes: every link is priced at **`min(spot, TWAP_30m, TWAP_7d)`** in value terms, so a pump only minutes old cannot raise the price and a crash lowers the payout immediately instead of waiting for the slow ring (audit 1); every pool in the conversion must cover the full 1800 s with ≥2 observations (`TwapNotReady`); the ±3% sqrt band on the **target** pool; ≤2% of `max(active bucket, first-range capacity)` per call; and a **10%-of-a-continuously-refilling-bucket** drawdown per generation (`DailyLimitExceeded`, audit 6) with no resetting-window boundary to burst at. The protocol never swaps, so there is no `minOut` left at zero, and the bounty is paid only on a completed deposit | Residual: a *patient* attacker who can hold a manipulation across the 7-day average still profits, and must then take the sleeve a tenth of the bucket at a time over days, which is loud, slow and priced. The vacuous-on-a-fresh-pool hole (M2), the unbounded-slippage conversion (M3) and the same-block drain are closed (`Keeper.t.sol`). |
-| **Reentrancy / callback abuser** | reenters via an ERC-20 hook (e.g. a non-standard token) or a callback | `nonReentrant` on `finalize`, `claimRefund`, `claimDev`, `claimCreator`, `claimCreatorAccrued`, **`FeeVault.accrue`** (review-2, F-4: the post-sunset branch hands control to an unknown successor vault, and `ledgerTotal` is credited in full before it does, so no foreign code ever runs against an understated ledger), `deployAncestor`, both `deployEdgeBid` overloads and `depositExternalBid`; CEI throughout; `unlockCallback` restricted to `poolManager`; whole routes in one unlock | No known path; not externally audited. Review 5: every value transfer in the protocol is now an ERC-20 call rather than a native send, which is a wider reentrancy surface in principle (a malicious token's `transfer` could reenter), closed for the adopted edge token specifically by the "plain ERC-20" assumption in §R, not by a code-level guard against an adversarial token. |
+| **Reentrancy / callback abuser** | reenters via an ERC-20 hook (e.g. a non-standard token) or a callback | `nonReentrant` on `finalize`, `claimRefund`, `claimDev`, `claimCreator`, `claimCreatorAccrued`, **`FeeVault.accrue`** (F-4: the post-sunset branch hands control to an unknown successor vault, and `ledgerTotal` is credited in full before it does, so no foreign code ever runs against an understated ledger), `deployAncestor`, both `deployEdgeBid` overloads and `depositExternalBid`; CEI throughout; `unlockCallback` restricted to `poolManager`; whole routes in one unlock | No known path; not externally audited. Every value transfer in the protocol is now an ERC-20 call rather than a native send, which is a wider reentrancy surface in principle (a malicious token's `transfer` could reenter), closed for the adopted edge token specifically by the "plain ERC-20" assumption in §R, not by a code-level guard against an adversarial token. |
 | **Unlock interleaver (REN-01)** | opens its own v4 `PoolManager` unlock, swaps with flash accounting still open, and settles a round or pulls a claim in the same frame | `notInsideUnlock` on `RoundManager.finalize`, `requestEnd`, `finalizeDeterministic`, `submitScore` and on `FeeVault`'s three claim paths. The state is v4-core's own transient lock flag (`Lock.IS_UNLOCKED_SLOT`), read with one `exttload` through `PoolManager`'s inherited `Exttload`. The protocol's OWN swap path is deliberately NOT guarded: the hook's `afterSwap` and `FeeVault.accrue` are called from inside the swap's unlock on every swap, and neither touches the round machine or a claim | Closed as stated (`Review2.t.sol::test_REN01_everyGuardedEntrypointRefusesFromInsideAnUnlock`). Residual: an integrator that wants to batch a swap and a `submitScore` inside one unlock of its own must split them into two calls. No protocol path did so. |
 | **Bond griefer (F10)** | registers many junk candidates | `bondFor(headIndex + 1)` per entry, paid in the adopted edge token and forfeited on loss to the edge-bid earmark; both `FamilyLens.roundView` and `RoundManager.candidateIds(roundId, offset, limit)` are paginated, so an unbounded array return can never exceed an `eth_call` gas limit | Cheap if the bond is small: a spam round costs `n × bondFor(...)` plus gas and inflates read cost. Mitigated by the depth-scaled schedule and by sizing the mainnet base bond against the graduated Pons price (§C, §R: this pricing is set hours after graduation and can be wrong); pagination closes the read-side griefing outright (`Round.t.sol::test_candidateIdsArePaginated`). |
 | **Ancestry inflator** | grows the chain to make accounting expensive, or spams shallow links because depth is cheap | Fenwick range-add / point-query is O(log N) on swaps and claims; registration refuses past `FenwickRangeAdd.MAX_INDEX = 4095`, and a beta deployment refuses past its own immutable `RoundManager.MAX_INDEX`; the **bond doubles every 4 links** to a cap, so each extra generation costs more (F6) | Residual: `dollValueOfParent(j)` and router paths are **O(j)** in static calls (~48.5k gas/generation), deep keeper deployments and full-line routes eventually exceed the block gas limit, after which deep links are reachable only via external venues. The economic limit bites first: at ~6% of parent value per link, a deep pool's whole market cap is dust and the 2% size cap refuses the bid with a named error. |
-| **Steward (insider)** | one of two role addresses in the protocol (with the developer; review 5 removes the third, the `DevVesting` beneficiary, along with the contract) | `announceSunset` (once, `sunsetDelay`: mainnet 7 days, testnet 1 hour, floor 1 hour, successor must have code, no shorten, no second call; refused on an unadopted continuation, `NotAdopted`, audit 2) and `cancelSunset` (once ever, and only strictly before `sunsetAt`); **the role itself is transferable** on a separate 7-day announce/permissionless-execute/cancel delay (`announceStewardTransfer`/`executeStewardTransfer`/`cancelStewardTransfer`, §M) that changes who holds the role but adds no new power; neither the sunset switch nor the transfer moves funds or unlocks liquidity | Residual: a steward can hand the $DOLL edge to a successor **they** chose, and once the delay elapses that is permanent. Mainnet: a **single cold-signer address, deliberately not a multisig** (design decision 2026-09-11), the transfer delay is the recoverability mechanism instead of key-sharing; `address(0)` removes the sunset power and the upgrade path together (but is itself then permanent, since a role that is `address(0)` cannot announce its own transfer either). |
+| **Steward (insider)** | one of two role addresses in the protocol (with the developer) | `announceSunset` (once, `sunsetDelay`: mainnet 7 days, testnet 1 hour, floor 1 hour, successor must have code, no shorten, no second call; refused on an unadopted continuation, `NotAdopted`, audit 2) and `cancelSunset` (once ever, and only strictly before `sunsetAt`); **the role itself is transferable** on a separate 7-day announce/permissionless-execute/cancel delay (`announceStewardTransfer`/`executeStewardTransfer`/`cancelStewardTransfer`, §M) that changes who holds the role but adds no new power; neither the sunset switch nor the transfer moves funds or unlocks liquidity | Residual: a steward can hand the $DOLL edge to a successor **they** chose, and once the delay elapses that is permanent. Mainnet: a **single cold-signer address, deliberately not a multisig**; the transfer delay is the recoverability mechanism instead of key-sharing; `address(0)` removes the sunset power and the upgrade path together (but is itself then permanent, since a role that is `address(0)` cannot announce its own transfer either). |
 | **Malicious successor (F2, sharpened by audit 4)** | a contract named by the sunset that burns gas, reverts, or is not a deployment at all | **Gas bounds, not just `try/catch`:** the vault's hop runs on `min(FORWARD_GAS = 6M, gasleft − BOOK_GAS_RESERVE = 1.5M)` and is skipped when that is zero, so ≥1.5M gas is always left to **queue** the fee in `pendingForward` (never book it locally, audit 4) and let the swap finish; the hook's resolution legs are `staticcall{gas: 30_000}` each, and a dirty-word return is treated as "no answer" rather than reverting the `abi.decode` (audit 7A). A failure at full budget arms a one-shot negative cache (`forwardingFailed`, `successorUnresolvable`) and is never retried; on `forwardingFailed` every later fee is queued directly with no attempt. `accrueForwarded`/`receiveForward` are `NotPriorVault`-gated and never recurse, a hostile or sunset successor queues for its own flush instead of trying a second hop in the same call. `flushForward` is permissionless, so anyone can pay to push a queue on, one hop per call. `cancelSunset` is the pre-effect escape hatch | Closed for *bricking* (`Sunset.t.sol::test_aGasBurningSuccessorCannotBrickSwaps`, `Sunset.t.sol::test_aDirtyWordSuccessorCannotBrickRoutes`): the swap always finishes and costs at most one hostile attempt. Residual: a successor can *keep* a fee it successfully receives (that is the point of the handover) and pay it out under its own splits; and once a negative cache is armed, every later fee for that pool queues instead of forwarding in-swap (still recoverable by `flushForward`, not lost). |
 | **Competing trunk (F1)** | deploys a continuation, or races the incumbent during the sunset delay, to crown a second token at the same canonical index | Lazy head adoption: a continuation adopts nothing at construction, delegates every read to the prior registry, and may open its first round only when the prior version is sunset-effective, names *it* as `successor()`, and is `isIdle()`, otherwise `PriorNotHandedOver` | Closed. There is exactly **one canonical trunk** by construction: the prior head cannot move at the instant it is copied, and the prior version can never open another round. |
-| **Developer (insider)** | a named payout address, transferable | `claimDev` withdraws only the accrued 20% $DOLL under whoever currently holds the role; the role itself moves only on `FeeVault`'s 7-day announce/execute/cancel delay (§M); no other privilege exists | Residual is off-chain: whoever deploys chooses the curve, the splits, the hop fee, `GENESIS_TOKEN`, the steward, and the hook salt. There is no developer allocation of any family token for this role to also receive (review 5, §B.1). The single-key risk is mitigated the same way as the steward's: a 7-day transfer path instead of a multisig. |
-| **`DevVesting` beneficiary (insider), REMOVED (review 5)** | the address `release()` pays; not necessarily the same address as `developer` after either transfers | `DevVesting` and `DevVestingDeployer` are deleted from the tree along with the developer allocation they paid | N/A, there is no vesting beneficiary role anywhere in this deployment. |
+| **Developer (insider)** | a named payout address, transferable | `claimDev` withdraws only the accrued 20% $DOLL under whoever currently holds the role; the role itself moves only on `FeeVault`'s 7-day announce/execute/cancel delay (§M); no other privilege exists | Residual is off-chain: whoever deploys chooses the curve, the splits, the hop fee, `GENESIS_TOKEN`, the steward, and the hook salt. There is no developer allocation of any family token for this role to also receive (§B.1). The single-key risk is mitigated the same way as the steward's: a 7-day transfer path instead of a multisig. |
+| **`DevVesting` beneficiary (insider), REMOVED** | the address `release()` pays; not necessarily the same address as `developer` after either transfers | `DevVesting` and `DevVestingDeployer` are deleted from the tree along with the developer allocation they paid | N/A, there is no vesting beneficiary role anywhere in this deployment. |
 | **Protocol-level outsider** | the PoolManager owner / protocol-fee controller on 4663 | none, these are Uniswap's addresses, not ours | Uniswap's v4 protocol fee (capped, controller-set) applies to our pools like any other; we do not control it. |

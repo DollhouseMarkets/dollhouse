@@ -128,6 +128,17 @@ abstract contract FamilyTestBase is Test {
     uint256 internal constant H_FRAC_WAD = 1.5e15;
     uint256 internal constant H_MIN_FRAC_WAD = 3.75e14;
 
+    /// @dev {_factoryArgs} defaults to the tranche-1 threshold above; `DeployConstantsTest`
+    /// overrides these to the real, locked docs/DEPLOY_CONSTANTS.md values (both zero: the
+    /// threshold is disabled in this deployment).
+    function _hFracWad() internal view virtual returns (uint256) {
+        return H_FRAC_WAD;
+    }
+
+    function _hMinFracWad() internal view virtual returns (uint256) {
+        return H_MIN_FRAC_WAD;
+    }
+
     /// @dev The deploy-target standard curve: a four-range ladder in parent-supply units,
     /// shares 20/25/35/20% over FDV ratios 1e-3 -> 1e-2 -> 1e-1 -> 1 -> 100 (the last is the tail).
     function _standardCurveSpec() internal pure returns (CurveSegment[] memory spec) {
@@ -208,7 +219,7 @@ abstract contract FamilyTestBase is Test {
     }
 
     /// @dev Give `who` `amount` of the edge currency.
-    function _fundDoll(address who, uint256 amount) internal {
+    function _fundDoll(address who, uint256 amount) internal virtual {
         doll.mint(who, amount);
     }
 
@@ -405,8 +416,8 @@ abstract contract FamilyTestBase is Test {
         a.bidDeployer = bidDeployerAddress;
         a.router = sp.router;
         a.hopFeePpm = _hopFeePpm();
-        a.hFracWad = H_FRAC_WAD;
-        a.hMinFracWad = H_MIN_FRAC_WAD;
+        a.hFracWad = _hFracWad();
+        a.hMinFracWad = _hMinFracWad();
         a.genesisToken = address(doll);
         a.bond = _bondSchedule();
         a.maxIndex = maxIndex;

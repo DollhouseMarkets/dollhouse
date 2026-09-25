@@ -33,8 +33,7 @@ import {CurveRange} from "./types/CurveRange.sol";
 /// the gas. No owner, no setter, no way to move value anywhere but into a Locker position or to
 /// the keeper that earned the bounty.
 ///
-/// @dev Split out of `FeeVault` because the two together no longer fit under EIP-170
-/// (the private run log). The seam is exactly the keeper/bid machinery: the TWAP band guard, the
+/// @dev Split out of `FeeVault` because the two together do not fit under EIP-170. The seam is exactly the keeper/bid machinery: the TWAP band guard, the
 /// active-range reserve cap, the bid range and the launch-curve cold start. The vault keeps the
 /// ledgers and exposes four tightly scoped hooks that ONLY this contract may call
 /// ({FeeVault.consumeAncestorClaim}, {FeeVault.consumeReinforcement},
@@ -110,7 +109,7 @@ contract BidDeployer is IBidDeployer {
     bool public immutable isContinuation;
 
     /// @notice KEEPER ECONOMICS. The proportional 1% bounty is worth less than the gas
-    /// of the call at beta scale (Run 2: gas about 215x the bounty at j = 1), so nobody would ever
+    /// of the call at beta scale (gas about 215x the bounty at j = 1), so nobody would ever
     /// deploy a bid. A deployment therefore pays
     /// `max(1% of the value deployed, MIN_BOUNTY_DOLL)`, still out of the SAME generation's
     /// entitlement and still capped at {MAX_BOUNTY_SHARE_BPS} of what the call consumes.

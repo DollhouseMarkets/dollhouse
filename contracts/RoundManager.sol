@@ -212,7 +212,7 @@ contract RoundManager {
     /// A constructor argument of 0 therefore means the Fenwick cap, and anything above it is
     /// refused at construction rather than crowning a link whose sleeve would revert.
     uint256 public immutable MAX_INDEX;
-    /// @notice Base threshold as a fraction of the parent supply (WAD), `h` in the brief.
+    /// @notice Base threshold as a fraction of the parent supply (WAD), `h` in the protocol specification.
     uint256 public immutable H_FRAC_WAD;
     /// @notice Floor the threshold decays to, as a fraction of the parent supply (WAD).
     uint256 public immutable H_MIN_FRAC_WAD;

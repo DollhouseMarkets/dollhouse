@@ -6,8 +6,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {FamilyFactory} from "../contracts/FamilyFactory.sol";
 
 /// @notice EIP-170. `forge test` runs with the contract size limit DISABLED, which is why a
-/// 25,550-byte `FeeVault` passed 119 tests and then failed the real deploy at transaction 2
-/// (the private run log). This test deploys the whole stack the way the deploy script does and
+/// 25,550-byte `FeeVault` can pass every test and still fail a real deploy. This test deploys the whole stack the way the deploy script does and
 /// measures the runtime code of every address in it, so a regression is caught here rather than
 /// on a chain.
 contract CodeSizeTest is RoundTestBase {

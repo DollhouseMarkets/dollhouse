@@ -30,7 +30,7 @@ contract DeployConstantsTest is RoundTestBase {
     uint256 internal constant D_BOND_BASE = 0.008 ether;
     uint256 internal constant D_BOND_DOUBLING_EVERY = 4;
     uint256 internal constant D_BOND_MAX = 0.008 ether;
-    uint256 internal constant D_H_FRAC_WAD = 1.5e15; // 0.15% of parent supply
+    uint256 internal constant D_H_FRAC_WAD = 0; // threshold disabled in this deployment
     uint64 internal constant D_TRADING_S = 900;
     uint64 internal constant D_SUBMIT_S = 300;
     /// @dev Developer allocation: 3% of the GENESIS supply, 1-month cliff, 12-month linear.
@@ -58,6 +58,16 @@ contract DeployConstantsTest is RoundTestBase {
 
     function _reinforceBps() internal pure override returns (uint256) {
         return 5_000;
+    }
+
+    /// @dev The round threshold is disabled in this deployment: both the base and the floor
+    /// are zero, so the highest-scoring candidate always wins.
+    function _hFracWad() internal pure override returns (uint256) {
+        return D_H_FRAC_WAD;
+    }
+
+    function _hMinFracWad() internal pure override returns (uint256) {
+        return D_H_FRAC_WAD;
     }
 
     /// @dev Mainnet bond: flat, not the tranche-1/testnet doubling schedule.
@@ -102,7 +112,7 @@ contract DeployConstantsTest is RoundTestBase {
         // family supply is locked liquidity, and the edge currency is an adopted external token.
         assertEq(factory.GENESIS_TOKEN(), address(doll), "the adopted edge currency");
         assertEq(vault.EDGE().toId(), uint256(uint160(address(doll))), "and the vault is denominated in it");
-        assertEq(roundManager.H_FRAC_WAD(), D_H_FRAC_WAD, "H0 = 0.15% of parent supply");
+        assertEq(roundManager.H_FRAC_WAD(), D_H_FRAC_WAD, "H0 = 0, threshold disabled in this deployment");
         assertEq(roundManager.durationFor(1), D_TRADING_S, "trading window 900 s");
         assertEq(factory.TICK_SPACING(), 60, "tick spacing 60");
 

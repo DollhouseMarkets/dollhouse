@@ -20,8 +20,8 @@
 //   node script/check-artefact-keys.mjs [deployments/<chainId>.json]
 //
 // A key that is present and ZERO is as silent as a key that is missing. With a record named on
-// the command line (or CHAIN_ID / VITE_CHAIN_ID set, resolved the way the web build resolves it,
-// private/ first), this also fails on a zero `genesisToken`, and WARNS on a zero or missing
+// the command line (or CHAIN_ID / VITE_CHAIN_ID set, resolved the way the web build resolves it),
+// this also fails on a zero `genesisToken`, and WARNS on a zero or missing
 // `entrancePoolId` or `stateView` - the legitimate but easily unnoticed "no venue behind the edge
 // currency" deployment.
 //
@@ -82,6 +82,8 @@ const OPTIONAL = [
     (r) => r.constants?.minBountyDoll,
     'keeper bounties are the proportional rate with NO floor under them',
   ],
+  ['ethZap', (r) => r.ethZap, 'the site hides the ETH buy/sell option and keeps the $DOLL-only flow'],
+  ['devVesting', (r) => r.devVesting, 'the site does not link the developer vesting wallet'],
 ]
 
 const isZero = (v) =>
@@ -109,6 +111,21 @@ if (record) {
     const why = v === undefined ? 'missing' : 'zero'
     if (isZero(v)) console.log(`  WARNING: ${label} is ${why}: ${meaning}`)
     else console.log(`  ${label} = ${v}`)
+  }
+  // The zap swaps ETH against the SAME pool the site prices $DOLL in ETH with. If a record
+  // names both, they must be the same pool - a zap pointed at a different venue would swap
+  // at a price the site never shows and never protects against.
+  if (!isZero(raw.ethZap) && !isZero(raw.entrancePoolId)) {
+    if (isZero(raw.venuePoolId)) {
+      console.log(
+        '  WARNING: ethZap is set but venuePoolId is not recorded: cannot confirm it swaps ' +
+          'the same pool entrancePoolId prices $DOLL in ETH with',
+      )
+    } else if (String(raw.venuePoolId).toLowerCase() !== String(raw.entrancePoolId).toLowerCase()) {
+      valueErrors.push(`venuePoolId (${raw.venuePoolId}) != entrancePoolId (${raw.entrancePoolId})`)
+    } else {
+      console.log(`  venuePoolId = ${raw.venuePoolId} (matches entrancePoolId)`)
+    }
   }
 } else {
   console.log('\nno deployment record checked: pass one as an argument, or set CHAIN_ID')

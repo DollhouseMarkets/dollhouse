@@ -43,7 +43,7 @@ import {V4UnlockGuard} from "./libraries/V4UnlockGuard.sol";
 ///   - `edgeBidEarmark`           EDGE, forfeited candidate bonds.
 ///
 /// @dev The EDGE sleeve and the hop fees are deliberately kept in SEPARATE mappings even though
-/// the brief lumps them together: they are denominated in different currencies (the edge currency
+/// the fee model groups them together: they are denominated in different currencies (the edge currency
 /// vs the parent token), and a single number could not be spent safely. Both are consumed by the same
 /// keeper call, `BidDeployer.deployAncestor`.
 ///

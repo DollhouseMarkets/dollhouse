@@ -15,9 +15,8 @@ import {RoundManager} from "../contracts/RoundManager.sol";
 import {CurveMath} from "../contracts/libraries/CurveMath.sol";
 import {FamilyLens} from "../contracts/FamilyLens.sol";
 
-/// @notice One whole succession round, end to end, plus the attacks the design brief and the
-/// design review call out: the submission-ordering attack, the post-bell dump, and a stale
-/// finalize.
+/// @notice One whole succession round, end to end, plus the attacks the round design must
+/// withstand: the submission-ordering attack, the post-bell dump, and a stale finalize.
 contract RoundTest is RoundTestBase {
     using StateLibrary for IPoolManager;
 

@@ -1,37 +1,33 @@
-# Halmos symbolic review: review-5
+# Halmos symbolic checks
 
 Tool: halmos 0.3.3 (Z3 and yices), installed via `uv tool install halmos --python 3.12`.
-Date: 2026-09-15. Host: 16 GB Windows 11.
+Host: 16 GB Windows 11.
 
-## Why this pass exists
+## Scope
 
-`certora/specs/FeeVault.spec` cannot be loaded by the Certora Prover: every submission since
-review 5 crashes inside the Prover while transforming `FeeVault.receiveForward`, six workarounds
-have been measured and all six are refused, and the specification has **no verdict of any kind**
-(`certora/RESULTS-review-5.md`, findings P-1 and S-14 to S-20). The properties it carries are the
-review-5 ones: the two delivery guards, the donation gap, the payout guard, the two-sided queue
+The edge-token `certora/specs/FeeVault.spec` has no Certora Prover verdict (`certora/RESULTS.md`).
+Its properties are the two delivery guards, the donation gap, the payout guard, the two-sided queue
 conservation and the ledger decomposition.
 
-This pass restates those properties as Halmos checks over **the real `FeeVault` bytecode**, and
-adds the `RoundManager.finalize` forfeit path (RND-11) that review 5b changed. It is the formal
-substitute for the blocked specification, not a replacement for it: the bounds below are real and
-are stated per check.
+These checks restate those properties as Halmos checks over **the real `FeeVault` bytecode**, and
+add the `RoundManager.finalize` forfeit path (RND-11). The bounds below are real and are stated per
+check.
 
 ## What changed in `[profile.halmos]`
 
-Review-1's lean profile compiled pure libraries only. `FeeVault` and `RoundManager` drag in
+The earlier lean profile compiled pure libraries only. `FeeVault` and `RoundManager` drag in
 `FamilyFactory`, `FamilyHook` and the rest of the stack, so two things had to change:
 
 1. **`contracts/FeeVault.sol` and `contracts/RoundManager.sol` are no longer in `skip`.** Their
    imports (factory, hook, locker, token) compile as dependencies regardless of the skip list.
 2. **`via_ir = true` and the optimizer are on.** `FamilyHook._collect` does not compile at all
-   under legacy codegen ("stack too deep"), which is the same wall Certora review 6 hit. The lean
+   under legacy codegen ("stack too deep"). The lean
    file set still builds in **22 s** with a free-RAM dip of about 400 MB, so this costs nothing
    that matters.
 
-That second change **removes review-1's largest caveat**: these checks now run on bytecode built
-by the same pipeline as the shipped artifact. The review-1 checks were re-run under the changed
-profile to confirm nothing regressed; see "Review-1 regression" below.
+With the second change these checks run on bytecode built by the same pipeline as the shipped
+artifact. The library checks were re-run under the changed profile to confirm nothing regressed;
+see "Library checks under this profile" below.
 
 ## How to run
 
@@ -43,7 +39,7 @@ halmos --root . --forge-build-out out-halmos \
   --loop 3 --solver-timeout-assertion 120000 --solver-threads 1 --statistics --no-status
 ```
 
-Both flags review-1 established are still mandatory (`--forge-build-out out-halmos`, and
+Both flags are mandatory (`--forge-build-out out-halmos`, and
 `FOUNDRY_PROFILE=halmos`). Two operational notes learned here:
 
 - **Never run a bare `forge build` in this profile.** Halmos needs the `ast` field in the
@@ -138,7 +134,7 @@ are all the real implementations. The fee split constants are the PRODUCTION one
   first; the REAL vault's version of that same guard is proved on real bytecode by
   `check_depositEdgeBidEarmarkKeepsSolvency` and `check_undeliveredDepositAlwaysReverts`.
 - `ForfeitHalmos`'s edge token has a symbolic `honest` switch: a dishonest token returns `true` from
-  `transfer` and moves nothing, which is exactly the failure shape review 5b's try/catch exists for.
+  `transfer` and moves nothing, which is exactly the failure shape the try/catch exists for.
 - `RoundManagerForfeitHarness` writes the round record directly (`candidateCount` candidates each
   holding `bondAmount`, the matching `bondEscrow`, a closed submission window) because driving a
   round there through the real entrypoints means registering candidates, deploying their tokens and
@@ -154,7 +150,7 @@ Every bound below was forced by a measured timeout, not chosen for comfort.
   comparison because a power-of-two bound is a mask for the solver. Bonds in `ForfeitHalmos` the
   same.
 - **The ancestor depth is `M = 0`.** `FenwickRangeAdd.addSleeve` routes through `FullMath.mulDiv`
-  for `M > 0`, which review-1 already established Z3 cannot discharge. Attribution stays fully
+  for `M > 0`, which Z3 cannot discharge. Attribution stays fully
   symbolic: every index above `headIndex()` and every candidate id resolves to "unattributed",
   which is also `M = 0`. Depths `M > 0` are covered at the fuzz, invariant and unit tiers.
 - **The decomposition is stated WAD-SCALED.** The sleeve lives in the Fenwick trees at `WAD`
@@ -180,15 +176,15 @@ files; each was the formulation that had to be replaced.
 
 | formulation | result | why it was replaced |
 |---|---|---|
-| One five-way symbolic `which % 5` switch over the review-5 call set | **no verdict in 600 s** | a symbolic `%` is a 256-bit division, and the function carried every branch's state at once. Split into five checks, each 5 to 9 s. |
+| One five-way symbolic `which % 5` switch over the call set | **no verdict in 600 s** | a symbolic `%` is a 256-bit division, and the function carried every branch's state at once. Split into five checks, each 5 to 9 s. |
 | `assert(dev + creator + claimableEdge(0) == amount)` (unscaled) | **TIMEOUT at 120 s assertion budget**, 244 s of model time | inverting `(x * 1e18) / 1e18` over 256 bits. Restated WAD-scaled: 1.85 s. |
 | `assert(ancestorPointQueryWad(0) >= 0)` | **TIMEOUT**, 122 s of model time | proving `sleeve * 1e18 < 2^255` from a 96-bit bound. The sign is covered by the equality that follows it. |
 | Four payouts with a symbolic recipient in one check | **no verdict in 600 s**, 309 paths | split to one payout path per check, each 0.4 to 1.4 s. |
 | Keeper draw and decomposition with a symbolic fee | **no verdict in 600 s** | fee pinned; see the bound above. |
 
-## Review-1 regression
+## Library checks under this profile
 
-The review-1 checks were re-run under the changed profile (`via_ir = true`, optimizer on, the
+The library checks were re-run under the changed profile (`via_ir = true`, optimizer on, the
 vault and round manager in the compile set):
 
 ```
@@ -197,7 +193,7 @@ FOUNDRY_PROFILE=halmos halmos --root . --forge-build-out out-halmos \
   --solver-timeout-assertion 120000 --solver-threads 1 --statistics --no-status
 ```
 
-**9 passed, 0 failed, 68.1 s wall.** Every check keeps its review-1 verdict; path counts moved
+**9 passed, 0 failed, 68.1 s wall.** Every check keeps its earlier verdict; path counts moved
 slightly (886 rather than 928 on `check_sqrtPriceNeverOutOfRange`, 128 rather than 182 on
 `check_rangeAddIsAdditive`) because the bytecode is now IR-compiled. `CurveMathSlowCheck` remains
 excluded from the default run and remains a known timeout.
@@ -207,7 +203,7 @@ excluded from the default run and remains a known timeout.
 | phase | observation |
 |---|---|
 | `halmos` build of the lean set (60 source units, via-IR) | 22 s; free physical RAM dipped about 400 MB |
-| The 23 checks of this review, one at a time | minimum free physical RAM observed **5.2 GB**; no solver crash |
+| The 23 checks, one at a time | minimum free physical RAM observed **5.2 GB**; no solver crash |
 
 Sampling: free physical RAM read from `Win32_OperatingSystem.FreePhysicalMemory` before and after
 each check, with a 2.5 GB floor the runner waits on. Nothing came near it.

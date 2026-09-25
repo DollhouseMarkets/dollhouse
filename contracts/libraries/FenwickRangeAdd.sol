@@ -69,7 +69,7 @@ library FenwickRangeAdd {
         }
     }
 
-    /// @notice Range-add one ancestor sleeve over `[0, M]` with the brief's weight family
+    /// @notice Range-add one ancestor sleeve over `[0, M]` with the specification's weight family
     /// `w(r) = 2 - 5r + 4r^2`, `r = j/M`, normalised by `Z(M) = (M+1)(5M+4)/(6M)`.
     /// @dev Coefficients are WAD-scaled so that `c1 = -5a/M` and `c2 = 4a/M^2` keep their
     /// precision; `a = sleeve / Z(M)`. Every division floors, so the point queries sum to

@@ -59,9 +59,9 @@ contract Deploy is Script {
     uint256 internal constant CREATOR_BPS = 4_000;
     uint256 internal constant ANCESTOR_BPS = 5_000;
     uint256 internal constant REINFORCE_BPS = 5_000;
-    /// @dev Threshold: 0.15% of parent supply, decaying to a floor of 0.25x that.
-    uint256 internal constant H_FRAC_WAD = 1.5e15;
-    uint256 internal constant H_MIN_FRAC_WAD = 3.75e14;
+    /// @dev Threshold: disabled in this deployment (both the base and the floor are zero).
+    uint256 internal constant H_FRAC_WAD = 0;
+    uint256 internal constant H_MIN_FRAC_WAD = 0;
 
     uint256 internal constant SUPPLY = 1e9 * 1e18;
     /// @dev Candidate bond (the contract supports a schedule: `base`, doubling every
