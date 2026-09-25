@@ -124,8 +124,8 @@ contract RouterPropTest is RoundTestBase {
         }
     }
 
-    /// @notice ROU-04: index 0 - the adopted edge currency - is adjacent only to index 1. Review
-    /// 5 removed the native sentinel entirely, so adjacency is a pure index relation now.
+    /// @notice ROU-04: index 0 - the adopted edge currency - is adjacent only to index 1. There
+    /// is no native sentinel, so adjacency is a pure index relation.
     function testFuzz_ROU04_theEdgeCurrencyOnlyTouchesLinkOne(uint256 indexSeed, uint256 ethIn) public {
         uint256 index = bound(indexSeed, 2, 2);
         ethIn = bound(ethIn, 0.001 ether, 1 ether);

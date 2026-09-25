@@ -38,10 +38,11 @@ The mainnet contract addresses are listed in `deployments/4663.json` and on the 
 
 ## Audit record
 
-`docs/security/README.md` lists every assurance method and where its result is held: formal
-verification with the Certora Prover (`certora/RESULTS.md`), an automated audit with V12,
-independent manual adversarial passes over the code, unit, property and invariant tests, symbolic checks with Halmos, and
-fork tests against the live Uniswap v4 `PoolManager` (`docs/security/FORK_RESULTS.md`).
+The audit record is [`docs/security/README.md`](docs/security/README.md): every assurance method,
+its result and the file that holds it. It covers formal verification with the Certora Prover
+(`certora/RESULTS.md`), an automated audit with V12, 12 independent reviews, unit, property and
+invariant tests, fork tests against the live Uniswap v4 `PoolManager`, symbolic checks with Halmos,
+static analysis with Slither and fuzzing with Medusa.
 
 ## Build and test
 
@@ -62,9 +63,10 @@ Fork tests (`test/fork/`) need an RPC endpoint; the command is in `docs/security
 ## Repository layout
 
 - `contracts/`: the protocol.
-- `test/`: unit, property and fork tests.
-- `script/`: the deploy script (`Deploy.s.sol`) and its artefact-key checker
-  (`check-artefact-keys.mjs`).
+- `test/`: unit, property, fork, symbolic and Medusa tests; `test/README.md` describes each group.
+- `script/`: the deploy scripts (`Deploy.s.sol`, `DeployZap.s.sol`, `DeployVesting.s.sol`) and the
+  artefact-key checker (`check-artefact-keys.mjs`).
+- `scripts/`: `install-deps.sh` and the Medusa configuration (`security/medusa.json`).
 - `docs/spec/`: the protocol specification (`PROTOCOL_SPEC.md`, `PROPERTIES.md`).
 - `docs/security/`: the audit record and its tool summaries.
 - `certora/`: the formal verification specs, configs and results.

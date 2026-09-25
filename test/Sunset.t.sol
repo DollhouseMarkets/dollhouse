@@ -12,6 +12,8 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {FamilyFactory} from "../contracts/FamilyFactory.sol";
 import {FamilyLens} from "../contracts/FamilyLens.sol";
 import {RoundManager} from "../contracts/RoundManager.sol";
+import {FeeVault} from "../contracts/FeeVault.sol";
+import {IFeeVault} from "../contracts/interfaces/IFeeVault.sol";
 
 /// @notice The ENTIRE privileged surface of the protocol: an immutable steward that may, once,
 /// announce that this version stops opening new rounds seven days from now. These tests pin down
@@ -427,6 +429,312 @@ contract SunsetTest is RoundTestBase {
         vm.expectRevert(RoundManager.SunsetNotCancellable.selector);
         roundManager.cancelSunset();
     }
+
+    /// @dev The edge currency's ledger key: $DOLL.
+    Currency internal constant EDGE = Currency.wrap(DOLL_ADDRESS);
+    /// @dev The attribution the EDGE fee is queued under: the terminal canonical index, which for
+    /// a $DOLL -> link-one buy is 1. The edge is not at index 0.
+    uint256 internal constant QUEUE_KEY = 1;
+
+    /// @dev Declared locally so that {vm.expectEmit} can name them before the vault does.
+    event SuccessorDeclaredDead(address indexed successor, uint256 attribution, uint256 amount);
+    event SuccessorDeliveryFailed(uint256 indexed attribution, bytes reason);
+    event SuccessorUnresolved(address indexed successor);
+    event SuccessorDeliveryEvidenceCleared(uint256 indexed attribution);
+
+    // ---------------------------------------------------------------------------------
+    // The successor hop runs behind the reentrancy lock, on a complete ledger
+    // ---------------------------------------------------------------------------------
+
+    /// @notice POST-SUNSET HANDOVER, HOSTILE SUCCESSOR. `accrue` hands control to a successor
+    /// vault that is unknown third-party code. It now does so behind the vault's own reentrancy
+    /// lock and with `ledgerTotal` already credited in full, so a successor that calls back in
+    /// can neither move a ledger nor observe an understated one. Conservation is asserted: the
+    /// whole ETH edge is either in this vault's ledger or in the successor's hands.
+    ///
+    /// The solvency invariant is asserted DURING the hop as well. The protocol
+    /// share's refund is the instruction BEFORE the ERC-6909 transfer, not after it: were the
+    /// refund to run after the transfer returned, the claim would have left the vault while
+    /// `ledgerTotal` still counted it for the whole of the successor's call -
+    /// `ledgerTotal > holdings` in exactly the window where foreign code reads the vault. With the
+    /// refund first, `ledgerTotal <= holdings` holds at every point, and the property that the
+    /// ledger never UNDERSTATES what the vault holds is unchanged because the debit and
+    /// the holding it accounts for move together and roll back together.
+    function test_aHostileSuccessorCannotReenterTheAccrualPath() public {
+        HostileSuccessorVault hostile = new HostileSuccessorVault(vault, IPoolManager(address(manager)));
+        SuccessorFactoryStub sf = new SuccessorFactoryStub(address(hostile));
+        SuccessorRegistryStub sr = new SuccessorRegistryStub(address(sf));
+
+        vm.prank(steward);
+        roundManager.announceSunset(address(sr));
+        vm.warp(roundManager.sunsetAt());
+        assertTrue(roundManager.isSunsetEffective(), "the handover is live");
+
+        uint256 ledgerBefore = vault.ledgerTotal(EDGE);
+        uint256 devBefore = vault.devBalance();
+        uint256 hopBefore = vault.reinforcementBalance(address(doll));
+
+        uint256 spend = 1 ether;
+        uint256 out = familyRouter.buyExactIn(1, spend, 0, address(this), 4);
+        assertGt(out, 0, "the swap is never failed by the handover");
+
+        uint256 protocolFee = (spend * PROTOCOL_FEE_PPM) / PPM;
+        uint256 hopFee = (spend * HOP_FEE_PPM) / PPM;
+
+        // THE PROBE: the successor's re-entry into the vault was refused by the lock
+        assertTrue(hostile.reentered(), "the successor did try to come back in");
+        assertEq(hostile.flushRevert(), FeeVault.Reentrancy.selector, "flushForward is locked out");
+        assertEq(hostile.accrueRevert(), FeeVault.Reentrancy.selector, "and accrue itself is locked");
+
+        // the hop was completed, so the protocol share left as a claim and the ledger gave it up
+        assertEq(
+            manager.balanceOf(address(hostile), uint256(uint160(address(doll)))),
+            protocolFee,
+            "the successor holds the edge"
+        );
+        assertEq(vault.ledgerTotal(EDGE) - ledgerBefore, hopFee, "this version books the hop fee only");
+        assertEq(vault.reinforcementBalance(address(doll)) - hopBefore, hopFee, "and it is the reinforcement");
+        assertEq(vault.devBalance(), devBefore, "no local ledger moved during the foreign call");
+        assertEq(vault.pendingForward(1), 0, "nothing had to be queued");
+
+        // ...and what the foreign code saw while it held control
+        assertEq(hostile.ledgerInside(), ledgerBefore + hopFee, "the share was given up BEFORE the claim left");
+        assertLe(hostile.ledgerInside(), hostile.holdingsInside(), "the ledger never overstates, mid-hop either");
+        assertGe(hostile.ledgerInside(), ledgerBefore, "and it never understates what stayed behind");
+
+        // CONSERVATION: every wei of the edge is accounted for, and the vault is still solvent
+        assertEq(protocolFee + hopFee, (spend * TOTAL_FEE_PPM) / PPM, "the whole fee is one of the two");
+        _assertSolvent();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // A successor that never answers may not freeze the queue forever
+    // ---------------------------------------------------------------------------------
+
+    /// @dev Sunset this version in favour of a stack that RESOLVES to a vault which refuses every
+    /// delivery, and charge one edge fee so that the forward queue holds something. A successor
+    /// that does not resolve at all is a different case entirely and is never
+    /// evidence of a dead one, so the recovery path has to be exercised against a real refusal.
+    function _queueBehindADeadSuccessor() internal returns (address stub, uint256 fee) {
+        FlakySuccessorVault v = new FlakySuccessorVault();
+        v.setFailing(true);
+        stub = _sunsetTowards(address(v));
+        // the canonical router attributes the edge to the terminal index, so the queue key is 0
+        familyRouter.buyExactIn(1, 1 ether, 0, address(this), 1);
+        fee = 1 ether / 100;
+        assertEq(vault.pendingForward(QUEUE_KEY), fee, "the edge is queued, not booked");
+    }
+
+    /// @notice The queue is not allowed to depend entirely on a successor that
+    /// answers: the escape is TWO-PHASE. The first full-budget failure only
+    /// records evidence against that attribution and forwards nothing; only a SECOND full-budget
+    /// failure, {FeeVault.DEAD_SUCCESSOR_DELAY} after the first, books the fee here.
+    function test_aDeadSuccessorCannotFreezeTheQueueForever() public {
+        (address stub, uint256 fee) = _queueBehindADeadSuccessor();
+        uint256 attribution = QUEUE_KEY;
+        uint256 devBefore = vault.devBalance();
+
+        // PHASE ONE: the successor's vault refuses the delivery, which is said out loud, and the
+        // failure is recorded rather than acted on
+        uint64 evidenceAt = uint64(block.timestamp);
+        vm.expectEmit(true, false, false, false, address(vault));
+        emit SuccessorDeliveryFailed(attribution, "");
+        assertEq(vault.flushForward(attribution, type(uint256).max), 0, "nothing is forwarded on the first failure");
+        assertEq(vault.deadEvidenceAt(attribution), evidenceAt, "the clock starts HERE, on evidence");
+        assertEq(vault.pendingForward(attribution), fee, "still queued");
+        assertEq(vault.devBalance(), devBefore, "and nothing booked locally");
+        _assertSolvent();
+
+        // inside the timelock the fee stays queued: the successor may still come to life
+        vm.warp(uint256(evidenceAt) + 29 days);
+        assertEq(vault.flushForward(attribution, type(uint256).max), 0, "still nothing");
+        assertEq(vault.pendingForward(attribution), fee, "still queued");
+        assertEq(vault.devBalance(), devBefore, "still nothing booked");
+
+        // PHASE TWO: the delay has run out behind the recorded evidence AND this attempt failed
+        vm.warp(uint256(evidenceAt) + 30 days + 1);
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit SuccessorDeclaredDead(stub, attribution, fee);
+        uint256 flushed = vault.flushForward(attribution, type(uint256).max);
+
+        assertEq(flushed, fee, "the whole queued fee was recovered");
+        assertEq(vault.pendingForward(attribution), 0, "the queue is empty");
+        assertEq(vault.pendingForwardTotal(), 0, "and so is its total");
+        assertGt(vault.devBalance() - devBefore, 0, "booked with this version's split");
+        _assertSolvent();
+    }
+
+    /// @notice A successor that does not RESOLVE YET is not a successor that is
+    /// DEAD. The registry names a stack whose vault is still to be deployed at the address its
+    /// factory already publishes; until that address has code there is no delivery attempt to
+    /// fail, so the flush says so and records NOTHING. Counting an unresolved hop as evidence let
+    /// this version take the whole queue for itself thirty days into a handover that was merely
+    /// unfinished, without one real delivery ever having been refused.
+    function test_anUnresolvedSuccessorIsNeverEvidenceOfADeadOne() public {
+        // the address the successor's factory publishes, before anything is deployed at it
+        address predicted = address(0xFEE7A17);
+        address successor = _sunsetTowards(predicted);
+        familyRouter.buyExactIn(1, 1 ether, 0, address(this), 1);
+        uint256 fee = 1 ether / 100;
+        uint256 attribution = QUEUE_KEY;
+        uint256 devBefore = vault.devBalance();
+        assertEq(vault.pendingForward(attribution), fee, "the edge is queued, not booked");
+
+        // day 0, full gas: the resolution fails, which is said out loud and is all that happens
+        vm.expectEmit(true, false, false, false, address(vault));
+        emit SuccessorUnresolved(successor);
+        assertEq(vault.flushForward(attribution, type(uint256).max), 0, "there is nobody to deliver to");
+        assertEq(vault.deadEvidenceAt(attribution), 0, "an unresolved successor is not evidence");
+
+        // day 31, full gas: a month of the same answer is still not evidence, and the timelock
+        // has nothing to run against
+        vm.warp(block.timestamp + 31 days);
+        assertEq(vault.flushForward(attribution, type(uint256).max), 0, "still nothing forwarded");
+        assertEq(vault.deadEvidenceAt(attribution), 0, "and still no evidence");
+        assertEq(vault.pendingForward(attribution), fee, "the fee is still the successor's");
+        assertEq(vault.devBalance(), devBefore, "nothing was booked locally");
+        _assertSolvent();
+
+        // the vault is deployed at the address the factory always named, and the queue goes
+        // where it belongs
+        vm.etch(predicted, address(new FlakySuccessorVault()).code);
+        assertEq(vault.flushForward(attribution, type(uint256).max), fee, "delivered");
+        assertEq(vault.pendingForward(attribution), 0, "the queue is empty");
+        assertEq(doll.balanceOf(predicted), fee, "the successor really has the $DOLL");
+        _assertSolvent();
+    }
+
+    /// @notice THE PROPERTY. The clock runs on evidence about the successor itself, NOT on when
+    /// the queue filled: a perfectly healthy successor that simply had nothing pushed to it for
+    /// thirty days is never declared dead by the very FIRST flush ever made, on one transient
+    /// revert. It takes two full-budget failures a month apart, and one transient revert is not
+    /// two.
+    function test_aHealthySuccessorCannotBeDeclaredDead() public {
+        (FlakySuccessorVault successorVault, uint256 fee) = _queueBehindAFlakySuccessor();
+        uint256 attribution = QUEUE_KEY;
+        uint256 devBefore = vault.devBalance();
+
+        // the OLD clock is long expired: the queue has been sitting here for a month
+        uint64 flushedAt = uint64(block.timestamp + 30 days + 1);
+        vm.warp(flushedAt);
+
+        // ...and the successor reverts once, the way a live contract transiently can
+        successorVault.setFailing(true);
+        assertEq(vault.flushForward(attribution, type(uint256).max), 0, "the transient revert forwards nothing");
+        assertEq(vault.devBalance(), devBefore, "and books NOTHING locally: one revert is not evidence enough");
+        assertEq(vault.pendingForward(attribution), fee, "the fee is still the successor's");
+        assertEq(vault.deadEvidenceAt(attribution), flushedAt, "it only started the clock");
+        _assertSolvent();
+
+        // the successor is healthy again, so the very next flush delivers
+        successorVault.setFailing(false);
+        uint256 flushed = vault.flushForward(attribution, type(uint256).max);
+        assertEq(flushed, fee, "delivered");
+        assertEq(doll.balanceOf(address(successorVault)), fee, "the successor really has the $DOLL");
+        assertEq(vault.devBalance(), devBefore, "still nothing booked here");
+        _assertSolvent();
+    }
+
+    /// @notice ...and a delivery WITHDRAWS the evidence, so a successor that has one bad month
+    /// does not carry a half-spent death sentence forever.
+    function test_evidenceClearsOnDelivery() public {
+        (FlakySuccessorVault successorVault, uint256 fee) = _queueBehindAFlakySuccessor();
+        uint256 attribution = QUEUE_KEY;
+
+        uint64 firstFailureAt = uint64(block.timestamp);
+        successorVault.setFailing(true);
+        vault.flushForward(attribution, type(uint256).max);
+        assertEq(vault.deadEvidenceAt(attribution), firstFailureAt, "evidence stands");
+
+        // half the queue is delivered: that is proof of life
+        successorVault.setFailing(false);
+        vm.expectEmit(true, false, false, false, address(vault));
+        emit SuccessorDeliveryEvidenceCleared(attribution);
+        assertEq(vault.flushForward(attribution, fee / 2), fee / 2, "half forwarded");
+        assertEq(vault.deadEvidenceAt(attribution), 0, "and the evidence is withdrawn");
+
+        // so a later failure starts a FRESH thirty days rather than completing the old ones
+        uint64 secondFailureAt = firstFailureAt + 29 days;
+        vm.warp(secondFailureAt);
+        successorVault.setFailing(true);
+        vault.flushForward(attribution, type(uint256).max);
+        assertEq(vault.deadEvidenceAt(attribution), secondFailureAt, "the clock restarted here");
+        vm.warp(uint256(secondFailureAt) + 29 days);
+        uint256 devBefore = vault.devBalance();
+        assertEq(vault.flushForward(attribution, type(uint256).max), 0, "29 days is not 30");
+        assertEq(vault.devBalance(), devBefore, "nothing booked on the old clock");
+        _assertSolvent();
+    }
+
+    /// @notice The queue entry and the ledger are debited BEFORE the successor is
+    /// called, so at no instant of ITS execution does this vault count the same wei twice - once
+    /// as $DOLL already sent and once as still queued. The successor reads the prior vault from
+    /// inside `receiveForward` and the numbers it sees are the ones that must hold.
+    function test_noTransientDoubleCountDuringTheHandoverCall() public {
+        (ObservingSuccessorVault successorVault, uint256 fee) = _queueBehindAnObservingSuccessor();
+        uint256 attribution = QUEUE_KEY;
+
+        assertEq(vault.flushForward(attribution, type(uint256).max), fee, "delivered");
+        assertEq(successorVault.seenPending(), 0, "the queue no longer counts what is already in flight");
+        assertLe(successorVault.seenLedger(), successorVault.seenHoldings(), "and the vault looks solvent throughout");
+        _assertSolvent();
+    }
+
+    /// @dev Sunset this version in favour of a stack that DOES resolve to a vault, and charge one
+    /// edge fee. The in-swap hop fails (the stub has no `accrueForwarded`), so the fee queues
+    /// exactly as it does behind a dead successor - but the flush path can reach it.
+    function _queueBehindAFlakySuccessor() internal returns (FlakySuccessorVault v, uint256 fee) {
+        v = new FlakySuccessorVault();
+        _sunsetTowards(address(v));
+        familyRouter.buyExactIn(1, 1 ether, 0, address(this), 1);
+        fee = 1 ether / 100;
+        assertEq(vault.pendingForward(QUEUE_KEY), fee, "the edge is queued, not booked");
+    }
+
+    function _queueBehindAnObservingSuccessor() internal returns (ObservingSuccessorVault v, uint256 fee) {
+        v = new ObservingSuccessorVault(address(vault));
+        _sunsetTowards(address(v));
+        familyRouter.buyExactIn(1, 1 ether, 0, address(this), 1);
+        fee = 1 ether / 100;
+        assertEq(vault.pendingForward(QUEUE_KEY), fee, "the edge is queued, not booked");
+    }
+
+    /// @dev Name a successor whose `factory().feeVault()` resolves to `successorVault`.
+    function _sunsetTowards(address successorVault) internal returns (address successor) {
+        SuccessorFactoryStub f = new SuccessorFactoryStub(successorVault);
+        SuccessorRegistryStub reg = new SuccessorRegistryStub(address(f));
+        successor = address(reg);
+        vm.prank(steward);
+        roundManager.announceSunset(successor);
+        vm.warp(roundManager.sunsetAt());
+    }
+
+    /// @notice ...and a caller cannot declare the successor dead by starving the hop of gas: the
+    /// recovery only arms behind a delivery attempt that had the full {FeeVault.FORWARD_GAS}, and
+    /// a thin-gas call may not even RECORD the evidence that starts the clock.
+    function test_aThinGasFlushCannotDeclareTheSuccessorDead() public {
+        (, uint256 fee) = _queueBehindADeadSuccessor();
+        uint256 attribution = QUEUE_KEY;
+        uint256 devBefore = vault.devBalance();
+
+        (bool ok,) = address(vault).call{gas: 2_000_000}(
+            abi.encodeCall(FeeVault.flushForward, (attribution, type(uint256).max))
+        );
+        assertFalse(ok, "a thin-gas flush is refused");
+        assertEq(vault.deadEvidenceAt(attribution), 0, "and it recorded no evidence against the successor");
+        assertEq(vault.pendingForward(attribution), fee, "nothing left the queue");
+        assertEq(vault.devBalance(), devBefore, "and nothing was booked locally");
+        _assertSolvent();
+
+        // the honest calls still work: one to record the evidence, one to act on it
+        uint64 recordedAt = uint64(block.timestamp);
+        vault.flushForward(attribution, type(uint256).max);
+        assertEq(vault.deadEvidenceAt(attribution), recordedAt, "full gas records it");
+        vm.warp(uint256(recordedAt) + 30 days + 1);
+        vault.flushForward(attribution, type(uint256).max);
+        assertEq(vault.pendingForward(attribution), 0, "a second full-gas flush recovers it");
+        _assertSolvent();
+    }
 }
 
 /// @dev A "successor stack" (registry, factory, router and vault in one contract) whose
@@ -517,4 +825,110 @@ contract GasBurner {
             x = uint256(keccak256(abi.encode(x)));
         }
     }
+}
+
+/// @dev A successor vault that is hostile third-party code: it takes the handover and, while the
+/// prior vault is still inside {FeeVault.accrue}, tries to come back in through the two doors
+/// a hostile successor could reach. It swallows every revert so that the handover still completes
+/// and the test can read what happened rather than just watching the swap fail.
+contract HostileSuccessorVault {
+    FeeVault internal immutable victim;
+    IPoolManager internal immutable poolManager;
+
+    bool public reentered;
+    bytes4 public flushRevert;
+    bytes4 public accrueRevert;
+    /// @dev What the victim's EDGE ledger and holdings looked like DURING the hop, read by the
+    /// foreign code the hop hands control to.
+    uint256 public ledgerInside;
+    uint256 public holdingsInside;
+
+    constructor(FeeVault _victim, IPoolManager _poolManager) {
+        victim = _victim;
+        poolManager = _poolManager;
+    }
+
+    receive() external payable {}
+
+    function accrueForwarded(uint256, uint256, uint256) external {
+        reentered = true;
+        Currency edge = victim.EDGE();
+        ledgerInside = victim.ledgerTotal(edge);
+        holdingsInside = victim.holdings(edge);
+        flushRevert = _probe(abi.encodeWithSelector(FeeVault.flushForward.selector, uint256(1), type(uint256).max));
+        accrueRevert = _probe(
+            abi.encodeWithSelector(
+                IFeeVault.accrue.selector, edge, address(0), uint256(0), uint256(0), uint256(0), false
+            )
+        );
+    }
+
+    function receiveForward(uint256, uint256) external {}
+
+    function _probe(bytes memory call) internal returns (bytes4 selector) {
+        (bool ok, bytes memory ret) = address(victim).call(call);
+        if (ok) return bytes4(0);
+        if (ret.length < 4) return bytes4(0xffffffff);
+        return bytes4(ret);
+    }
+}
+
+/// @dev `FeeVault._resolveSuccessorVault` walks `successor().factory().feeVault()`; these two
+/// stubs are that walk and nothing else.
+contract SuccessorFactoryStub {
+    address public immutable feeVault;
+
+    constructor(address v) {
+        feeVault = v;
+    }
+}
+
+contract SuccessorRegistryStub {
+    address public immutable factory;
+
+    constructor(address f) {
+        factory = f;
+    }
+}
+
+/// @dev A successor vault that takes delivery unless it is switched to failing. The switch is
+/// EXTERNAL on purpose: a revert inside `receiveForward` rolls back any state it wrote, so a
+/// self-decrementing counter would stay stuck at its initial value forever. It deliberately does
+/// NOT implement `accrueForwarded`, so the in-swap hop always fails and the fee queues.
+contract FlakySuccessorVault {
+    bool public failing;
+    uint256 public received;
+
+    function setFailing(bool f) external {
+        failing = f;
+    }
+
+    function receiveForward(uint256, uint256 amount) external {
+        if (failing) revert("transient");
+        received += amount;
+    }
+
+    receive() external payable {}
+}
+
+/// @dev A successor vault that reads the PRIOR vault's books from inside the handover call: what
+/// it sees is the state foreign code observes while the hop is in flight.
+contract ObservingSuccessorVault {
+    FeeVault internal immutable prior;
+    uint256 public seenPending;
+    uint256 public seenLedger;
+    uint256 public seenHoldings;
+
+    constructor(address _prior) {
+        prior = FeeVault(payable(_prior));
+    }
+
+    function receiveForward(uint256 attribution, uint256) external {
+        Currency edge = prior.EDGE();
+        seenPending = prior.pendingForward(attribution);
+        seenLedger = prior.ledgerTotal(edge);
+        seenHoldings = prior.holdings(edge);
+    }
+
+    receive() external payable {}
 }

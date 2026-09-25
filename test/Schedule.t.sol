@@ -434,4 +434,99 @@ contract ScheduleTest is RoundTestBase {
             roundManager.finalize();
         }
     }
+
+    // ---------------------------------------------------------------------------------
+    // The random-end window is clamped to a quarter of the round; the closing window is flat
+    // ---------------------------------------------------------------------------------
+
+    /// @notice MAINNET IS UNCHANGED. The shortest round is 15 minutes, so `D(n)/4 >= 225 s` and
+    /// the window is always the full {RoundManager.RANDOM_END_S}.
+    function test_theRandomEndWindowIsUnchangedOnTheMainnetSchedule() public view {
+        assertEq(roundManager.DURATION_SCALE_DIV(), 1, "this stack runs the published schedule");
+        assertEq(roundManager.durationFor(1), 15 minutes, "the shortest round");
+        assertEq(roundManager.randomEndWindowFor(1), 180, "the window is RANDOM_END_S exactly");
+        for (uint256 n = 1; n <= 16; n++) {
+            assertEq(roundManager.randomEndWindowFor(n), roundManager.RANDOM_END_S(), "every round");
+        }
+    }
+
+    /// @notice `W` is {RoundManager.CLOSING_WINDOW_S} on every round, not a fraction of the
+    /// duration such as `D(n)/4` above an hour (2 h -> 30 min, 12 h -> 3 h): the yardstick a coin
+    /// is measured with does not change with the round number.
+    function test_theClosingWindowIsTheSameConstantOnEveryRound() public view {
+        uint64 w = roundManager.CLOSING_WINDOW_S();
+        assertEq(w, 15 minutes, "the published constant");
+        assertEq(roundManager.closingWindowFor(1), w, "round 1, a 15-minute round");
+        assertEq(roundManager.closingWindowFor(5), w, "round 5, a 1-hour round");
+        assertEq(roundManager.closingWindowFor(7), w, "round 7, a 2-hour round (was 30 min)");
+        assertEq(roundManager.closingWindowFor(13), w, "round 13, a 12-hour round (was 3 h)");
+    }
+
+    /// @notice The hook's checkpoint rings reach back over `W + RANDOM_END_S` on every row of the
+    /// schedule, which is the WHOLE span a round can be scored over: `T_end` lies in
+    /// `[T - RANDOM_END_S, T]` and the window reaches `W` further back.
+    ///
+    /// The settlement TAIL has left this requirement. Ring writes freeze at the
+    /// pool's published end `T`, so no swap made while a round is being settled or scored can
+    /// overwrite an entry at all, and the ring no longer has to SURVIVE
+    /// `END_TIMEOUT + SUBMIT_S` of churn on top of the span it has to REACH. On this stack the
+    /// requirement is 900 + 180 = 1080 s for every round, met by 63 x 18 = 1134 s of coarse ring
+    /// (it was 51 s, sized for 3180 s). The fast ring is unchanged at 36 x 5 = 180 s, which is
+    /// exactly the random-end span it exists to cover.
+    function test_theScoreRingsCoverTheFlatWindowAndTheRandomEnd() public view {
+        assertEq(hook.SCORE_RING_S(), roundManager.RANDOM_END_S(), "the fast ring spans the random end");
+        for (uint256 n = 1; n <= 20; n++) {
+            uint256 needed = roundManager.closingWindowFor(n) + roundManager.RANDOM_END_S();
+            assertEq(needed, 1080, "one requirement for every round now");
+            uint256 slot = roundManager.scoreSlotFor(n);
+            assertEq(slot, 18, "and one coarse spacing");
+            assertGe((hook.SCORE_COARSE_SLOTS() - 1) * slot, needed, "the coarse ring reaches the far edge");
+            assertGe(slot, hook.SCORE_SLOT_S(), "never finer than the fast ring");
+        }
+    }
+}
+
+/// @notice The same schedule, read on a heavily SCALED testnet divisor - the only place the
+/// random-end clamp does anything at all.
+contract ScheduleScaledTest is RoundTestBase {
+    function setUp() public {
+        durationScaleDiv = 5;
+        _setUpFamily();
+    }
+
+    /// @notice `RANDOM_END_S` is not scaled by {RoundManager.DURATION_SCALE_DIV}, so on a divisor
+    /// of 5 the first round trades for 180 s; without a clamp the end would be drawn from a
+    /// window as long as the whole round, and `T_end` could land at `tradingStart` itself,
+    /// leaving nothing to score. The clamp keeps three quarters of every round unconditionally
+    /// inside the round.
+    function test_theRandomEndWindowIsAQuarterOfAScaledRound() public view {
+        assertEq(roundManager.DURATION_SCALE_DIV(), 5, "the scaled testnet schedule");
+        assertEq(roundManager.durationFor(1), 180, "a 180-second round");
+        assertEq(roundManager.randomEndWindowFor(1), 45, "and a 45-second random-end window");
+        assertLt(roundManager.randomEndWindowFor(1), roundManager.RANDOM_END_S(), "clamped, not RANDOM_END_S");
+    }
+
+    /// @notice The coarse ring's spacing follows the SCALED closing window, while `RANDOM_END_S`
+    /// is seconds of wall clock whatever the schedule divisor does to the rounds; the settlement
+    /// tail is not part of the span at all.
+    function test_theCoarseSlotFollowsTheScaledWindowAndTheUnscaledRandomEnd() public view {
+        assertEq(roundManager.closingWindowFor(1), 180, "W is scaled by the divisor");
+        assertEq(roundManager.RANDOM_END_S(), 180, "the random-end span is not");
+        uint256 needed = roundManager.closingWindowFor(1) + roundManager.RANDOM_END_S();
+        assertEq(needed, 360, "180 + 180");
+        assertEq(roundManager.scoreSlotFor(1), 6, "ceil(360 / 63)");
+        assertGe((hook.SCORE_COARSE_SLOTS() - 1) * roundManager.scoreSlotFor(1), needed, "the ring covers it");
+        assertGt(roundManager.closingWindowFor(1), roundManager.scoreSlotFor(1), "W exceeds one coarse slot");
+    }
+
+    /// @notice The clamp holds for every round of the schedule, and the window is never zero:
+    /// `fulfilEnd` takes `word mod W_r`, which a zero window would make undefined.
+    function test_theWindowIsNeverZeroAndNeverMoreThanAQuarter() public view {
+        for (uint256 n = 1; n <= 32; n++) {
+            uint64 w = roundManager.randomEndWindowFor(n);
+            assertGt(w, 0, "the modulus is defined");
+            assertLe(w, roundManager.RANDOM_END_S(), "never longer than RANDOM_END_S");
+            assertLe(uint256(w) * 4, roundManager.durationFor(n), "never more than a quarter of the round");
+        }
+    }
 }

@@ -922,6 +922,71 @@ contract ContinuationTest is RoundTestBase {
     }
 }
 
+/// @notice Attribution across the sunset handover. Needs two complete stacks,
+/// and a v1 round that is still TRADING when the handover takes effect - so this deployment uses
+/// the {RoundManager.MIN_SUNSET_DELAY} floor rather than the mainnet seven days.
+contract ContinuationAttributionTest is RoundTestBase {
+    address internal constant STEWARD = address(0x57E4A2D);
+    Currency internal constant EDGE = Currency.wrap(DOLL_ADDRESS);
+
+    Stack internal v1;
+    Stack internal v2;
+
+    function setUp() public {
+        steward = STEWARD;
+        sunsetDelay = 1 hours;
+        _setUpEdge();
+        v1 = _currentStack();
+        _buyLink(1, 5 ether);
+        v2 = _deployStack(true, STEWARD, address(v1.roundManager));
+    }
+
+    /// @notice A CANDIDATE attribution is a local index into this version's own `candidates`
+    /// array. Forwarded across the handover it named some entirely unrelated coin in the
+    /// successor's array - or nothing at all, which queued the fee behind a hop that could never
+    /// complete. It crosses as {FeeVault.UNATTRIBUTED} instead.
+    function test_aCandidateAttributionDoesNotCrossTheHandover() public {
+        vm.prank(STEWARD);
+        v1.roundManager.announceSunset(address(v2.roundManager));
+        uint64 at = v1.roundManager.sunsetAt();
+
+        // a v1 round that outlives the handover: the sunset stops v1 opening a NEW round, it does
+        // not stop the one already open from trading
+        vm.warp(at - 300);
+        Cand memory c = _registerCandidate(address(0xCA11), "CAND");
+        (, uint64 nominalEnd,) = _roundTimes(roundManager.roundCount());
+        assertLt(at, nominalEnd, "the round is still trading when the handover lands");
+
+        vm.warp(at + 1);
+        assertTrue(v1.roundManager.isSunsetEffective(), "the handover is live");
+
+        uint256 v2LedgerBefore = v2.vault.ledgerTotal(EDGE);
+        vm.recordLogs();
+        v1.router.buyCandidate(c.id, 1 ether, 0, address(this), 4);
+
+        uint256 fee = 1 ether / 100;
+        assertEq(v2.vault.ledgerTotal(EDGE) - v2LedgerBefore, fee, "the edge reached v2");
+        assertEq(_receivedAttribution(), vault.UNATTRIBUTED(), "and it crossed unattributed");
+        assertEq(v2.vault.creatorBalance(c.token), 0, "v1's candidate is not a creator in v2");
+        assertEq(v2.vault.devBalance(), (fee * v2.vault.DEV_BPS()) / 10_000, "v2 booked it with its own split");
+        assertEq(v1.vault.pendingForward(vault.CANDIDATE_ATTRIBUTION() | c.id), 0, "nothing queued under the id");
+        assertLe(v1.vault.ledgerTotal(EDGE), v1.vault.holdings(EDGE), "v1 stays solvent");
+        assertLe(v2.vault.ledgerTotal(EDGE), v2.vault.holdings(EDGE), "v2 stays solvent");
+    }
+
+    /// @dev The attribution v2's vault was actually handed, out of its own receipt event.
+    function _receivedAttribution() internal returns (uint256) {
+        bytes32 sig = keccak256("ProtocolFeeReceived(address,uint256,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(v2.vault) || logs[i].topics[0] != sig) continue;
+            (, uint256 attribution) = abi.decode(logs[i].data, (uint256, uint256));
+            return attribution;
+        }
+        revert("v2 never received the edge");
+    }
+}
+
 /// @dev A "successor" with code but no stack behind it: `announceSunset` accepts it, and the
 /// handover must degrade to booking locally rather than reverting a swap.
 contract NotAStack {

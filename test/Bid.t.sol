@@ -242,4 +242,150 @@ contract BidTest is RoundTestBase {
             bidDeployer.bidCap(1), (active * bidDeployer.MAX_RESERVE_BPS()) / 10_000, "the cap uses the real amount"
         );
     }
+
+    // ---------------------------------------------------------------------------------
+    // index 0 has no pool, and every consumer knows it
+    // ---------------------------------------------------------------------------------
+
+    /// @notice `poolKeyOf(0)` is a ZERO key and every consumer that walks it either answers
+    /// zero or refuses with a named error. Nothing reverts from inside the PoolManager.
+    function test_indexZeroHasNoPoolAndEveryConsumerGuardsOnIt() public {
+        PoolKey memory k = roundManager.poolKeyOf(0);
+        assertEq(address(k.hooks), address(0), "no hook: no pool of ours");
+        assertEq(Currency.unwrap(k.currency0), address(0));
+        assertEq(Currency.unwrap(k.currency1), address(0));
+
+        assertFalse(lens.hasPool(0), "the lens says so");
+        assertEq(bidDeployer.bidCap(0), 0, "and nothing can be sized against it");
+        assertEq(bidDeployer.maxParentForDeploy(0), 0);
+
+        vm.expectRevert(BidDeployer.NoPoolAtIndex.selector);
+        bidDeployer.deployAncestor(0, 1e18);
+
+        vm.expectRevert(BidDeployer.NoPoolAtIndex.selector);
+        bidDeployer.deployHopPot(0);
+
+        vm.expectRevert(BidDeployer.NoPoolAtIndex.selector);
+        bidDeployer.depositExternalBid(address(doll), 1e18);
+
+        // the conversion walk is the identity at index 0 and 1, and reads no oracle at all
+        (uint256 v0,) = bidDeployer.dollValueOfParent(0, 12_345e18);
+        assertEq(v0, 12_345e18, "index 0 is the edge currency itself");
+        assertEq(bidDeployer.parentForDollValue(0, 12_345e18), 12_345e18);
+        _assertNoEth();
+    }
+
+    /// @notice `dollValueOfParent(1, x) == x`: generation one is priced in its own parent, which
+    /// IS the edge currency. No TWAP is read and nothing can make the walk fail.
+    function testFuzz_dollValueOfParentIsTheIdentityAtLinkOne(uint256 amount) public {
+        amount = bound(amount, 1, type(uint128).max);
+        (uint256 v, bool slowMissing) = bidDeployer.dollValueOfParent(1, amount);
+        assertEq(v, amount, "the identity");
+        assertFalse(slowMissing, "no oracle was consulted, so none was missing");
+        assertEq(bidDeployer.parentForDollValue(1, amount), amount, "and so is the inverse");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // the edge bid, and a self-funded link-one deployment
+    // ---------------------------------------------------------------------------------
+
+    /// @notice {BidDeployer.deployEdgeBid} funds a bid under LINK ONE out of ALL FOUR
+    /// edge-currency pots: generation 0's sleeve, generation 1's sleeve, the link-one hop pot and
+    /// the forfeited-bond earmark. Each is drawn partially, and the call is worth a keeper's gas.
+    function test_deployEdgeBidFundsFromAllFourPots() public {
+        // a second generation, so generation 0 and 1 both earn a real ancestor sleeve
+        _runWinningRound(1, WINNING_ABSORPTION);
+        _buyLink(2, 50_000e18);
+
+        // a failed round, so there are forfeited bonds in the earmark
+        _registerCandidate(address(0xF00D), "FAIL");
+        (,, uint64 submitEnd) = _roundTimes(roundManager.roundCount());
+        _settleEnd();
+        vm.warp(submitEnd + 1);
+        roundManager.finalize();
+
+        _warmOracles();
+
+        uint256 sleeve0 = vault.drawableEdge(0);
+        uint256 sleeve1 = vault.drawableEdge(1);
+        uint256 hopPot = vault.reinforcementBalance(address(doll));
+        uint256 earmark = vault.edgeBidEarmark();
+        assertGt(sleeve0, 0, "generation 0 has a sleeve");
+        assertGt(sleeve1, 0, "generation 1 has one too");
+        assertGt(hopPot, 0, "link one collected hop fees and snipe tax");
+        assertGt(earmark, 0, "and a losing bond was forfeited into the earmark");
+
+        address keeper = address(0xC0FFEE);
+        uint256 keeperBefore = doll.balanceOf(keeper);
+        vm.prank(keeper);
+        uint256 deposited = bidDeployer.deployEdgeBid();
+
+        assertGt(deposited, 0, "the bid was placed");
+        assertGt(doll.balanceOf(keeper) - keeperBefore, 0, "and the keeper was paid its bounty");
+        // every pot gave something up: the four together funded the deposit plus the bounty
+        uint256 spent = (sleeve0 - vault.drawableEdge(0)) + (sleeve1 - vault.drawableEdge(1))
+            + (hopPot - vault.reinforcementBalance(address(doll))) + (earmark - vault.edgeBidEarmark());
+        assertEq(spent, deposited + (doll.balanceOf(keeper) - keeperBefore), "deposit + bounty came out of the pots");
+        assertEq(doll.balanceOf(address(bidDeployer)), 0, "the deployer keeps nothing");
+        _assertSolvent();
+        _assertNoEth();
+    }
+
+    /// @notice {BidDeployer.deployAncestor} at generation ONE needs NO KEEPER TOKENS. The parcel
+    /// and the payment are the same currency, so the two transfers cancel: the vault funds the
+    /// bid out of generation one's own sleeve and only the bounty leaves.
+    function test_deployAncestorAtLinkOneNeedsNoKeeperTokens() public {
+        _runWinningRound(1, WINNING_ABSORPTION);
+        _buyLink(2, 50_000e18);
+        _warmOracles();
+
+        uint256 available = vault.drawableEdge(1);
+        assertGt(available, 0, "generation 1 has something to deploy");
+        uint256 cap = bidDeployer.bidCap(1);
+        uint256 amount = available / 2;
+        if (amount > cap) amount = cap;
+        assertGt(amount, 0);
+
+        address keeper = address(0xBEEF);
+        assertEq(doll.balanceOf(keeper), 0, "the keeper holds nothing at all");
+        vm.prank(keeper);
+        uint256 deposited = bidDeployer.deployAncestor(1, amount);
+
+        assertGt(deposited, 0, "the bid was placed out of the vault's own edge currency");
+        assertGt(doll.balanceOf(keeper), 0, "and the keeper was paid the bounty, having brought nothing");
+        assertEq(doll.balanceOf(address(bidDeployer)), 0, "the deployer keeps nothing");
+        _assertSolvent();
+        _assertNoEth();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // `maxParentForDeploy(1)` never offers more than the sleeve holds
+    // ---------------------------------------------------------------------------------
+
+    /// @notice WHAT `maxParentForDeploy(1)` ACTUALLY PROMISES. The
+    /// round trip is not exact and cannot be: the inverse is two integer divisions, so
+    /// it is CONSERVATIVE by up to a hundred wei of the sleeve. The true property - what the view
+    /// offers the call accepts, and what it leaves behind is worth less than a wei of bounty - is
+    /// pinned here over a fuzzed sleeve rather than at one size.
+    /// @param buy The edge currency spent on link 2, which is what sizes generation 1's sleeve.
+    function testFuzz_maxParentForDeployAtLinkOneNeverOffersMoreThanTheSleeveHolds(uint256 buy) public {
+        buy = bound(buy, 0.01 ether, 200 ether);
+        _runWinningRound(1, WINNING_ABSORPTION);
+
+        familyRouter.buyExactIn(2, buy, 0, address(this), 3);
+        vm.warp(block.timestamp + 200);
+        familyRouter.buyExactIn(2, 0.01 ether, 0, address(this), 3);
+        vm.warp(block.timestamp + 2 * uint256(bidDeployer.TWAP_WINDOW()));
+
+        uint256 available = vault.drawableEdge(1);
+        uint256 offered = bidDeployer.maxParentForDeploy(1);
+        uint256 bps = bidDeployer.BOUNTY_BPS();
+
+        uint256 payout = offered + (offered * bps) / 10_000;
+        // SOUND: what the view offers always fits in the sleeve, at every size
+        assertLe(payout, available, "what it costs fits in the sleeve");
+        // CONSERVATIVE, AND BY HOW MUCH: the two floored divisions can leave behind up to
+        // `10_000 / BOUNTY_BPS` wei, no more. At the deployed 1 percent rate that is 100 wei.
+        assertLt(available - payout, 10_000 / bps + 1, "and leaves under a hundred wei behind");
+    }
 }

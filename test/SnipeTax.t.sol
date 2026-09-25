@@ -154,3 +154,106 @@ contract SnipeTaxCeilingTest is RoundTestBase {
         );
     }
 }
+
+/// @notice The edge fee and the opening snipe tax are mutually exclusive IN TIME on a round-one
+/// pool: the edge fee is suppressed for the whole snipe window.
+contract SnipeTaxEdgeFeeTest is RoundTestBase {
+    function setUp() public {
+        _setUpFamily();
+    }
+
+    /// @notice A ROUND-ONE pool is both an EDGE pool (1%) and a freshly opened candidate pool
+    /// (99% decaying over {FamilyHook.SNIPE_S}). Charging both would put the parent-side rates
+    /// above 100%, which exact-input accounting cannot express and which makes the exact-output
+    /// gross-up diverge. The edge fee therefore waits for the snipe tax to finish.
+    ///
+    /// Asserted at three instants of the same pool: `t = 0` (the 99% opening tax), `t = 1 s`
+    /// (mid-decay) and `t = 4 s` (past the window, where the 1% starts). At every one of them the
+    /// swap goes through, the rates sum below 100%, and the split the vault books is exactly the
+    /// schedule.
+    function test_edgeFeeIsSuppressedForTheWholeSnipeWindow() public {
+        Cand memory c = _registerCandidate(address(0xA11CE), "EDGE");
+        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        assertTrue(hook.poolInfo(c.poolId).isEdge, "round one launches against index 0: an edge pool");
+
+        _assertSnipeWindowFee(c, tradingStart, 0);
+        _assertSnipeWindowFee(c, tradingStart, 1);
+        _assertSnipeWindowFee(c, tradingStart, 4);
+        _assertNoEth();
+    }
+
+    /// @dev One buy of the candidate `dt` seconds into its trading, with the fee split asserted
+    /// against the published schedule.
+    function _assertSnipeWindowFee(Cand memory c, uint64 tradingStart, uint64 dt) internal {
+        vm.warp(uint256(tradingStart) + dt);
+        uint256 amountIn = 1_000e18;
+
+        uint256 snipePpm = _snipePpm(dt);
+        // the edge fee is charged only once the snipe tax has finished
+        uint256 protocolPpm = snipePpm == 0 ? PROTOCOL_FEE_PPM : 0;
+        assertLt(_hopFeePpm() + protocolPpm + snipePpm, PPM, "the summed parent-side rates stay under 100%");
+
+        uint256 potBefore = vault.reinforcementBalance(address(doll));
+        uint256 devBefore = vault.devBalance();
+        uint256 vaultBefore = _feeVaultEdge();
+
+        // a plain exact-input buy of the candidate with the parent (the edge currency)
+        bool zeroForOne = !c.tokenIsCurrency0;
+        swapRouter.swap(
+            c.key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        uint256 hopFee = (amountIn * _hopFeePpm()) / PPM;
+        uint256 snipeFee = (amountIn * snipePpm) / PPM;
+        uint256 protocolFee = (amountIn * protocolPpm) / PPM;
+
+        assertEq(_feeVaultEdge() - vaultBefore, hopFee + snipeFee + protocolFee, "the whole parent-side charge");
+        assertEq(vault.reinforcementBalance(address(doll)) - potBefore, hopFee + snipeFee, "hop + snipe are the pot");
+        assertEq(vault.devBalance() - devBefore, (protocolFee * vault.DEV_BPS()) / 10_000, "the protocol share only");
+        if (dt < hook.SNIPE_S()) {
+            assertEq(protocolFee, 0, "no edge fee inside the snipe window");
+            assertGt(snipeFee, 0, "but the snipe tax is running");
+        } else {
+            assertEq(protocolFee, amountIn / 100, "the 1% edge fee starts when the window closes");
+            assertEq(snipeFee, 0, "and the snipe tax is over");
+        }
+    }
+
+    /// @notice The exact-OUTPUT path is the one the summed rates would actually break: the
+    /// gross-up `poolCost / (1 - rate)` has no finite answer at 100%. At the very first instant
+    /// of a round-one pool it must still price.
+    function test_exactOutputBuyPricesAtTheOpeningInstantOfAnEdgePool() public {
+        Cand memory c = _registerCandidate(address(0xA11CE), "EDGE");
+        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        vm.warp(tradingStart);
+
+        bool zeroForOne = !c.tokenIsCurrency0;
+        uint256 before = IERC20(c.token).balanceOf(address(this));
+        swapRouter.swap(
+            c.key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: int256(1_000e18),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(IERC20(c.token).balanceOf(address(this)) - before, 1_000e18, "exact output honored at t = 0");
+        _assertNoEth();
+    }
+
+    /// @dev The published snipe schedule, with the subtraction taken at true floor division.
+    function _snipePpm(uint64 dt) internal view returns (uint256) {
+        uint256 s = hook.SNIPE_S();
+        if (dt >= s) return 0;
+        return hook.SNIPE_END_PPM() + ((hook.SNIPE_START_PPM() - hook.SNIPE_END_PPM()) * (s - dt)) / s;
+    }
+}

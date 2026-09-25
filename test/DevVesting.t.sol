@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
+import {DeployVesting} from "../script/DeployVesting.s.sol";
 import {MockDoll} from "./utils/MockDoll.sol";
 
 /// @notice The developer's 3% lock: plain linear release from launch (no cliff), and release()
@@ -61,5 +62,44 @@ contract DevVestingTest is Test {
 
         assertEq(doll.balanceOf(stranger), strangerBefore);
         assertEq(doll.balanceOf(beneficiary), expected);
+    }
+
+    /// @notice Runs DeployVesting's own deploy + fund + verify logic end to end against a mock
+    /// token, the same sequence the launch-day script runs, so a script regression fails here
+    /// instead of on launch day.
+    function test_scriptDeploysFundsAndVerifies() public {
+        DeployVestingHarness harness = new DeployVestingHarness();
+        doll.mint(address(harness), TOTAL);
+
+        // Pranked as the harness itself: `_deployAndFund`'s `msg.sender` balance check and the
+        // token it actually moves (out of `address(this)`, i.e. the harness) are then the same
+        // account, exactly as `run()`'s broadcaster is one account for both.
+        vm.prank(address(harness));
+        VestingWallet deployed = harness.deployFundAndVerify(address(doll), beneficiary, start, TOTAL);
+
+        assertEq(doll.balanceOf(address(deployed)), TOTAL);
+        assertEq(deployed.owner(), beneficiary);
+        assertEq(deployed.start(), start);
+        assertEq(deployed.duration(), DURATION);
+    }
+
+    function test_scriptRevertsWhenBroadcasterUnderfunded() public {
+        DeployVestingHarness harness = new DeployVestingHarness();
+        doll.mint(address(harness), TOTAL - 1);
+
+        vm.prank(address(harness));
+        vm.expectRevert("broadcaster balance below AMOUNT");
+        harness.deployFundAndVerify(address(doll), beneficiary, start, TOTAL);
+    }
+}
+
+/// @dev Exposes DeployVesting's internal deploy/fund/verify sequence for direct testing.
+contract DeployVestingHarness is DeployVesting {
+    function deployFundAndVerify(address token, address beneficiary, uint64 start, uint256 amount)
+        external
+        returns (VestingWallet wallet)
+    {
+        wallet = _deployAndFund(token, beneficiary, start, amount);
+        _verify(wallet, token, beneficiary, start, amount);
     }
 }

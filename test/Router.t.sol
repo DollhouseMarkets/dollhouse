@@ -120,4 +120,34 @@ contract RouterTest is RoundTestBase {
         familyRouter.buyExactIn(3, 1 ether, 0, address(this), 3);
         emit log_named_uint("routed 3-hop buy ($DOLL -> #1 -> #2 -> #3) gas", g - gasleft());
     }
+
+    // ---------------------------------------------------------------------------------
+    // The attribution sentinel is index 0
+    // ---------------------------------------------------------------------------------
+
+    /// @notice A round trip `[0, 1, 0]` ends where it started, at the EDGE CURRENCY, so the
+    /// terminal token of the route is canonical index 0 and the creator credited is the genesis
+    /// creator - the deployer, since adoption credits the deployment itself. The path
+    /// pays the protocol fee on both edge legs; only one creator is ever credited for it.
+    function test_aRoundTripPathCreditsTheGenesisCreator() public {
+        _runWinningRound(1, WINNING_BUY);
+        _warmOracles();
+        address edge = roundManager.canonical(0);
+        address genesisCreator = roundManager.creatorOf(edge);
+        assertEq(genesisCreator, factory.DEPLOYER(), "index 0 is credited to the deployer");
+
+        address link1 = roundManager.canonical(1);
+        uint256 creditedBefore = vault.creatorBalance(edge);
+        uint256 linkCreditedBefore = vault.creatorBalance(link1);
+        uint256[] memory path = new uint256[](3);
+        path[0] = 0;
+        path[1] = 1;
+        path[2] = 0;
+        IERC20(address(doll)).approve(address(familyRouter), type(uint256).max);
+        familyRouter.swapPath(path, 1 ether, 0, address(this), 3);
+
+        assertGt(vault.creatorBalance(edge) - creditedBefore, 0, "the edge currency's creator is credited");
+        assertEq(vault.creatorRecipient(edge), genesisCreator, "and it is claimable by the deployer");
+        assertEq(vault.creatorBalance(link1), linkCreditedBefore, "the link the route passed THROUGH is credited nothing");
+    }
 }

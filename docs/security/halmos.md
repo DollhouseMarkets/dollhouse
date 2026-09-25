@@ -1,7 +1,10 @@
 # Halmos symbolic checks
 
-Tool: halmos 0.3.3 (Z3 and yices), installed via `uv tool install halmos --python 3.12`.
-Host: 16 GB Windows 11.
+Tool: halmos 0.3.3 (Z3 and yices).
+
+32 checks pass: 18 over `FeeVault`, 5 over the `RoundManager` forfeit path, and 9 over the curve
+math and Fenwick libraries. `CurveMathSlowCheck` (2 checks) is outside the default run: it does not
+discharge within the solver budget.
 
 ## Scope
 
@@ -13,21 +16,12 @@ These checks restate those properties as Halmos checks over **the real `FeeVault
 add the `RoundManager.finalize` forfeit path (RND-11). The bounds below are real and are stated per
 check.
 
-## What changed in `[profile.halmos]`
+## Build profile
 
-The earlier lean profile compiled pure libraries only. `FeeVault` and `RoundManager` drag in
-`FamilyFactory`, `FamilyHook` and the rest of the stack, so two things had to change:
-
-1. **`contracts/FeeVault.sol` and `contracts/RoundManager.sol` are no longer in `skip`.** Their
-   imports (factory, hook, locker, token) compile as dependencies regardless of the skip list.
-2. **`via_ir = true` and the optimizer are on.** `FamilyHook._collect` does not compile at all
-   under legacy codegen ("stack too deep"). The lean
-   file set still builds in **22 s** with a free-RAM dip of about 400 MB, so this costs nothing
-   that matters.
-
-With the second change these checks run on bytecode built by the same pipeline as the shipped
-artifact. The library checks were re-run under the changed profile to confirm nothing regressed;
-see "Library checks under this profile" below.
+`[profile.halmos]` in `foundry.toml` compiles `contracts/FeeVault.sol` and
+`contracts/RoundManager.sol` with their imports (factory, hook, locker, token), with `via_ir = true`
+and the optimizer on: `FamilyHook._collect` does not compile under legacy codegen ("stack too
+deep"). The checks therefore run on bytecode built by the same pipeline as the shipped artifact.
 
 ## How to run
 
@@ -39,20 +33,10 @@ halmos --root . --forge-build-out out-halmos \
   --loop 3 --solver-timeout-assertion 120000 --solver-threads 1 --statistics --no-status
 ```
 
-Both flags are mandatory (`--forge-build-out out-halmos`, and
-`FOUNDRY_PROFILE=halmos`). Two operational notes learned here:
-
-- **Never run a bare `forge build` in this profile.** Halmos needs the `ast` field in the
-  artifacts and runs its own build to get it; a plain `forge build` overwrites `out-halmos` without
-  it, and the next Halmos run reports "No tests" with a `KeyError: 'ast'` warning per artifact. The
-  fix is `rm -rf out-halmos cache-halmos` and letting Halmos build.
-- **Halmos can leave orphans.** A wall-clock `timeout` kills the launcher, not the Python child or
-  its `yices-smt2`. Every run here was wrapped so that surviving `halmos`/`yices`/`z3` processes are
-  killed by Windows PID afterwards.
-
-Every run was taken under the shared `$TEMP/dollhouse-forge.lock` mkdir mutex (stale after 40
-minutes), one check at a time, `--solver-threads 1`, with free physical RAM sampled before each
-check and a 2.5 GB floor to wait on.
+Both flags are mandatory (`--forge-build-out out-halmos`, and `FOUNDRY_PROFILE=halmos`). Do not
+run a bare `forge build` in this profile: Halmos needs the `ast` field in the artifacts and runs its
+own build to get it, and a plain `forge build` overwrites `out-halmos` without it (the next run then
+reports "No tests"). `rm -rf out-halmos cache-halmos` restores it.
 
 ## Results: `test/halmos/FeeVaultHalmos.t.sol`
 
@@ -79,8 +63,7 @@ All 18 checks, `--loop 3`, `--solver-timeout-assertion 120000`, one solver threa
 | `check_decompositionAfterAQueuedFee(uint256)` | FEE-10, CON-05 | **PASS** | 66 | 5.27 s |
 | `check_oneBookedFeeDecomposesExactly(uint256)` | FEE-08, FEE-10 | **PASS** | 37 | 1.85 s |
 
-Total: **18 passed, 0 failed, 45.3 s of solver time.** Wall time per check was 2 to 13 s after the
-first invocation (31 s, which includes the build).
+Total: **18 passed, 0 failed, 45.3 s of solver time.**
 
 ## Results: `test/halmos/ForfeitHalmos.t.sol`
 
@@ -94,7 +77,7 @@ first invocation (31 s, which includes the build).
 
 Total: **5 passed, 0 failed, 1.72 s of solver time.**
 
-**No counterexamples anywhere in this pass.** No contract change was made and none was needed.
+**No counterexamples.**
 
 ## Non-vacuity
 
@@ -104,8 +87,8 @@ deliberate `assert(false)` at the end of the check body and re-running:
 - `ForfeitHalmos.check_forfeitBookedEqualsDeliveredPlusPending` → **FAIL**, 2 counterexamples.
 - `FeeVaultHalmos.check_receiveForwardKeepsSolvencyWhenLive` → **FAIL**, 8 counterexamples.
 
-Both assertions are therefore reached on live, non-reverting paths. The probe was removed
-afterwards; the committed files contain no `assert(false)`.
+Both assertions are therefore reached on live, non-reverting paths. The committed
+files contain no `assert(false)`.
 
 The forfeit suite also pins its own branch selection: `check_forfeitBookedEqualsDeliveredPlusPending`
 asserts that an honest token puts the WHOLE forfeit in the earmark and a lying one puts the whole
@@ -169,23 +152,22 @@ Every bound below was forced by a measured timeout, not chosen for comfort.
 - `--loop 3`. No loop bound was actually reached: the Fenwick walks and the registry walk are all
   concretely indexed here, and Halmos reported an empty `bounds: []` on every check.
 
-## Measured timeouts, kept out of the shipped checks
+## Formulations that do not discharge
 
 These are recorded so the bounds above are not mistaken for preferences. None is in the committed
-files; each was the formulation that had to be replaced.
+files.
 
-| formulation | result | why it was replaced |
+| formulation | result | the committed formulation |
 |---|---|---|
 | One five-way symbolic `which % 5` switch over the call set | **no verdict in 600 s** | a symbolic `%` is a 256-bit division, and the function carried every branch's state at once. Split into five checks, each 5 to 9 s. |
 | `assert(dev + creator + claimableEdge(0) == amount)` (unscaled) | **TIMEOUT at 120 s assertion budget**, 244 s of model time | inverting `(x * 1e18) / 1e18` over 256 bits. Restated WAD-scaled: 1.85 s. |
 | `assert(ancestorPointQueryWad(0) >= 0)` | **TIMEOUT**, 122 s of model time | proving `sleeve * 1e18 < 2^255` from a 96-bit bound. The sign is covered by the equality that follows it. |
 | Four payouts with a symbolic recipient in one check | **no verdict in 600 s**, 309 paths | split to one payout path per check, each 0.4 to 1.4 s. |
-| Keeper draw and decomposition with a symbolic fee | **no verdict in 600 s** | fee pinned; see the bound above. |
+| A bid-deployment draw and decomposition with a symbolic fee | **no verdict in 600 s** | fee pinned; see the bound above. |
 
-## Library checks under this profile
+## Library checks
 
-The library checks were re-run under the changed profile (`via_ir = true`, optimizer on, the
-vault and round manager in the compile set):
+The library checks run under the same profile:
 
 ```
 FOUNDRY_PROFILE=halmos halmos --root . --forge-build-out out-halmos \
@@ -193,20 +175,7 @@ FOUNDRY_PROFILE=halmos halmos --root . --forge-build-out out-halmos \
   --solver-timeout-assertion 120000 --solver-threads 1 --statistics --no-status
 ```
 
-**9 passed, 0 failed, 68.1 s wall.** Every check keeps its earlier verdict; path counts moved
-slightly (886 rather than 928 on `check_sqrtPriceNeverOutOfRange`, 128 rather than 182 on
-`check_rangeAddIsAdditive`) because the bytecode is now IR-compiled. `CurveMathSlowCheck` remains
-excluded from the default run and remains a known timeout.
-
-## Memory
-
-| phase | observation |
-|---|---|
-| `halmos` build of the lean set (60 source units, via-IR) | 22 s; free physical RAM dipped about 400 MB |
-| The 23 checks, one at a time | minimum free physical RAM observed **5.2 GB**; no solver crash |
-
-Sampling: free physical RAM read from `Win32_OperatingSystem.FreePhysicalMemory` before and after
-each check, with a 2.5 GB floor the runner waits on. Nothing came near it.
+**9 passed, 0 failed.**
 
 ## Caveats
 
@@ -218,6 +187,6 @@ each check, with a 2.5 GB floor the runner waits on. Nothing came near it.
   token that lies about delivery) and deliberately trivial where the real thing is covered elsewhere
   (no ERC-6909 claims).
 - **`ForfeitHalmos` assumes its pre-state.** See "What is modelled and what is real".
-- **This does not close the Certora gap, it covers it.** `FeeVault.spec` still has no verdict. What
-  these checks give is a machine-checked statement of the same properties over the same bytecode,
-  under bounds the specification would not have needed.
+- **Relation to the Certora record.** The edge-token `FeeVault.spec` has no Prover verdict. These
+  checks give a machine-checked statement of the same properties over the same bytecode, under
+  bounds the specification would not have needed.

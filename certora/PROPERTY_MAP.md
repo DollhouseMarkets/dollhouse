@@ -8,7 +8,7 @@ stated in the edge token and has no Prover verdict, next to the verdict each rul
 vault with its ledgers in native ETH ("ETH-denominated vault"). `Sleeve.spec` rows carry the verdicts
 of its own harness runs.
 
-Status values: **verified** (ran and was not violated, and its sanity check passed), **violated**
+Status values: **verified** (ran without a violation, and its sanity check passed), **violated**
 (ran and produced a counterexample, see `RESULTS.md` for the assessment), **vacuous** (ran, reported
 "not violated", but failed its `rule_sanity` vacuity check, so it proves nothing), **timeout**,
 **needs harness** (runs only against a harness contract), **not expressible** (cannot be stated in
@@ -20,36 +20,36 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
 
 | PROPERTIES ID | spec file | rule / invariant | status |
 |---|---|---|---|
-| FEE-11, SUP-04 | FeeVault.spec | `solvency` (invariant) | RE-BASED, no verdict. Now `ledgerTotal[c] + (c == EDGE ? deployerCredit : 0) <= holdings(c)` with `EDGE` the linked edge token, and `holdings` an ERC-20 balance plus unredeemed claims rather than an ETH balance. The INEQUALITY is load-bearing: a donation of the edge currency raises `holdings` and credits nothing, and no path sweeps the difference. ETH-denominated vault: verified on the base, the transient step and 17 / 20 methods; the 3 left are the accrual paths, where the fee claim is minted to the vault by the HOOK before `accrue` is called |
-| FEE-10 | FeeVault.spec | `edgeMirrorsAreNonNegative` (invariant, was `ethMirrorsAreNonNegative`) | RENAMED and re-keyed, no verdict. ETH-denominated vault: **verified (22/22)** |
-| FEE-10 | FeeVault.spec | `edgeLedgerDecomposition` (invariant, was `ethLedgerDecomposition`) | RE-BASED, no verdict. The mirrors are `reinforcementEdge`, `edgeBidEarmark` and the `reinforcementBalance[edge]` key. The `accrue` `preserved` block states the caller's NEW convention, `parentToken == edge <=> currency == EDGE`, because `_collect` no longer passes a genesis marker. ETH-denominated vault: violated on 2 methods (`accrue`, `forwardProtocolFee`) |
-| FEE-08 | FeeVault.spec | `accrueConservesTheFee` | re-based (edge mirrors), no verdict. ETH-denominated vault: **verified**, upper bound only, see note 1 |
-| FEE-08 | FeeVault.spec | `accrueMovesLedgerTotalByTheFee` | re-based (`ledgerTotal[EDGE]`), no verdict. ETH-denominated vault: **verified** |
-| FEE-10 | FeeVault.spec | `onlyAccrualPathsCredit` | CORRECTED, no verdict. `flushForward` is added to the enumeration: the dead-successor branch calls `_book` and therefore credits the local ledgers out of the queue, which this list had not caught. ETH-denominated vault: **verified**, against an enumeration one writer short |
-| SUP-04 | FeeVault.spec | `onlyAccrualPathsRaiseLedgerTotal` (new) | no verdict. an unsolicited edge-currency transfer into the vault is never sweepable. `ledgerTotal[EDGE]` rises only on the accrual, forward and earmark paths, so a donation cannot make itself claimable, and `solvency`'s inequality is what leaves the surplus unreachable |
-| ROL-07 | FeeVault.spec | `creatorTransferIsALedgerMove` | unchanged, no verdict. ETH-denominated vault: verified |
-| FEE-11 | FeeVault.spec | `receiveForwardRefusesAnUndeliveredAmount` (new) | no verdict. `receiveForward(attribution, amount)` is non-payable now, so the amount is a CLAIM rather than value that arrived with the call. The contract re-checks `ledgerTotal[EDGE] <= holdings(EDGE)` after crediting and reverts `NotDelivered`; this is that guard |
-| RND-11 | FeeVault.spec | `depositEdgeBidEarmarkRefusesAnUndeliveredAmount` (new) | no verdict. The same shape on the forfeit deposit, and it is what makes the RoundManager's try / catch meaningful: a forfeit that did not arrive REVERTS the deposit, which is caught and booked into `pendingForfeits` |
-| FEE-10 | FeeVault.spec | `everyEntrypointRefusesNativeValue` (new) | no verdict. `receive()` is gone and no entrypoint is payable, so the vault can never acquire native value it has no code to send out |
-| BID-07 | FeeVault.spec | `drawNeverExceedsTheBucket` | re-based (`drawableEdge`), no verdict. ETH-denominated vault: verified |
-| BID-07 | FeeVault.spec | `bucketNeverExceedsCap` (invariant) | re-based (`drawableEdge` / `claimableEdge`), no verdict. ETH-denominated vault: violated on 5, Prover imprecision in the Fenwick `_prefix` walk (the `BWAnd` abstraction) at `loop_iter: 3`, which cannot be raised here. BID-07 holds at U/F |
-| PUR-05, BID-07 | FeeVault.spec | `drawNeverExceedsTheGenerationsClaim` | re-based (`claimableEdge`), no verdict. ETH-denominated vault: **verified** |
-| BID-07 | FeeVault.spec | `twoDrawsCannotDoubleUp` | re-based, no verdict. ETH-denominated vault: **verified**; surfaced finding F-2, closed in code |
-| BID-07 | FeeVault.spec | `twoDrawsCannotDoubleUpAtAnyClock` | re-based, no verdict. ETH-denominated vault: **verified**, the F-2 fix confirmed with NO clock precondition |
-| BID-05 | FeeVault.spec | `payKeeperIsBoundedByDeployerCredit` | unchanged, no verdict. ETH-denominated vault: verified |
-| BID-14 | FeeVault.spec | `deployerCreditSettles` (invariant) | unchanged, no verdict. ETH-denominated vault: **verified (20/20)** |
-| BID-05, FEE-10 | FeeVault.spec | `valueLeavesOnlyOnPayoutMethods` | RE-BASED ONTO THE TOKEN BALANCE, no verdict. It measures the LINKED edge token's balance of the vault now, and `consumeEdgeEarmark` / `deliverForward` join the declared-payout list |
-| BID-05 | FeeVault.spec | `onlyBidDeployerHooks` | re-based (`consumeEdgeEarmark`), no verdict. ETH-denominated vault: verified |
-| CON-05 | FeeVault.spec | `pendingForwardTotalIsTheSum` (invariant) | unchanged, no verdict. ETH-denominated vault: **verified (20/20)** |
-| CON-05 | FeeVault.spec | `flushForwardConserves` | TWO-SIDED (finding S-4), re-keyed to `EDGE`, no verdict. ETH-denominated vault: **verified** |
-| CON-05 | FeeVault.spec | `localBookingRequiresAgedEvidence` | re-keyed to `EDGE`, no verdict. ETH-denominated vault: **verified** |
-| CON-05 | FeeVault.spec | `unresolvedSuccessorIsNeverEvidence` | unchanged, no verdict. ETH-denominated vault: **verified** |
-| CON-05 | FeeVault.spec | `deadEvidenceMovesOnlyOnTheForwardingPaths` | re-signed (`receiveForward` takes two arguments now), no verdict. ETH-denominated vault: **verified** |
-| CON-04 | FeeVault.spec | `candidateAttributionsCrossAsUnattributed` | unchanged, no verdict. ETH-denominated vault: **verified** |
-| BID-05, FEE-10 | FeeVault.spec | `noPayoutPathCanBurnTokensAtTheZeroAddress` (was `noPayoutPathCanBurnEthAtTheZeroAddress`) | RENAMED and re-based on `_sendToken`'s `BadRecipient` guard, no verdict. It carries finding S-5: `require amount > 0` scopes the rule past `payKeeper`'s zero-amount early return |
-| CON-04 | FeeVault.spec | `postSunsetFeesAreNeverBookedLocally` | unchanged, no verdict. ETH-denominated vault: **verified**; `isSunset()` is NONDET, see note 2 |
-| FEE-03, ROL-01 | FeeVault.spec | `ratesAndSplitsAreImmutable` | STRENGTHENED, no verdict. `EDGE` joins the immutable list: no call may re-point the vault at another token and make its standing ledgers payable in something else. Last run: verified |
-| REN-02 | FeeVault.spec | `claimZeroesBeforePaying` | unchanged, no verdict. ETH-denominated vault: verified |
+| FEE-11, SUP-04 | FeeVault.spec | `solvency` (invariant) | no verdict. States `ledgerTotal[c] + (c == EDGE ? deployerCredit : 0) <= holdings(c)` with `EDGE` the linked edge token, and `holdings` an ERC-20 balance plus unredeemed claims. The INEQUALITY is load-bearing: a donation of the edge currency raises `holdings` and credits nothing, and no path sweeps the difference. ETH-denominated vault: verified on the base, the transient step and 17 / 20 methods; the 3 left are the accrual paths, where the fee claim is minted to the vault by the HOOK before `accrue` is called |
+| FEE-10 | FeeVault.spec | `edgeMirrorsAreNonNegative` (invariant; `ethMirrorsAreNonNegative` on the ETH-denominated vault) | no verdict. ETH-denominated vault: **verified (22/22)** |
+| FEE-10 | FeeVault.spec | `edgeLedgerDecomposition` (invariant; `ethLedgerDecomposition` on the ETH-denominated vault) | no verdict. The mirrors are `reinforcementEdge`, `edgeBidEarmark` and the `reinforcementBalance[edge]` key. The `accrue` `preserved` block states the caller's convention, `parentToken == edge <=> currency == EDGE`: `_collect` passes no genesis marker. ETH-denominated vault: violated on 2 methods (`accrue`, `forwardProtocolFee`) |
+| FEE-08 | FeeVault.spec | `accrueConservesTheFee` | no verdict (stated over the edge mirrors). ETH-denominated vault: **verified**, upper bound only, see note 1 |
+| FEE-08 | FeeVault.spec | `accrueMovesLedgerTotalByTheFee` | no verdict (stated over `ledgerTotal[EDGE]`). ETH-denominated vault: **verified** |
+| FEE-10 | FeeVault.spec | `onlyAccrualPathsCredit` | no verdict. The enumeration includes `flushForward`: the dead-successor branch calls `_book` and therefore credits the local ledgers out of the queue. ETH-denominated vault: **verified**, against an enumeration without `flushForward` |
+| SUP-04 | FeeVault.spec | `onlyAccrualPathsRaiseLedgerTotal` | no verdict. An unsolicited edge-currency transfer into the vault is never sweepable. `ledgerTotal[EDGE]` rises only on the accrual, forward and earmark paths, so a donation cannot make itself claimable, and `solvency`'s inequality is what leaves the surplus unreachable |
+| ROL-07 | FeeVault.spec | `creatorTransferIsALedgerMove` | no verdict. ETH-denominated vault: verified |
+| FEE-11 | FeeVault.spec | `receiveForwardRefusesAnUndeliveredAmount` | no verdict. `receiveForward(attribution, amount)` is non-payable, so the amount is a CLAIM rather than value that arrived with the call. The contract re-checks `ledgerTotal[EDGE] <= holdings(EDGE)` after crediting and reverts `NotDelivered`; this is that guard |
+| RND-11 | FeeVault.spec | `depositEdgeBidEarmarkRefusesAnUndeliveredAmount` | no verdict. The same shape on the forfeit deposit, and it is what makes the RoundManager's try / catch meaningful: a forfeit that did not arrive REVERTS the deposit, which is caught and booked into `pendingForfeits` |
+| FEE-10 | FeeVault.spec | `everyEntrypointRefusesNativeValue` | no verdict. There is no `receive()` and no entrypoint is payable, so the vault can never acquire native value it has no code to send out |
+| BID-07 | FeeVault.spec | `drawNeverExceedsTheBucket` | no verdict (stated over `drawableEdge`). ETH-denominated vault: verified |
+| BID-07 | FeeVault.spec | `bucketNeverExceedsCap` (invariant) | no verdict (stated over `drawableEdge` / `claimableEdge`). ETH-denominated vault: violated on 5, Prover imprecision in the Fenwick `_prefix` walk (the `BWAnd` abstraction) at `loop_iter: 3`, which cannot be raised here. BID-07 holds at U/F |
+| PUR-05, BID-07 | FeeVault.spec | `drawNeverExceedsTheGenerationsClaim` | no verdict (stated over `claimableEdge`). ETH-denominated vault: **verified** |
+| BID-07 | FeeVault.spec | `twoDrawsCannotDoubleUp` | no verdict. ETH-denominated vault: **verified**; finding F-2, closed in code |
+| BID-07 | FeeVault.spec | `twoDrawsCannotDoubleUpAtAnyClock` | no verdict. ETH-denominated vault: **verified** with NO clock precondition (F-2) |
+| BID-05 | FeeVault.spec | `payKeeperIsBoundedByDeployerCredit` | no verdict. ETH-denominated vault: verified |
+| BID-14 | FeeVault.spec | `deployerCreditSettles` (invariant) | no verdict. ETH-denominated vault: **verified (20/20)** |
+| BID-05, FEE-10 | FeeVault.spec | `valueLeavesOnlyOnPayoutMethods` | no verdict. It measures the LINKED edge token's balance of the vault, and `consumeEdgeEarmark` / `deliverForward` are in the declared-payout list |
+| BID-05 | FeeVault.spec | `onlyBidDeployerHooks` | no verdict (includes `consumeEdgeEarmark`). ETH-denominated vault: verified |
+| CON-05 | FeeVault.spec | `pendingForwardTotalIsTheSum` (invariant) | no verdict. ETH-denominated vault: **verified (20/20)** |
+| CON-05 | FeeVault.spec | `flushForwardConserves` | no verdict. Two-sided (finding S-4), keyed to `EDGE`. ETH-denominated vault: **verified** |
+| CON-05 | FeeVault.spec | `localBookingRequiresAgedEvidence` | no verdict (keyed to `EDGE`). ETH-denominated vault: **verified** |
+| CON-05 | FeeVault.spec | `unresolvedSuccessorIsNeverEvidence` | no verdict. ETH-denominated vault: **verified** |
+| CON-05 | FeeVault.spec | `deadEvidenceMovesOnlyOnTheForwardingPaths` | no verdict (`receiveForward` takes two arguments). ETH-denominated vault: **verified** |
+| CON-04 | FeeVault.spec | `candidateAttributionsCrossAsUnattributed` | no verdict. ETH-denominated vault: **verified** |
+| BID-05, FEE-10 | FeeVault.spec | `noPayoutPathCanBurnTokensAtTheZeroAddress` (`noPayoutPathCanBurnEthAtTheZeroAddress` on the ETH-denominated vault) | no verdict. Stated on `_sendToken`'s `BadRecipient` guard. It carries finding S-5: `require amount > 0` scopes the rule past `payKeeper`'s zero-amount early return |
+| CON-04 | FeeVault.spec | `postSunsetFeesAreNeverBookedLocally` | no verdict. ETH-denominated vault: **verified**; `isSunset()` is NONDET, see note 2 |
+| FEE-03, ROL-01 | FeeVault.spec | `ratesAndSplitsAreImmutable` | no verdict. `EDGE` is in the immutable list: no call may re-point the vault at another token and make its standing ledgers payable in something else. ETH-denominated vault: verified |
+| REN-02 | FeeVault.spec | `claimZeroesBeforePaying` | no verdict. ETH-denominated vault: verified |
 
 ## RoundManager.spec
 
@@ -62,19 +62,19 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
 | RND-09 | RoundManager.spec | `reverseIndexIsConsistent` (invariant) | **verified on the base, the transient step and 14 of 17 methods**; VIOLATED on `addCandidate`, `adoptGenesis` (C-1) and `finalize` (the delegation item) |
 | PAR-01 | RoundManager.spec | `pairingRightsAreWriteOnce` | **verified (17/17 methods)** |
 | PAR-01 | RoundManager.spec | `headIndexOnlyGrows` | **verified (17/17 methods)** |
-| RND-09, CON-01 | RoundManager.spec | `adoptGenesisIsOnceAndFactoryOnly` (new) | **VIOLATED** - finding **C-1**, a contract finding: `adoptGenesis` uses `_head != address(0)` as its once-only flag, so adopting `address(0)` leaves the flag unset and a second adoption succeeds. Latent (the factory constructor refuses a zero or codeless genesis token). REPORTED, NOT PATCHED |
+| RND-09, CON-01 | RoundManager.spec | `adoptGenesisIsOnceAndFactoryOnly` | **VIOLATED** - finding **C-1**, a contract finding, fixed in the code (note 13). Latent: the factory constructor refuses a zero or codeless genesis token |
 | RND-07 | RoundManager.spec | `finalizeIsIdempotent` | **verified** |
 | RND-08 | RoundManager.spec | `noNewRoundBeforeFinalize` | **verified** |
 | RND-13 | RoundManager.spec | `thresholdMovesOnlyInFinalize` | **verified (17/17 methods)** |
 | RND-11 | RoundManager.spec | `winnersBondIsReturned` | **verified** |
 | RND-11 | RoundManager.spec | `losersBondsAreForfeited` | **verified** |
-| RND-11 | RoundManager.spec | `addCandidateRefusesAnUnderDeliveredBond` (new) | **verified** |
-| RND-12 | RoundManager.spec | `registrationNeverPullsMoreThanTheQuotedBond` (new) | **verified** |
-| RND-11 | RoundManager.spec | `finalizeBooksWhatItCouldNotDeliver` (new) | **verified** |
-| RND-11 | RoundManager.spec | `pendingForfeitsMoveOnlyOnFinalizeOrFlush` (new) | **verified (17/17 methods)** |
-| REN-02 | RoundManager.spec | `flushForfeitsZeroesBeforeDelivering` (new) | **verified** |
-| RND-11 | RoundManager.spec | `theBondPushesAreSelfOnly` (new) | **verified** |
-| REN-01 | RoundManager.spec | `guardedFactoryEntrypointsCannotBeReentered` (new) | **verified** |
+| RND-11 | RoundManager.spec | `addCandidateRefusesAnUnderDeliveredBond` | **verified** |
+| RND-12 | RoundManager.spec | `registrationNeverPullsMoreThanTheQuotedBond` | **verified** |
+| RND-11 | RoundManager.spec | `finalizeBooksWhatItCouldNotDeliver` | **verified** |
+| RND-11 | RoundManager.spec | `pendingForfeitsMoveOnlyOnFinalizeOrFlush` | **verified (17/17 methods)** |
+| REN-02 | RoundManager.spec | `flushForfeitsZeroesBeforeDelivering` | **verified** |
+| RND-11 | RoundManager.spec | `theBondPushesAreSelfOnly` | **verified** |
+| REN-01 | RoundManager.spec | `guardedFactoryEntrypointsCannotBeReentered` | **verified** |
 | RND-04, RAN-03 | RoundManager.spec | `requestEndIsOnceAndNotBeforeT` | **verified** |
 | RND-05 | RoundManager.spec | `trueEndFallsInsideTheWindow` | **verified** |
 | RND-06, RAN-06 | RoundManager.spec | `timeoutFallbackSettlesAtT` | **verified** |
@@ -99,10 +99,10 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
 |---|---|---|---|
 | SLV-01 | Sleeve.spec | `rangeAddThenPointQueryIsTheClosedForm` | needs harness - violated; the counterexample sits exactly ON the bounds (`before = -(2^200 - 1)`, `c1 = -(2^160 - 2)`), which are one power of two looser than the reachable range (tree `< 2^190`, coefficients `< 2^128`) |
 | SLV-04 | Sleeve.spec | `pointQueryIsAdditive` | needs harness - violated, same cause as SLV-01 above |
-| SLV-06 | Sleeve.spec | `genesisTakesTheWholeSleeveAtMZero` | needs harness - **verified**: bounding the tree pre-state (`< 2^200`) and the WAD-scaled sleeve (`< 2^160`) removed the `unchecked`-accumulator overflow. |
-| SLV-05 | Sleeve.spec | `genesisWeightIsTwiceTheTerminalWeight` | needs harness - **violated** (a loose-bound counterexample); still bounded to `M <= 64`, a recorded scoping restriction |
+| SLV-06 | Sleeve.spec | `genesisTakesTheWholeSleeveAtMZero` | needs harness - **verified**, with the tree pre-state bounded (`< 2^200`) and the WAD-scaled sleeve bounded (`< 2^160`), which excludes the `unchecked`-accumulator overflow. |
+| SLV-05 | Sleeve.spec | `genesisWeightIsTwiceTheTerminalWeight` | needs harness - **violated** (a loose-bound counterexample); bounded to `M <= 64`, a recorded scoping restriction |
 | SLV-02 | Sleeve.spec | `everyAncestorShareIsNonNegative` | needs harness - timeout (`loop_iter: 14`) |
-| SLV-03 | Sleeve.spec | `sumOfSharesNeverExceedsTheSleeveSmallM` | needs harness - **timeout** (`loop_iter: 14`, non-vacuous; `loop_iter: 12` against the 13-deep Fenwick walk was vacuous). Stated as a delta at WEI granularity. SLV-03 is UNPROVED at this tier |
+| SLV-03 | Sleeve.spec | `sumOfSharesNeverExceedsTheSleeveSmallM` | needs harness - **timeout** (`loop_iter: 14`, non-vacuous; `loop_iter: 12` against the 13-deep Fenwick walk is vacuous). Stated as a delta at WEI granularity. SLV-03 is UNPROVED at this tier |
 | SLV-03 | Sleeve.spec | `noShareExceedsTheSleeve` | needs harness - **timeout**, same cause; restated as a delta against the WAD-scaled sleeve |
 | SLV-02 | Sleeve.spec | `noIndexOutsideTheRangeIsCredited` | needs harness - **violated**, same loose-bound cause |
 | SLV-07 | Sleeve.spec | `indexPastMaxReverts` | needs harness - **verified with no `sleeve > 0` precondition**: the bounds check runs before the zero short-circuit |
@@ -117,24 +117,24 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
 | SUP-06 | FamilyHook.spec | `donationsAreImpossible` | **verified** |
 | SUP-05 | FamilyHook.spec | `liquidityIsARatchet` | **verified** |
 | SCR-04 | FamilyHook.spec | `averageOverIsTheAccumulatorDifference` | **verified** |
-| SCR-14 (was SPEC-GAP 7.12) | FamilyHook.spec | `averageOverRevertsOnACollapsedWindow` | **verified** |
+| SCR-14 (SPEC-GAP 7.12) | FamilyHook.spec | `averageOverRevertsOnACollapsedWindow` | **verified** |
 | SCR-10 | FamilyHook.spec | `noRingEntryIsWrittenPastTheBell` | **verified (3/3 methods)** |
 | SCR-10 | FamilyHook.spec | `endSealIsWriteOnce` | **verified (3/3 methods)** |
 | SCR-10 | FamilyHook.spec | `theEndSealIsOnlyLaidPastTheBell` | **verified (3/3 methods)** |
-| SCR-13 | FamilyHook.spec | `registerPoolRefusesAPoolWithoutAPublishedEnd` (was `registerPoolRefusesACandidateWithoutAPublishedEnd`) | **verified** |
-| SCR-10, SCR-13 | FamilyHook.spec | `everyRegisteredPoolHasAPublishedEnd` (new) | **verified (3/3 methods)** |
+| SCR-13 | FamilyHook.spec | `registerPoolRefusesAPoolWithoutAPublishedEnd` | **verified** |
+| SCR-10, SCR-13 | FamilyHook.spec | `everyRegisteredPoolHasAPublishedEnd` | **verified (3/3 methods)** |
 | SCR-05 | FamilyHook.spec | `aSlotIsWrittenOnceByItsFirstSwap` | **verified** |
 | SCR-06 | FamilyHook.spec | `theFastRingSpansTheRandomEndWindow` | **verified** |
 | FEE-04 | FamilyHook.spec | `snipeTaxBounds` | **verified** |
 | FEE-04, FEE-06 | FamilyHook.spec | `summedRatesStayBelowOne` | **VIOLATED on its third assertion only** (finding **S-11**: `hopFeePpm` is an unpinned immutable and the Prover may choose 0). The two pairwise FEE-04 bounds are **verified** |
-| FEE-04, FEE-06 | FamilyHook.spec | `theEdgeFeeIsSuppressedDuringTheSnipeWindow` (new) | **DISABLED** (finding **S-10**, same cause). NOT EXPRESSIBLE here; falls back to the fuzz and unit tiers |
+| FEE-04, FEE-06 | FamilyHook.spec | `theEdgeFeeIsSuppressedDuringTheSnipeWindow` | **DISABLED** (finding **S-10**, same cause). NOT EXPRESSIBLE here; falls back to the fuzz and unit tiers |
 | FEE-03 | FamilyHook.spec | `feeRatesAreImmutable` | **verified (3/3 methods)** |
-| FEE-01 | FamilyHook.spec | `protocolFeeOnlyAtTheEdge` (was `protocolFeeOnlyOnTheGenesisPool`) | **DISABLED** (finding **S-10**: the `PoolId` key type of the `Sload` hook cannot be named in CVL at 8.19.2). NOT EXPRESSIBLE here; falls back to `test/properties/Fees.prop.t.sol` and the unit tests |
+| FEE-01 | FamilyHook.spec | `protocolFeeOnlyAtTheEdge` | **DISABLED** (finding **S-10**: the `PoolId` key type of the `Sload` hook cannot be named in CVL at 8.19.2). NOT EXPRESSIBLE here; falls back to `test/properties/Fees.prop.t.sol` and the unit tests |
 | FEE-01 | FamilyHook.spec | `beforeSwapIsReachable` (`satisfy`) | **verified** |
-| FEE-01 | FamilyHook.spec | `theFeeMintIsReachable` (`satisfy`) | **verified (reachable)**, which is exactly where the FEE-01 ladder still stops |
+| FEE-01 | FamilyHook.spec | `theFeeMintIsReachable` (`satisfy`) | **verified (reachable)**, which is exactly where the FEE-01 ladder stops |
 | FEE-01 | FamilyHook.spec | `anyFeeAccrualIsReachable` (`satisfy`) | **VIOLATED (unreachable)** - finding **S-13** |
 | FEE-01 | FamilyHook.spec | `someProtocolFeeIsReachable` (`satisfy`) | **VIOLATED (unreachable)** - finding **S-13** |
-| FEE-01 | FamilyHook.spec | `oneProtocolFeeAtTheEdgeIsReachable` (`satisfy`, was `oneProtocolFeeAtTheEthEdgeIsReachable`) | **VIOLATED (unreachable)** - finding **S-13**. With the vault UNLINKED and the exact summary gone, three hypotheses for FEE-01 are dead; `optimistic_fallback` is the one left |
+| FEE-01 | FamilyHook.spec | `oneProtocolFeeAtTheEdgeIsReachable` (`satisfy`) | **VIOLATED (unreachable)** - finding **S-13**. With the vault UNLINKED and no exact summary, three hypotheses for FEE-01 are ruled out; `optimistic_fallback` is the one left |
 
 ## Not expressible in these specs
 
@@ -175,7 +175,7 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
    sum over a symbolic range. The depth-independent half is `noShareExceedsTheSleeve`.
 7. Reconstructing `acc` at both window edges from the rings needs the swap history; the rule is
    weakened to the attainment-time bound, which is what `submitScore` reads as `tFirstAttained`.
-8. (superseded, see note 10.)
+8. See note 10.
 9. `protocolFeeOnlyAtTheEdge` states the per-pool half of FEE-01 ("only if the pool is an edge
    pool"). `_collect` passes `Currency.unwrap(parent)` to the vault unconditionally, so the word the
    vault receives carries no pool class; the predicate has to be read from `p.isEdge` itself, through
@@ -183,7 +183,7 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
    per-pool half is NOT EXPRESSIBLE at this tier. It is covered by `test/properties/Fees.prop.t.sol`
    and the unit tests. The per-route count is in the not-expressible table above, for a different
    reason.
-10. Note 8 above is obsolete: `ghostSlotWrites` is gone. SCR-05 is stated against the contract's
+10. SCR-05 is stated against the contract's
     own `scoreCheckpoint()` getter either side of a swap, because an `Sstore` hook on the nested ring
     does not type-check (the key resolves to a `PoolId` identity a hook declaration cannot name).
 11. A `PoolId` key is an identity a hook declaration cannot name at `certora-cli` 8.19.2, whether the
@@ -196,13 +196,13 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
 12. The `EDGE` link in `FeeVault.conf` links an immutable of a USER-DEFINED VALUE TYPE (`Currency`
     over `address`) rather than a plain address. The fallback, if the Prover refuses it, is in that
     conf's own header.
-13. C-1, a contract finding. `adoptGenesisIsOnceAndFactoryOnly` was VIOLATED:
-    `RoundManager.adoptGenesis` used `_head != address(0)` as its write-once flag, so adopting
-    `address(0)` performed every write, emitted the event, and left the flag unset, after which a
-    second adoption re-seated canonical index 0, the head, the index-0 creator and the edge currency.
-    It was LATENT rather than live: the entrypoint is `onlyFactory` and `FamilyFactory`'s constructor
-    refuses a zero or codeless genesis token. **Fixed in the code**: `RoundManager` carries its own
-    write-once `_genesisAdopted` boolean and `adoptGenesis` refuses a zero `token`.
+13. C-1, a contract finding. The `adoptGenesisIsOnceAndFactoryOnly` counterexample adopts
+    `address(0)` against a `_head != address(0)` write-once flag: every write is performed, the event
+    is emitted and the flag stays unset, so a second adoption re-seats canonical index 0, the head, the
+    index-0 creator and the edge currency. It is LATENT rather than live: the entrypoint is
+    `onlyFactory` and `FamilyFactory`'s constructor refuses a zero or codeless genesis token.
+    **Fixed in the code**: `RoundManager` carries its own write-once `_genesisAdopted` boolean and
+    `adoptGenesis` refuses a zero `token` (`test/Round.t.sol`, `GenesisAdoptionTest`).
 
 ## Spec gaps encoded as assumptions
 
@@ -210,8 +210,8 @@ the reason and the restore condition, so that nothing passes vacuously in its pl
 |---|---|---|
 | 1 - one fee per edge traversal | FamilyHook.spec, FEE-01 block (the per-pool rule is DISABLED, S-10; the ladder is unreachable, S-13) | one fee per traversal, i.e. two for a round trip: `swapPath([0, 1, 0])` ends at index 0 and credits the creator recorded for the adopted genesis token with the creator share of both edge legs |
 | 7, `DURATION_SCALE_DIV` vs `closingWindowFor` | RoundManager.spec, `scheduleBounds` | `W` is computed from the **scaled** `D` |
-| 8 - "no fee on genesis-less paths" | FamilyHook.spec, FEE-01 block (same caveat as item 1) | the rule is read as "only if the pool is an EDGE pool" (parent is canonical index 0, decided by the factory at registration), not in terms of a currency. There is no native-ETH reading left to choose between |
+| 8 - "no fee on genesis-less paths" | FamilyHook.spec, FEE-01 block (same caveat as item 1) | the rule is read as "only if the pool is an EDGE pool" (parent is canonical index 0, decided by the factory at registration), not in terms of a currency. There is no native-ETH reading to choose between |
 | 12, `averageOver` with `t1 == t0` | FamilyHook.spec, `averageOverRevertsOnACollapsedWindow` | **GAP CLOSED in the code's favour**: the call REVERTS `BadScoreWindow`, because two edges resolving to one instant measure nothing and a zero there is indistinguishable from a real average of zero. The rule asserts the revert and verifies; the precondition that keeps it unreachable is a deploy-time guard, proved in `RoundManager.spec` |
-| 14 - `hopFeePpm` at its ceiling | FamilyHook.spec, `summedRatesStayBelowOne` (the partner rule `theEdgeFeeIsSuppressedDuringTheSnipeWindow` is DISABLED, S-10) | **the two pairwise bounds VERIFY and the third assertion is VIOLATED for finding S-11, an unpinned `hopFeePpm` the Prover may choose to be 0.** The rule states `hopFeePpm + max(PROTOCOL_FEE_PPM, SNIPE_START_PPM) <= 1e6`, and PROPERTIES 7.14's "100.075%" is still arithmetically wrong (990000 + 10000 + 10000 = 101%). The three are never summed because a round-one pool is both edge and freshly opened, and the exclusion is in TIME: `protocolPpm = (p.isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` |
+| 14 - `hopFeePpm` at its ceiling | FamilyHook.spec, `summedRatesStayBelowOne` (the partner rule `theEdgeFeeIsSuppressedDuringTheSnipeWindow` is DISABLED, S-10) | **the two pairwise bounds VERIFY and the third assertion is VIOLATED for finding S-11, an unpinned `hopFeePpm` the Prover may choose to be 0.** The rule states `hopFeePpm + max(PROTOCOL_FEE_PPM, SNIPE_START_PPM) <= 1e6`, and PROPERTIES 7.14's "100.075%" is arithmetically wrong (990000 + 10000 + 10000 = 101%). The three are never summed because a round-one pool is both edge and freshly opened, and the exclusion is in TIME: `protocolPpm = (p.isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0` |
 | - (§J Fenwick residue) | FeeVault.spec, `edgeLedgerDecomposition` | the floored residue stays in the vault and is not subtracted from `ledgerTotal` |
 | - (§J donations) | FeeVault.spec, `solvency` + `onlyAccrualPathsRaiseLedgerTotal` | an unsolicited edge-currency transfer into the vault raises `holdings(EDGE)`, credits no ledger and is permitted. Solvency is an inequality in that direction and nothing sweeps the surplus |

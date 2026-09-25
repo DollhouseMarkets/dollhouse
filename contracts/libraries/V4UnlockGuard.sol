@@ -11,7 +11,7 @@ import {IExttload} from "v4-core/src/interfaces/IExttload.sol";
 /// `bytes32(uint256(keccak256("Unlocked")) - 1)`) and the `PoolManager` inherits `Exttload`, so
 /// the slot is readable from outside with a single `exttload`. The constant is pinned here
 /// rather than imported because `Lock` is an internal library: the value is asserted against
-/// v4-core's own definition in `test/Review2.t.sol`.
+/// v4-core's own definition in `test/RoundGuards.t.sol`.
 ///
 /// REN-01: the protocol's OWN swap path legitimately runs inside an unlock - the hook's
 /// `afterSwap` and the vault's `accrue` are called from there on every swap, and those are not

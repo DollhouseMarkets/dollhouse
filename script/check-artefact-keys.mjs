@@ -17,10 +17,12 @@
 //
 // AND THE VALUES, when a written record is there to check:
 //
-//   node script/check-artefact-keys.mjs [deployments/<chainId>.json]
+//   node script/check-artefact-keys.mjs [path/to/record.json]
 //
-// A key that is present and ZERO is as silent as a key that is missing. With a record named on
-// the command line (or CHAIN_ID / VITE_CHAIN_ID set, resolved the way the web build resolves it),
+// The record is `deployments/<chainId>.json` for the chain in CHAIN_ID (or VITE_CHAIN_ID). A
+// different file can be named on the command line or in DEPLOYMENT_RECORD.
+//
+// A key that is present and ZERO is as silent as a key that is missing. With a record resolved,
 // this also fails on a zero `genesisToken`, and WARNS on a zero or missing
 // `entrancePoolId` or `stateView` - the legitimate but easily unnoticed "no venue behind the edge
 // currency" deployment.
@@ -52,20 +54,16 @@ for (const m of sync.matchAll(/\braw\.([A-Za-z0-9_]+)/g)) read.add(m[1])
 const venue = /const VENUE_VIEW_KEY = '([A-Za-z0-9_]+)'/.exec(sync)
 if (venue) read.add(venue[1])
 
-/// The record whose VALUES are checked, if one was named or can be resolved. No record is not a
+/// The record whose VALUES are checked: named on the command line or in DEPLOYMENT_RECORD, else
+/// `deployments/<chainId>.json`. No record is not a
 /// failure: the key check is the part that runs everywhere, toolchain or not.
 function recordPath() {
-  const named = process.argv[2]
+  const named = process.argv[2] || process.env.DEPLOYMENT_RECORD
   if (named) return resolve(named)
   const chainId = process.env.CHAIN_ID || process.env.VITE_CHAIN_ID
   if (!chainId) return null
-  for (const p of [
-    join(repo, 'private', 'deployments', `${chainId}.json`),
-    join(repo, 'deployments', `${chainId}.json`),
-  ]) {
-    if (existsSync(p)) return p
-  }
-  return null
+  const p = join(repo, 'deployments', `${chainId}.json`)
+  return existsSync(p) ? p : null
 }
 
 /// Every value that must be non-zero for the deployment to mean anything, and the two that are

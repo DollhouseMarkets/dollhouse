@@ -14,6 +14,9 @@ import {FamilyToken} from "../contracts/FamilyToken.sol";
 import {RoundManager} from "../contracts/RoundManager.sol";
 import {CurveMath} from "../contracts/libraries/CurveMath.sol";
 import {FamilyLens} from "../contracts/FamilyLens.sol";
+import {IRandomnessSource} from "../contracts/interfaces/IRandomnessSource.sol";
+import {FamilyFactory} from "../contracts/FamilyFactory.sol";
+import {MockDoll} from "./utils/MockDoll.sol";
 
 /// @notice One whole succession round, end to end, plus the attacks the round design must
 /// withstand: the submission-ordering attack, the post-bell dump, and a stale finalize.
@@ -460,5 +463,197 @@ contract RoundTest is RoundTestBase {
 
         (page,) = roundManager.candidateIds(3, 0, 10);
         assertEq(page.length, 0, "and so is a round that does not exist");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The end-request guard is a flag, not a non-zero beacon id
+    // ---------------------------------------------------------------------------------
+
+    function test_theEndCannotBeRequestedTwice() public {
+        _openRoundAtNominalEnd();
+        roundManager.requestEnd();
+        vm.expectRevert(RoundManager.EndAlreadyRequested.selector);
+        roundManager.requestEnd();
+    }
+
+    /// @notice A source that hands back `bytes32(0)` does not disarm the once-per-round guard,
+    /// because the guard is its own flag, not the id itself. `DrandSource.pin()` returns
+    /// `bytes32(round)`, so this would need beacon round 0 - but the guard holds either way.
+    function test_aZeroRequestIdStillClosesTheRound() public {
+        uint256 roundId = _openRoundAtNominalEnd();
+
+        vm.mockCall(
+            address(randomness), abi.encodeWithSelector(IRandomnessSource.pin.selector), abi.encode(bytes32(0))
+        );
+        bytes32 id = roundManager.requestEnd();
+        assertEq(id, bytes32(0), "the source really returned a zero id");
+
+        RoundManager.Round memory r = roundManager.roundInfo(roundId);
+        assertTrue(r.endRequested, "the request is recorded by its own flag");
+        assertEq(r.randomId, bytes32(0), "and the id carries no 'unset' meaning");
+
+        vm.expectRevert(RoundManager.EndAlreadyRequested.selector);
+        roundManager.requestEnd();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // A round with no score says so
+    // ---------------------------------------------------------------------------------
+
+    /// @notice A denied submission must be legible after the fact: a round that finalizes with no
+    /// score at all says so on chain.
+    function test_aRoundWithNoSubmittedScoreSaysSo() public {
+        _registerCandidate(address(0xA11CE), "A");
+        (,, uint64 submitEnd) = _roundTimes(roundManager.roundCount());
+        _settleEnd();
+        vm.warp(submitEnd + 1);
+
+        vm.recordLogs();
+        roundManager.finalize();
+        assertTrue(_sawNoScoreSubmitted(2), "finalize reports that no score was ever submitted");
+    }
+
+    function _sawNoScoreSubmitted(uint256 roundId) internal returns (bool) {
+        bytes32 sig = keccak256("NoScoreSubmitted(uint256,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(roundManager) || logs[i].topics[0] != sig) continue;
+            if (uint256(logs[i].topics[1]) == roundId) return true;
+        }
+        return false;
+    }
+
+    /// @dev Open a round and stand at its nominal end `T`, where {RoundManager.requestEnd} is
+    /// the next legal call.
+    function _openRoundAtNominalEnd() internal returns (uint256 roundId) {
+        _registerCandidate(address(0xA11CE), "CAND");
+        roundId = roundManager.roundCount();
+        (, uint64 nominalEnd,) = _roundTimes(roundId);
+        vm.warp(nominalEnd);
+    }
+}
+
+/// @notice The external genesis is ADOPTED, once, inside {FamilyFactory.wire}. `adoptGenesis` keeps
+/// a dedicated `_genesisAdopted` flag and refuses `address(0)` explicitly, so a zero adoption can
+/// never leave the write-once flag unset and let a second call re-seat canonical index 0, the
+/// head and the edge currency.
+contract GenesisAdoptionTest is RoundTestBase {
+    function setUp() public {
+        _setUpFamily();
+    }
+
+    /// @notice Adoption happens inside {FamilyFactory.wire}, exactly once, and the
+    /// creator of record is the DEPLOYER whoever sends the wiring transaction. The entry it
+    /// wrote is the registry entry of index 0.
+    function test_adoptionHappensOnceInsideWiringAndCreditsTheDeployer() public {
+        assertTrue(factory.genesisAdopted(), "set up wires, and wiring adopts");
+        assertEq(roundManager.canonical(0), address(doll), "canonical 0 is the adopted token");
+        assertEq(roundManager.head(), address(doll), "and it is the first head");
+        assertEq(roundManager.headIndex(), 0);
+        assertEq(roundManager.parentOf(address(doll)), address(0), "index 0 has no parent");
+        assertEq(factory.DEPLOYER(), address(this), "the factory records who deployed it");
+        assertEq(roundManager.creatorOf(address(doll)), address(this), "the deployer is the creator of record");
+
+        // wiring again is a no-op, from anybody: there is no second adoption to race for
+        factory.wire();
+        vm.prank(address(0xA11CE));
+        factory.wire();
+        assertEq(roundManager.creatorOf(address(doll)), address(this), "and nobody else can take it");
+
+        // and the RoundManager refuses a second entry even from the factory
+        vm.prank(address(factory));
+        vm.expectRevert();
+        roundManager.adoptGenesis(address(0xDEAD), address(this));
+    }
+
+    /// @notice A third party who wires the stack first cannot become the creator of
+    /// canonical index 0. The attribution is fixed at construction, not at the call.
+    function test_wiringByAStrangerStillCreditsTheDeployer() public {
+        maxIndex = 0;
+        Stack memory s = _deployStack(true, steward, address(0));
+        assertFalse(s.factory.genesisAdopted(), "a fresh stack is not wired yet");
+
+        vm.prank(address(0xBAD));
+        s.factory.wire();
+
+        assertTrue(s.factory.genesisAdopted());
+        assertEq(s.factory.genesisCreator(), address(this), "the deployer, not the caller");
+        assertEq(s.roundManager.creatorOf(address(doll)), address(this));
+        assertEq(s.roundManager.canonical(0), address(doll));
+    }
+
+    /// @notice A token with the wrong decimals is refused at adoption, so a stack quoted in a
+    /// 6-decimal unit can never come into existence.
+    function test_adoptionRefusesNonEighteenDecimals() public {
+        // a whole second world: a six-decimal mock at the same fixed address
+        MockDoll six = new MockDoll(6);
+        vm.etch(DOLL_ADDRESS, address(six).code);
+        MockDoll bad = MockDoll(DOLL_ADDRESS);
+        bad.mint(address(this), 1e6);
+        assertEq(bad.decimals(), 6, "the etched token is six-decimal");
+
+        Stack memory s = _deployStack(true, steward, address(0));
+        vm.expectRevert(FamilyFactory.BadGenesisToken.selector);
+        s.factory.wire();
+    }
+
+    /// @notice The zero-address path: called directly as the factory (bypassing
+    /// the factory's own zero/codeless guard, which is what makes it latent rather than live), it
+    /// must revert rather than seat the sentinel. A second, unwired stack is used because the
+    /// fixture's own trunk is already adopted by {setUp}.
+    function test_adoptGenesisRefusesTheZeroAddress() public {
+        Stack memory s2 = _deployStack(false, steward, address(0));
+
+        vm.prank(address(s2.factory));
+        vm.expectRevert(RoundManager.BadGenesisToken.selector);
+        s2.roundManager.adoptGenesis(address(0), address(this));
+    }
+
+    /// @notice A second adoption reverts after the first, with the dedicated flag - not by
+    /// coincidentally re-reading a token field as a sentinel.
+    function test_adoptGenesisRevertsOnASecondCall() public {
+        // this stack's genesis was already adopted in setUp() via factory.wire()
+        vm.prank(address(factory));
+        vm.expectRevert(RoundManager.GenesisAlreadyAdopted.selector);
+        roundManager.adoptGenesis(address(0xBEEF), address(this));
+    }
+
+    /// @notice Attempt to adopt `address(0)` first. That attempt itself reverts and leaves the flag unset, so pin that a real adoption
+    /// can still happen exactly once afterwards, and that a further attempt then hits the
+    /// dedicated flag rather than re-seating canonical index 0.
+    function test_zeroAddressAdoptionCannotBeFollowedByARealOne() public {
+        Stack memory s2 = _deployStack(false, steward, address(0));
+
+        vm.prank(address(s2.factory));
+        vm.expectRevert(RoundManager.BadGenesisToken.selector);
+        s2.roundManager.adoptGenesis(address(0), address(this));
+
+        // the flag was never set by the reverted call, and priorRegistry is still zero, so a real
+        // adoption succeeds - exactly once
+        vm.prank(address(s2.factory));
+        s2.roundManager.adoptGenesis(address(doll), address(this));
+        assertEq(s2.roundManager.canonical(0), address(doll), "the real token seated once");
+
+        vm.prank(address(s2.factory));
+        vm.expectRevert(RoundManager.GenesisAlreadyAdopted.selector);
+        s2.roundManager.adoptGenesis(address(0xCAFE), address(this));
+        assertEq(s2.roundManager.canonical(0), address(doll), "index 0 was not re-seated");
+    }
+
+    /// @notice The production path: the factory adopts exactly once inside {wire}, and calling it
+    /// again from anybody is a no-op, not a second adoption.
+    function test_factoryPathStillAdoptsExactlyOnce() public {
+        assertTrue(factory.genesisAdopted(), "set up wires, and wiring adopts");
+        assertEq(roundManager.canonical(0), address(doll));
+        assertEq(roundManager.head(), address(doll));
+        assertEq(roundManager.headIndex(), 0);
+
+        factory.wire();
+        vm.prank(address(0xA11CE));
+        factory.wire();
+
+        assertEq(roundManager.canonical(0), address(doll), "still the same token at index 0");
+        assertEq(roundManager.head(), address(doll), "still the same head");
+        assertEq(roundManager.headIndex(), 0, "still index 0");
     }
 }

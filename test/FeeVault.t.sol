@@ -17,6 +17,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {BidDeployer} from "../contracts/BidDeployer.sol";
 import {FeeVault} from "../contracts/FeeVault.sol";
 import {ILocker} from "../contracts/interfaces/ILocker.sol";
+import {FenwickRangeAdd} from "../contracts/libraries/FenwickRangeAdd.sol";
 
 /// @notice The fee ledger: the exact split, the Fenwick ancestor sleeve against a brute-force
 /// ledger, pull claims, and the keeper deployment path end to end.
@@ -665,5 +666,161 @@ contract FeeVaultTest is RoundTestBase {
             if (logs[i].emitter != address(locker) || logs[i].topics[0] != ILocker.BidDeposited.selector) continue;
             (, tickLower, tickUpper, liquidity) = abi.decode(logs[i].data, (uint256, int24, int24, uint128));
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The sleeve's bound check comes before its zero short-circuit
+    // ---------------------------------------------------------------------------------
+
+    /// @notice No index past {FenwickRangeAdd.MAX_INDEX} is ever accepted, even for a zero
+    /// sleeve: the bound is checked before the zero short-circuit, so it reverts either way.
+    function test_anOutOfRangeSleeveIndexAlwaysReverts() public {
+        FenwickHarness h = new FenwickHarness();
+        uint256 past = FenwickRangeAdd.MAX_INDEX + 1;
+
+        vm.expectRevert(FenwickRangeAdd.IndexOutOfRange.selector);
+        h.addSleeve(0, past);
+
+        vm.expectRevert(FenwickRangeAdd.IndexOutOfRange.selector);
+        h.addSleeve(1 ether, past);
+
+        // the last legal index is still legal, and a zero sleeve there is still a no-op
+        h.addSleeve(0, FenwickRangeAdd.MAX_INDEX);
+        assertEq(h.query(0), 0, "nothing was credited");
+    }
+}
+
+/// @notice The edge-currency ledgers from link one: the drawdown bucket, the payout recipient
+/// guard, and unsolicited donations.
+contract FeeVaultEdgeLedgerTest is RoundTestBase {
+    uint256 internal constant WINNING_BUY = 6_100_000e18;
+
+    function setUp() public {
+        _setUpEdge();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The drawdown bucket's "untouched" state is a flag, not a zero timestamp
+    // ---------------------------------------------------------------------------------
+
+    /// @notice First use is unchanged: an untouched generation starts with a full bucket, and a
+    /// drawn one refills continuously. That is the behaviour the flag has to preserve.
+    function test_theBucketBehavesIdenticallyOnFirstUseAndAfter() public {
+        _accrueSleeve(2 ether);
+
+        assertGt(vault.claimableEdge(1), 0, "generation 1 has a sleeve");
+        uint256 cap = (vault.claimableEdge(1) * vault.DAILY_DRAW_BPS()) / 10_000;
+        assertGt(cap, 0, "and a bucket to meter it with");
+        (uint64 updatedAt, uint256 available,) = vault.drawBucket(1);
+        assertEq(updatedAt, 0, "nothing has been drawn yet");
+        assertEq(available, cap, "and the bucket is full");
+        assertEq(vault.drawableEdge(1), cap, "which is what a keeper may take");
+
+        vm.prank(address(bidDeployer));
+        vault.consumeAncestorClaim(1, cap);
+        assertEq(vault.drawableEdge(1), 0, "the bucket is spent");
+
+        vm.warp(block.timestamp + uint256(vault.DRAW_WINDOW()));
+        uint256 capNow = (vault.claimableEdge(1) * vault.DAILY_DRAW_BPS()) / 10_000;
+        assertEq(vault.drawableEdge(1), capNow, "a full day refills it to the cap and no further");
+    }
+
+    /// @notice THE SENTINEL COLLISION. `updatedAt` is written with `uint64(block.timestamp)`, so
+    /// a clock at a multiple of 2^64 stores a legitimate zero. While zero also meant "never
+    /// drawn", that state read as a full bucket and two draws in the same block each took one.
+    /// The counterexample is Certora's own (`twoDrawsCannotDoubleUp`).
+    function test_aStoredZeroTimestampIsNotReadAsAnUntouchedBucket() public {
+        _accrueSleeve(2 ether);
+
+        // the clock truncates to exactly zero in the field's own width
+        vm.warp(2 ** 64);
+        uint256 first = vault.drawableEdge(1);
+        assertGt(first, 0, "there is a bucket to spend");
+        vm.prank(address(bidDeployer));
+        vault.consumeAncestorClaim(1, first);
+
+        (uint64 updatedAt,,) = vault.drawBucket(1);
+        assertEq(updatedAt, 0, "the stored clock really is a legitimate zero");
+        assertEq(vault.drawableEdge(1), 0, "and the bucket stays spent rather than reading as fresh");
+
+        vm.prank(address(bidDeployer));
+        vm.expectRevert(abi.encodeWithSelector(FeeVault.DailyLimitExceeded.selector, 1, 0));
+        vault.consumeAncestorClaim(1, 1);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // a payout may not be burned
+    // ---------------------------------------------------------------------------------
+
+    /// @notice Every payout refuses `address(0)`: without the guard, since the ledger is debited
+    /// before the send, a mistyped destination would burn the claim permanently.
+    function test_noPayoutPathCanBurnAPayoutAtTheZeroAddress() public {
+        // an ATTRIBUTED edge buy, so both the developer and link one's creator are owed something
+        familyRouter.buyExactIn(1, 1 ether, 0, address(this), 1);
+        assertGt(vault.devBalance(), 0, "the edge buy accrued a developer share");
+        vm.prank(vault.developer());
+        vm.expectRevert(FeeVault.BadRecipient.selector);
+        vault.claimDev(address(0));
+
+        address edgeToken = roundManager.canonical(1);
+        address creator = vault.creatorRecipient(edgeToken);
+        assertGt(vault.creatorBalance(edgeToken), 0, "and a creator share");
+        vm.prank(creator);
+        vm.expectRevert(FeeVault.BadRecipient.selector);
+        vault.claimCreator(edgeToken, address(0));
+
+        // the ledgers are untouched by the refusal, and the honest claim still pays
+        uint256 owed = vault.devBalance();
+        vm.prank(vault.developer());
+        uint256 paid = vault.claimDev(address(0xD00D));
+        assertEq(paid, owed, "the developer share is still there to claim");
+        assertEq(doll.balanceOf(address(0xD00D)), owed, "and it arrived");
+        _assertSolvent();
+        _assertNoEth();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // a donation is never sweepable
+    // ---------------------------------------------------------------------------------
+
+    /// @notice An unsolicited transfer of the edge currency into the vault raises `holdings`
+    /// without raising any ledger. Solvency is an INEQUALITY, so it still holds - and there is no
+    /// path of any kind that pays the donation out, because every payout is bounded by a ledger.
+    function testFuzz_aVaultDonationIsNeverSweepable(uint256 gift) public {
+        _buyLink(1, 10_000e18);
+        gift = bound(gift, 1, 1_000_000e18);
+
+        Currency edge = vault.EDGE();
+        uint256 ledgerBefore = vault.ledgerTotal(edge);
+        uint256 holdingsBefore = vault.holdings(edge);
+        uint256 devBefore = vault.devBalance();
+
+        doll.transfer(address(vault), gift);
+
+        assertEq(vault.ledgerTotal(edge), ledgerBefore, "a gift credits no ledger");
+        assertEq(vault.holdings(edge), holdingsBefore + gift, "but the vault really does hold it");
+        assertEq(vault.devBalance(), devBefore, "and nobody's claim grew");
+        assertLe(vault.ledgerTotal(edge), vault.holdings(edge), "solvency is an inequality, so it still holds");
+
+        // the developer can claim exactly what the ledger says and not one wei more
+        vm.prank(developer);
+        uint256 paid = vault.claimDev(developer);
+        assertEq(paid, devBefore, "the claim is the ledger, never the balance");
+        assertGe(vault.holdings(edge), gift, "the gift is still there, unclaimable, forever");
+
+        // there is no sweep: the vault exposes nothing that moves an unledgered balance
+        assertEq(vault.deployerCredit(), 0, "and no keeper credit was created by the gift");
+        _assertNoEth();
+    }
+
+    /// @dev Put a real ETH sleeve under generation 1, so the drawdown bucket has something to
+    /// meter. A generation's sleeve only fills when a DEEPER link is the attributed terminal
+    /// token, so the chain has to reach #2 and the buys have to terminate there.
+    function _accrueSleeve(uint256 ethIn) internal {
+        _runWinningRound(1, WINNING_BUY);
+        _runWinningRound(1, WINNING_BUY);
+        familyRouter.buyExactIn(2, ethIn, 0, address(this), 3);
+        vm.warp(block.timestamp + 200);
+        familyRouter.buyExactIn(2, ethIn / 10, 0, address(this), 3);
     }
 }
