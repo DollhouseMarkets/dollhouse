@@ -27,13 +27,35 @@ export const MAINNET_CHAIN_ID = 4663
 export const CORE_ADDRESS_KEYS = ['router', 'lens', 'roundManager', 'factory', 'feeVault', 'bidDeployer', 'hook']
 /// Also required non-zero, on every chain.
 export const ALWAYS_REQUIRED_EXTRA = ['genesisToken', 'deployBlock']
-/// Required on mainnet only: without it the site prints no ETH or USD figure at launch.
-export const MAINNET_REQUIRED_EXTRA = ['entrancePoolId']
-/// Required when the check is run with `--launch`: the ETH buy/sell option and both vesting
-/// locks (developer and artist), all of which a real launch must have run
-/// (script/DeployZap.s.sol, script/DeployVesting.s.sol run once per RECORD_KEY) before the
-/// record is usable.
-export const LAUNCH_REQUIRED_EXTRA = ['ethZap', 'devVesting', 'artistVesting']
+/// NOT required, even on mainnet: private/LAUNCH_RUNBOOK.md §10 (curve-phase launch) treats a
+/// record with no venue (`entrancePoolId` / `stateView` left empty, the deploy script writes
+/// zeros) as a legitimate deployment, not an error - "the site then prints no ETH or USD
+/// figure anywhere rather than a zero, which is the intended behaviour and not a bug." Kept as
+/// an exported (empty) list rather than deleted so a future key that IS unconditionally
+/// required on mainnet has a home without another seam like this one.
+export const MAINNET_REQUIRED_EXTRA = []
+/// Required when the check is run with `--launch`: both vesting locks (developer and
+/// artist), which a real launch must have run (script/DeployVesting.s.sol once per
+/// RECORD_KEY) before the record is usable. `ethZap` is NOT in this list: on 4663 it is
+/// required only when the record also carries a venue (a non-zero `entrancePoolId`) - see
+/// `ethZapRequired` below. A curve-phase record (the Pons bonding curve has not graduated,
+/// so there is no venue pool yet) has no zap and no ETH entry, and that is a valid launch,
+/// not a broken one.
+export const LAUNCH_REQUIRED_EXTRA = ['devVesting', 'artistVesting']
+
+/// True when a value is missing, empty, or all-zero (address, bytes32 or plain number),
+/// exactly what a deploy script writes for a key it has nothing to put there. Shared so
+/// `check-artefact-keys.mjs` and anything else reasoning about a record's zero-ness agrees.
+export function isZeroValue(v) {
+  return v === undefined || v === null || v === '' || /^0x0*$/.test(String(v)) || /^0+$/.test(String(v))
+}
+
+/// Whether `ethZap` must be present and non-zero in `raw`: on mainnet (4663), if and only if
+/// the record carries a venue (a non-zero `entrancePoolId`). Off mainnet, or with no venue,
+/// a zap has nothing to swap into and must be absent or zero.
+export function ethZapRequired(raw, isMainnet) {
+  return isMainnet && !isZeroValue(raw?.entrancePoolId)
+}
 
 /// Role EOAs in a record. None of them may be a well-known Anvil account.
 export const ROLE_KEYS = ['deployer', 'developer', 'devVestingDeployer', 'roundManagerDeployer', 'steward']

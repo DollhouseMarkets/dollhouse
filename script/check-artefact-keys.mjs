@@ -35,9 +35,13 @@
 //
 // A key that is present and ZERO is as silent as a key that is missing. REQUIRED non-zero on
 // every chain: the seven core contracts (router, lens, roundManager, factory, feeVault,
-// bidDeployer, hook), genesisToken and deployBlock; on mainnet (4663) also entrancePoolId; with
-// `--launch` also ethZap. The rest WARN when zero or missing - the legitimate but easily
-// unnoticed "no venue behind the edge currency" deployment among them.
+// bidDeployer, hook), genesisToken and deployBlock; with `--launch` also devVesting and
+// artistVesting. `ethZap` is required only on mainnet (4663) AND only when the record also
+// carries a venue (a non-zero entrancePoolId): the Pons bonding curve has not graduated at
+// launch, so a curve-phase record has no venue, no zap and no ETH entry - a valid launch, not
+// a broken one, and the check says so and passes rather than failing on it. The rest WARN when
+// zero or missing - the legitimate but easily unnoticed "no venue behind the edge currency"
+// deployment among them.
 //
 // `--rpc <url>` also asks that node, for every contract address in the record, `eth_getCode`,
 // and fails on any address with no code (and on an `eth_chainId` that is not the record's).
@@ -55,7 +59,9 @@ import {
   ALWAYS_REQUIRED_EXTRA,
   CORE_ADDRESS_KEYS,
   DIRECT_READ_KEYS,
+  ethZapRequired,
   flagValue,
+  isZeroValue,
   LAUNCH_REQUIRED_EXTRA,
   MAINNET_CHAIN_ID,
   MAINNET_REQUIRED_EXTRA,
@@ -119,13 +125,16 @@ function recordPath() {
 }
 
 /// Every value that must be non-zero for the deployment to mean anything. Mainnet and
-/// `--launch` add to it (script/contract-keys.mjs).
-function requiredKeys(isMainnet) {
+/// `--launch` add to it (script/contract-keys.mjs). `ethZap` is added only with `--launch`
+/// on mainnet AND only when `raw` already carries a venue (`ethZapRequired`); the caller
+/// passes the parsed record once it has one.
+function requiredKeys(isMainnet, raw) {
   return [
     ...CORE_ADDRESS_KEYS,
     ...ALWAYS_REQUIRED_EXTRA,
     ...(isMainnet ? MAINNET_REQUIRED_EXTRA : []),
     ...(launch ? LAUNCH_REQUIRED_EXTRA : []),
+    ...(launch && ethZapRequired(raw, isMainnet) ? ['ethZap'] : []),
   ]
 }
 /// Zero here is a legitimate deployment, not a broken record - but it is one nobody should
@@ -144,8 +153,7 @@ const OPTIONAL = [
   ['artistVesting', (r) => r.artistVesting, 'the site does not link the artist vesting wallet'],
 ]
 
-const isZero = (v) =>
-  v === undefined || v === null || v === '' || /^0x0*$/.test(String(v)) || /^0+$/.test(String(v))
+const isZero = isZeroValue
 
 const valueErrors = []
 const record = recordPath()
@@ -168,14 +176,28 @@ if (record) {
   if (chainId === undefined) console.log(`  (no CHAIN_ID/VITE_CHAIN_ID: checking as the record's own chain ${raw.chainId})`)
   for (const p of recordProblems(raw, checkedChain)) valueErrors.push(p)
   const isMainnet = checkedChain === MAINNET_CHAIN_ID
-  const required = requiredKeys(isMainnet)
+  const hasVenue = !isZero(raw.entrancePoolId)
+  const required = requiredKeys(isMainnet, raw)
   for (const label of required) {
     const v = raw[label]
     if (isZero(v)) valueErrors.push(`${label} is ${v === undefined ? 'missing' : `zero (${v})`}`)
     else console.log(shown(label, v))
   }
+  // A curve-phase record (the Pons bonding curve has not graduated, so there is no venue pool
+  // yet): ethZap is correctly absent, and that is not a warning, it is the expected shape of
+  // this launch. Say so plainly instead of letting the generic OPTIONAL warning below imply
+  // something is missing.
+  if (isMainnet && launch && !hasVenue) {
+    console.log('  curve-phase record: no venue, no ETH entry')
+    if (!isZero(raw.ethZap)) {
+      valueErrors.push(
+        'ethZap is set but entrancePoolId is zero/missing: a zap with no venue behind it cannot swap anything',
+      )
+    }
+  }
   for (const [label, get, meaning] of OPTIONAL) {
     if (required.includes(label)) continue
+    if (label === 'ethZap' && isMainnet && launch && !hasVenue) continue // said above, not warned here
     const v = get(raw)
     const why = v === undefined ? 'missing' : 'zero'
     if (isZero(v)) console.log(`  WARNING: ${label} is ${why}: ${meaning}`)
