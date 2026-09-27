@@ -27,27 +27,35 @@ accepts (`NotBidDeployer` otherwise). Every place below that used to say "the va
 or "the vault buys the keeper's tokens" now means `BidDeployer`; `FeeVault` never swaps and never
 places liquidity, before or after this split.
 
-**Sizes** (`forge build --sizes`, runtime bytecode, EIP-170 limit 24,576 B), the whole deployed
-stack including an adopted genesis and one candidate token, exactly as `CodeSize.t.sol` measures it:
+**Sizes** (`forge build --sizes`, regenerated 2026-09-26 at `optimizer_runs = 200`; EIP-170 runtime
+limit 24,576 B, EIP-3860 initcode limit 49,152 B), every contract the deploy scripts put on chain:
 
-| contract | runtime bytes | margin |
-|---|---|---|
-| `BidDeployer` | 18,373 | 6,203 |
-| `RoundManager` | 13,925 | 10,651 |
-| `FamilyFactory` | 13,528 | 11,048 |
-| `FeeVault` | 12,402 | 12,174 |
-| `FamilyHook` | 9,851 | 14,725 |
-| `FamilyRouter` | 8,700 | 15,876 |
-| `Locker` | 6,379 | 18,197 |
-| `FamilyLens` | 5,735 | 18,841 |
-| `FamilyToken` | 1,961 | 22,615 |
+| contract | runtime bytes | runtime margin | initcode bytes | initcode margin |
+|---|---|---|---|---|
+| `RoundManagerDeployer` (carries `RoundManager`'s creation code) | 22,698 | 1,878 | 22,724 | 26,428 |
+| `BidDeployer` | 21,438 | 3,138 | 23,173 | 25,979 |
+| `RoundManager` | 20,557 | 4,019 | 22,068 | 27,084 |
+| `FeeVault` | 17,033 | 7,543 | 18,652 | 30,500 |
+| `FamilyHook` | 13,701 | 10,875 | 14,152 | 35,000 |
+| `EthZap` | 11,000 | 13,576 | 12,412 | 36,740 |
+| `FamilyFactory` | 9,724 | 14,852 | 32,606 | 16,546 |
+| `FamilyRouter` | 8,336 | 16,240 | 8,855 | 40,297 |
+| `Locker` | 6,145 | 18,431 | 6,387 | 42,765 |
+| `FamilyLens` | 5,975 | 18,601 | 6,546 | 42,606 |
+| `DrandSource` | 4,506 | 20,070 | 4,895 | 44,257 |
+| `FamilyToken` (implementation; each clone is 45 B) | 3,412 | 21,164 | 4,260 | 44,892 |
+| `VestingWallet` | 2,023 | 22,553 | 2,331 | 46,821 |
+| `MockRandomnessSource` (testnet only) | 950 | 23,626 | 1,084 | 48,068 |
 
-Every deployed contract fits comfortably under the limit, `BidDeployer` included, the split leaves
-over 6.2 KB of headroom on the largest piece, versus the pre-split `FeeVault` at 25,550 B, which
-exceeded the limit outright. `CodeSize.t.sol::test_everyDeployedContractFitsUnderEip170` asserts
-`0 < size <= 24_576` for every one of these at once, against a stack deployed exactly the way the
-deploy script deploys it (`forge test` runs with the contract-size check disabled, so this test is
-what catches an oversized contract before a deploy).
+Every deployed contract fits under both limits. The only contract in the build over EIP-170 is the
+test-only property handler `PropHandler` (30,900 B runtime), which is never deployed; the test-only
+`MedusaTarget` harness is under EIP-170 but over the EIP-3860 initcode limit (57,429 B), and is
+never deployed either. `CodeSize.t.sol::test_everyDeployedContractFitsUnderEip170` asserts
+`0 < size <= 24_576` for every deployed contract at once, against a stack deployed exactly the way
+the deploy script deploys it (`forge test` runs with the contract-size check disabled, so this test
+is what catches an oversized contract before a deploy), and
+`CodeSize.t.sol::test_factoryDeploymentTransactionFitsUnderEip3860` measures the factory's
+deployment transaction, constructor arguments included, against EIP-3860.
 
 ---
 
@@ -244,14 +252,16 @@ not from `T`. **Timeout fallback, disclosed:** if nobody has relayed a verifiabl
 `T_end = T` and emits `RandomEndUnavailable(roundId, T, submitEnd)`, the randomness is simply
 absent for that round; the round always finalizes, it never hangs on the beacon
 (`Schedule.t.sol::test_anUnrelayedBeaconEndsTheRoundAtTLoudly`,
-`test_theFallbackWorksEvenIfNobodyEverRequestedTheEnd`). `randomEndWindowFor(n) = min(RANDOM_END_S,
-D(n))` so a heavily testnet-scaled round shorter than 180 s still draws from its own whole length,
-never from a span longer than the round.
+`test_theFallbackWorksEvenIfNobodyEverRequestedTheEnd`). `randomEndWindowFor(n) = max(1, min(RANDOM_END_S,
+D(n) / 4))`: a heavily testnet-scaled round draws its end from at most the last quarter of its own
+length, so `T_end` can never land at or before `tradingStart`, and the floor of 1 keeps the modulus
+in `fulfilEnd` defined. On mainnet `D(n) >= 15 min`, so `D(n) / 4 >= 225 s` and the window is always
+exactly `RANDOM_END_S`.
 
 **`DURATION_SCALE_DIV`** (mainnet `1`, a `RoundManager` constructor parameter, `ALLOW_SCALED_SCHEDULE`
 gate) divides `D`, `R` and the late-entry window uniformly, so a testnet run can exercise a 12-hour
-schedule inside minutes; it never scales `RANDOM_END_S`, the random-end span is capped at the
-(already scaled) duration instead, floored at 1 (never a zero-length window). Tests:
+schedule inside minutes; it never scales `RANDOM_END_S`, the random-end span is capped at a quarter
+of the (already scaled) duration instead, floored at 1 (never a zero-length window). Tests:
 `Schedule.t.sol::test_theScheduleTableIsExact`, `test_theScheduleIsCappedForever`,
 `test_theClosingWindowTable`, `test_anOpenedRoundUsesItsOwnRowOfTheTable`,
 `test_lateEntryIsRefusedOnAShortRound`, `test_lateEntryIsAcceptedInTheWindowAndRefusedAfterIt`,
@@ -294,7 +304,7 @@ registrationEnd   = openedAt + registrationFor(n)
 tradingStart      = registrationEnd                  (shared by every candidate in the round)
 nominalEnd (T)    = tradingStart + durationFor(n)    (public from the moment the round opens)
 tradingEnd        = T - (r mod randomEndWindowFor(n))    (T_end, settled by fulfilEnd/finalizeDeterministic, §C above)
-submitEnd         = tradingEnd + 300                 (starts at settlement, not at T)
+submitEnd         = settlement time + 300            (block.timestamp of the fulfilEnd or finalizeDeterministic call; starts at settlement, not at T or T_end)
 ```
 
 Late entrants (round `n` with `durationFor(n) >= 1 hour`) register through `lateEntryUntil(n)` of
@@ -665,7 +675,10 @@ has no effect on `H`) while making every remaining holder richer per token
 `FamilyRouter` is immutable, permissionless and **not fee-privileged**; it pays exactly the fees a
 direct `PoolManager.swap` pays. **The router is $DOLL-only.** There is no native-ETH
 sentinel, no `msg.value` anywhere, and no native settle branch; every entrypoint pulls `amountIn` as
-an ERC-20 from the caller (approval required first).
+an ERC-20 from the caller (approval required first). Native ETH enters and leaves only through
+`EthZap`, a stateless periphery contract outside the core stack: it converts ETH to $DOLL (and back)
+on $DOLL's entrance venue and then calls the router like any other caller, with no owner and no
+state kept between calls.
 
 - `buyExactIn(targetIndex, amountIn, minOut, to, maxHops)`, spends `amountIn` of the adopted edge
   currency (canonical index 0) down path `[0, 1, …, targetIndex]`; index 0 is used only as the
@@ -1462,7 +1475,7 @@ Two independent accumulators live in `FamilyHook.RegisteredPool`.
 exactly four slots instead of the pre-optimization layout's larger footprint:
 
 ```
-slot 0: registered, isEdge, parentIsCurrency0, frozen, tradingStart, tradingEnd, tFrozenAt   (every flag/window a swap READS; one SLOAD, one SSTORE on freeze; isEdge renamed from isGenesis)
+slot 0: registered, isEdge, parentIsCurrency0, tradingStart, nominalEnd, scoreSlotS             (every flag/window a swap READS; one SLOAD; no freeze flag is stored: ring writes stop once block.timestamp > nominalEnd; isEdge renamed from isGenesis)
 slot 1: R, tLast                                                                                  (the score-rate pair every accumulation writes together)
 slot 2: acc                                                                                        (needs the whole word — see ranges below)
 slot 3: cumSqrtP, tObs                                                                             (the observation pair every price update writes together)
@@ -1638,8 +1651,12 @@ Beyond continuation, the only recovery is social. That is a disclosed, accepted 
 
 ## Q. Contract invariants and the tests that assert them
 
-**Totals:** 346 passed, 0 failed, 1 skipped across 52 suites, plus 30 fork tests recorded
-separately (`docs/security/FORK_RESULTS.md`).
+**Totals** (`forge test --list`, 2026-09-26): 326 unit test functions (321 unit and fuzz tests, 5
+invariants) and 90 property test functions (70 fuzz, 16 invariants, 4 single-case tests), which a
+forge run reports as 322 + 75 = 397 results because each suite's invariants report as one; 1 of
+them is the known-divergent SLV-03 skip. Plus 38 fork tests (`docs/security/FORK_RESULTS.md`), 34
+Halmos checks (32 in the default run) and 7 Medusa properties. Per-tier breakdown and the last
+recorded run: `docs/security/PROPERTY_RESULTS.md` section 0.
 
 | invariant | asserted by |
 |---|---|
@@ -1670,7 +1687,7 @@ separately (`docs/security/FORK_RESULTS.md`).
 | **A sniped buy scores the pool delta and never goes negative** | `HookScore.t.sol::test_snipeWindowBuyScoresPoolDeltaAndNeverGoesNegative`, `test_snipeDecayMovesTheScoreNotTheSign` |
 | Snipe tax profile (99% at +1 s, none at +4 s) | `Round.t.sol::test_snipeTaxBitesAtOneSecondButNotAtFour` |
 | Submission window defeats the ordering attack (finding 1) | `Round.t.sol::test_submitOrderingAttackCannotWin` |
-| Accumulators clamp at `T_end`; a post-bell dump cannot move a score | `Round.t.sol::test_tailExtensionAndPostBellFreeze` |
+| The accumulator is never frozen; ring writes stop at the published end `T`, so a post-bell dump cannot move a score | `HookScore.t.sol::test_postBellFlowStillCannotMoveTheScore`, `test_theRingIsByteIdenticalAfterPostBellDust`, `test_postRevealDustCannotSelectADifferentScore` |
 | Finalize crowns, refunds the winner, forfeits losers | `Round.t.sol::test_finalizeCrownsWinnerRefundsBondAndForfeitsLosers` |
 | Finalize is idempotent; a stale call cannot overwrite | `Round.t.sol::test_staleFinalizeIsIdempotent` |
 | **Bond refund has a pull fallback** | `RoundGuards.t.sol::test_claimRefundIsThePullFallbackForAWinnerThatRejectsEth` |
@@ -2011,7 +2028,7 @@ mined hook encodes exactly `HOOK_FLAGS`, and on a continuation asserts head cont
 | **Block-1 sniper** | the first swap at `tradingStart` | linear snipe tax 99% → 1% over 3 s; proceeds go to the parent's reinforcement pot; the score counts only what the pool absorbed, so a sniped buy scores small and positive | Priced, not prevented: mean +$445/round (design analysis). |
 | **Score-sign attacker (C1)** | one exact-in buy inside the 99% window to drive a rival's `R` negative | closed: `R` is the pool's own parent delta, fee-exclusive by construction; pinned in four orientations and inside the snipe window | Closed (`HookScore.t.sol`). |
 | **Genesis squatter (C2), REMOVED** | watches the factory deploy and front-runs adoption at a near-zero FDV | there is no FDV to front-run: adoption places no curve and no price at all, only checks the adopted token against the fixed `GENESIS_TOKEN` deploy constant. There is no public `adoptGenesis(token)` entry point; adoption runs inside `wire()` with `genesisCreator` fixed at construction to the deployer | Closed by construction. There is no first caller to race: the attribution is fixed before any transaction can be sent, and it carries no fee stream. |
-| **Submission-order attacker** | submits a weak score and finalizes atomically | `submitScore` confined to `[T_end, T_end+300)`; `finalize()` refused until `submitEnd`; scores are `T_end` snapshots | Closed (`test_submitOrderingAttackCannotWin`). |
+| **Submission-order attacker** | submits a weak score and finalizes atomically | `submitScore` confined to `[T_end, settlement time + 300)`; `finalize()` refused until `submitEnd`; scores are `T_end` snapshots | Closed (`test_submitOrderingAttackCannotWin`). |
 | **Submission griefer** | withholds a rival's `submitScore` or spams submissions | permissionless and per-candidate idempotent; anyone may submit for anyone | Residual: if *nobody* submits, a qualifying round still finalizes with no winner and all bonds are forfeited. |
 | **Finalization stalker** | refuses to call `finalize()` | permissionless, idempotent, no deadline | Residual liveness dependency: succession halts until someone pays the gas. Trading continues. |
 | **Pool poisoner** | pre-initializes the predictable `PoolKey` | `beforeInitialize` requires factory pre-registration at the exact registered price; the factory registers, initializes and places in one transaction | Closed (finding 8). |

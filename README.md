@@ -6,8 +6,10 @@ a timed round; the coin with the highest average market cap over the round's clo
 the next link in the chain, and the round's true end is settled at a random moment inside its final
 three minutes by the drand public beacon. A coin that loses its round keeps trading. Trading fees
 pay each pool's creator and are locked back into the chain as buy support under every coin that
-came before. All liquidity the protocol places is locked forever, and no key can withdraw it or
-change how the protocol behaves.
+came before. All liquidity the protocol places is locked forever and no key can withdraw it. No key can
+change a fee, a split or the round schedule. The steward role can do two things only: announce a
+sunset, which stops new rounds from opening after a 7-day delay (a round already open still runs to
+its end), and hand the role on through a transfer that also waits 7 days.
 
 ## Contracts
 
@@ -18,8 +20,8 @@ change how the protocol behaves.
 | `RoundManager` | Runs the rounds: opens them, escrows entry bonds in $DOLL, settles the random end, scores candidates and crowns the winner. |
 | `BidDeployer` | Turns collected fees into permanently locked buy support under link one and under each crowned coin, paying the caller a small bounty. |
 | `FamilyFactory` | Registers candidates, deploys their tokens and pools, and adopts $DOLL as the first coin of the chain. |
-| `FamilyRouter` | Buys and sells along the chain in one transaction, paying exactly the fees a direct pool swap pays. |
-| `EthZap` | Lets a trader enter or leave the chain with ETH by swapping through $DOLL's own market. |
+| `FamilyRouter` | Buys and sells along the chain in one transaction, paying exactly the fees a direct pool swap pays. It takes and pays $DOLL only. |
+| `EthZap` | A stateless periphery contract: converts ETH to $DOLL (and back) on $DOLL's entrance venue, then calls the router, so a trader can enter or leave the chain with ETH. It has no owner and keeps no state between calls. |
 | `Locker` | Holds every liquidity position the protocol places, forever; it has no function that removes liquidity. |
 | `FamilyToken` | The fixed-supply token of each coin, minted once straight into its locked liquidity. |
 | `FamilyLens` | Read-only, batched views for apps and indexers. |
@@ -27,7 +29,8 @@ change how the protocol behaves.
 
 ## Fees
 
-- **1%** on the $DOLL side of every swap in a link-one pool, charged once per trade. It is split
+- **1%** on the $DOLL side of every swap in a link-one pool, charged once per traversal of link one
+  (a round trip through link one pays it twice). It is split
   **40%** to the pool's creator, **40%** locked as buy-support bids under the chain, and **20%** to
   the developer.
 - **0.075%** on every swap in every pool, locked as buy support under that pool's parent.
@@ -59,6 +62,9 @@ FOUNDRY_THREADS=1 FOUNDRY_FUZZ_RUNS=5000 FOUNDRY_INVARIANT_RUNS=400 FOUNDRY_INVA
 ```
 
 Fork tests (`test/fork/`) need an RPC endpoint; the command is in `docs/security/FORK_RESULTS.md`.
+
+Test functions: 326 unit, 90 property, 38 fork, 34 Halmos checks and 7 Medusa properties
+(`test/README.md`; per-tier breakdown in `docs/security/PROPERTY_RESULTS.md` section 0).
 
 ## Repository layout
 

@@ -18,6 +18,12 @@ import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
 ///                launch block timestamp so START matches the graduation buy (§3a).
 ///   TOKEN        the $DOLL token address
 ///   AMOUNT       amount of TOKEN to lock (default 30,000,000e18, the developer's 3%)
+///   RECORD_KEY   the deployment-record key this run's wallet address is written under
+///                (default "devVesting"). The team's 3% lock is now TWO separate runs of this
+///                script - the developer's 25,000,000 and the artist's 5,000,000 - each its own
+///                `VestingWallet`; without this, the second run silently overwrote the first
+///                under the same "devVesting" key. Pass `RECORD_KEY=artistVesting` on the
+///                second (artist) run.
 contract DeployVesting is Script {
     uint64 constant DURATION_SECONDS = 365 days;
     uint256 constant DEFAULT_AMOUNT = 30_000_000e18;
@@ -35,7 +41,10 @@ contract DeployVesting is Script {
 
         _verify(wallet, token, beneficiary, start, amount);
 
-        console2.log(string.concat('"devVesting": "', vm.toString(address(wallet)), '"'));
+        string memory recordKey = vm.envOr("RECORD_KEY", string("devVesting"));
+
+        console2.log(string.concat('"', recordKey, '": "', vm.toString(address(wallet)), '"'));
+        console2.log("record key", recordKey);
         console2.log("start", start);
         console2.log("fully vested", start + DURATION_SECONDS);
 
@@ -44,9 +53,9 @@ contract DeployVesting is Script {
             string memory record = vm.readFile(path);
             string memory o = "deployment";
             vm.serializeJson(o, record);
-            string memory out = vm.serializeAddress(o, "devVesting", address(wallet));
+            string memory out = vm.serializeAddress(o, recordKey, address(wallet));
             vm.writeJson(out, path);
-            console2.log("updated", path);
+            console2.log("updated", path, "under key", recordKey);
         } else {
             console2.log("no deployment record at", path, "- add the line above to it");
         }

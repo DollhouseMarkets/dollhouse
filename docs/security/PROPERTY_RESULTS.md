@@ -9,14 +9,32 @@ test is kept as the spec states it and its body is disabled through the file's `
 constant (`vm.skip(true)` in a test function; an early `return` in an invariant, which cannot
 call a non-view cheatcode), with a `// DIVERGENCE <ID>:` comment naming what the code does.
 
-## 0. Full-suite run
+## 0. Test counts and the full-suite run
 
-`FOUNDRY_THREADS=1 forge test --threads 1 --no-match-path 'test/{fork,halmos,properties,medusa}/**'`
-(unit tier) plus `--match-path 'test/properties/**'` (property tier): **395 tests passed, 0
-failed, 1 skipped** (396 total, 51 suites); the one skip is
-`testFuzz_SLV03_sleeveIsNeverOverAllocated`, the symbolic case the forge tier does not run (Halmos
-owns it). The fork tier (`test/fork/*`, needs an RPC
-endpoint) is recorded separately and passed 38 of 38.
+Function counts are from `forge test --list` on 2026-09-26; `test/README.md`,
+`docs/security/README.md`, `docs/security/FORK_RESULTS.md` and `docs/REVIEW_GUIDE.md` state the
+same numbers. A forge run reports all of one suite's invariants as a single result, so a run's
+result count is lower than its function count.
+
+| tier | where | test functions | results a forge run reports |
+|---|---|---|---|
+| unit | `test/*.t.sol` (38 suites) | 326: 321 unit and fuzz tests, 5 invariants | 322 |
+| property | `test/properties/` (13 suites) | 90: 70 fuzz properties, 16 invariants, 4 single-case tests | 75, of which 1 is skipped (SLV-03, below) |
+| fork | `test/fork/` (8 suites) | 38 | 38 |
+| Medusa harness self-test | `test/medusa/MedusaTargetSanity.sol` | 1 | 1 |
+| symbolic | `test/halmos/` | 34 Halmos checks (`check_*`), 32 in the default run | run by Halmos, not forge: `docs/security/halmos.md` |
+| Medusa | `test/medusa/MedusaTarget.sol` | 7 properties (`property_*`) | run by Medusa: `docs/security/medusa.md` |
+
+Last recorded full run of the unit and property tiers
+(`FOUNDRY_THREADS=1 forge test --threads 1 --no-match-path 'test/{fork,halmos,properties,medusa}/**'`
+plus `--match-path 'test/properties/**'`): **395 passed, 0 failed, 1 skipped** of 396 results, 51
+suites. That run predates `test_ROL01_theProbeIsRefusedEverywhere` (added 2026-09-26), which brings
+the reported total to 397 results (396 passing and the same 1 skip expected). After the REN-01 and
+ROL-01 changes of 2026-09-26, `Invariants.prop.t.sol` was re-run on its own: 3 results (the
+16-invariant bundle and 2 tests), all passed. The one skip is
+`testFuzz_SLV03_sleeveIsNeverOverAllocated`, a known divergence recorded in the table below; no
+Halmos check covers it either. The fork tier (`test/fork/*`, needs an RPC endpoint) is recorded
+separately and passed 38 of 38.
 
 Properties restated for external genesis / $DOLL-only accounting, all passing at this run:
 
@@ -33,47 +51,47 @@ Properties restated for external genesis / $DOLL-only accounting, all passing at
   self-funded through `deployEdgeBid()`/`dollValueOfParent(1, x) == x`), `Purse.prop`
   `testFuzz_PUR02_theDestinationIsAlwaysTheTrunk`, extended for the two new edge cases.
 
-Rows below for `SUP-02/03/08`, `FEE-01/02/12`, `FEE-10` and `PUR-02` that name `createGenesis` or
-a genesis curve record the result against an in-protocol genesis launch; index 0 is now an adopted
-external token, and the restated properties above cover that path. `SUP-03` has no successor test:
-there is no genesis curve.
+Every test named below exists in the current tree (checked against `forge test --list` on
+2026-09-26). Index 0 is an adopted external token with no curve and no pool here; `SUP-03` (the
+genesis curve) has no successor test because there is no genesis curve. A property with no test at
+its tier is marked **no automated test**, not removed.
 
 ## 1. Property status
 
 | ID | ★ | tier | test | status | note |
 |---|---|---|---|---|---|
-| SUP-01 | ★ | F,I | `Supply.prop` `testFuzz_SUP01_supplyOnlyEverFallsByAHoldersOwnBurn`, `testFuzz_SUP01_thereIsNoSecondMint`; `Invariants.prop` `invariant_SUP01_supplyNeverMoves` | pass | the launch dust burn happens inside `createGenesis`, so the post-launch supply is `1e27` less that dust; the test pins the dust and the fixed supply from there |
-| SUP-02 | ★ | U,K | existing `Genesis.t.sol::test_genesisSupplyIsConserved`, `DevAllocation.t.sol` | pass | ★U already covered; not duplicated |
-| SUP-04 | | I | `invariant_SUP04_noProtocolContractHoldsSupply` | pass | factory, round manager, router and bid deployer hold nothing; the Locker's sub-wei placement dust is immovable and excluded. Restated for the $DOLL-denominated vault: `ledgerTotal[EDGE] <= holdings(EDGE)` (FEE-11) and an unsolicited donation credits no ledger and is never sweepable |
+| SUP-01 | ★ | F,I | `Supply.prop` `testFuzz_SUP01_supplyOnlyEverFallsByAHoldersOwnBurn`, `testFuzz_SUP01_thereIsNoSecondMint`; `Invariants.prop` `invariant_SUP01_supplyNeverMoves` | pass | the launch dust burn happens inside a candidate's registration, so the post-launch supply is `1e27` less that dust; the test pins the dust and the fixed supply from there |
+| SUP-02 | ★ | U,K | `Supply.prop` `test_SUP08_ticksAreDenominatedInTheWholeSupply` (asserts `placed + dust == 1e27` on a fresh candidate); `Mirrored.t.sol::test_mirroredCandidateLaunchesUpsideDown` (the whole supply is locked, mirrored orientation); fork `Edge.fork.t.sol::testFork_SUP02_candidatePlacesTheWholeSupply` | pass | no dedicated `SUP-02` unit test; the assertions above carry it. There is no developer allocation to test |
+| SUP-04 | | I | `Invariants.prop` `invariant_SUP04_noProtocolContractHoldsSupply`, `invariant_SUP04_aDonationNeverCreditsALedger`; `Supply.prop` `test_SUP04_noProtocolContractHoldsSupplyOrEth` | pass | factory, round manager, router and bid deployer hold nothing; the Locker's sub-wei placement dust is immovable and excluded. Restated for the $DOLL-denominated vault: `ledgerTotal[EDGE] <= holdings(EDGE)` (FEE-11) and an unsolicited donation credits no ledger and is never sweepable |
 | SUP-05 | | U,I,K | `invariant_SUP05_lockedLiquidityIsARatchet` | pass | |
-| SUP-08 | | U,F | `Supply.prop` `testFuzz_SUP08_ticksAreDenominatedInTheWholeSupply` | pass | the tick-invariance half (changing `DEV_ALLOCATION_BPS` moves no tick) needs a second deployment per case; covered at U by `GenesisCurve.t.sol` / `DevAllocation.t.sol` |
+| SUP-08 | | U,F | `Supply.prop` `test_SUP08_ticksAreDenominatedInTheWholeSupply` (one fixed case, not fuzzed) | pass | F-tier: **no automated test**. The tick-invariance half of the original property (changing a developer allocation moves no tick) no longer applies: there is no developer allocation |
 | FEE-01 | ★ | F | `Fees.prop` `testFuzz_FEE01_oneEdgeFeePerTraversal`, `..._theEdgeFeeDoesNotDependOnDepth`, `..._aRoundTripPaysOneFeePerTraversal` | pass | restated: "one edge fee per traversal of an edge pool" (`isEdge = parent == canonical(0)`), not "the ETH edge", the tests were renamed to `dollIn`/edge-pool terms |
 | FEE-02 | | U,K | `Fees.prop` `testFuzz_FEE02_everyLegPaysItsOwnHopFee` | pass | added at F beside the U coverage |
 | FEE-04 | | F | `Fees.prop` `testFuzz_FEE04_theSnipeScheduleIsLinearOverThreeSeconds`, `..._asettledEdgePoolIsNeverSnipedAgain` | pass | the published formula matches the code exactly when the negative term is taken at true floor division; restated since every pool, edge pools included, now has a snipe window during its own first 3 s |
 | FEE-05 | | F | `Fees.prop` `testFuzz_FEE05_theFeeIsAlwaysTheRateOfTheGross` | pass | each rate is floored independently, so the total is the sum of two floors; it is within 1 wei of the combined rate, as the property allows |
 | ★ FEE-06 | | F | `Fees.prop` `FeesEdgeWindowPropTest` `testFuzz_FEE06_theEdgeFeeIsSuppressedWhileTheSnipeTaxRuns`, `..._exactOutputPricesThroughTheWholeWindow` | pass | restated: `protocolPpm = (isEdge && snipePpm == 0) ? PROTOCOL_FEE_PPM : 0`, the edge fee is suppressed, never summed, during a round-one pool's own 3-second snipe window |
 | FEE-08 | ★ | F,I | `Fees.prop` `testFuzz_FEE08_theProtocolFeeIsConserved`; `invariant_FEE08_familyLedgersAreHopFeesOnly` | pass | |
-| FEE-10 | | I | `invariant_FEE10_everyEthDestinationIsANamedLedger` | pass | the named destinations never exceed the edge-currency ledger total; the gap is the sleeve's unclaimable floor residue. Ledgers renamed (`reinforcementEth` to `reinforcementEdge`, `genesisBidEarmark` to `edgeBidEarmark`); the invariant name is unchanged in the test file |
-| FEE-11 | ★ | I | `invariant_FEE11_theVaultIsSolvent` | pass | |
+| FEE-10 | | I | `Invariants.prop` `invariant_FEE10_everyEdgeDestinationIsANamedLedger` | pass | the named destinations never exceed the edge-currency ledger total; the gap is the sleeve's unclaimable floor residue. Ledgers renamed (`reinforcementEth` to `reinforcementEdge`, `genesisBidEarmark` to `edgeBidEarmark`) |
+| FEE-11 | ★ | I,H | `Invariants.prop` `invariant_FEE11_theVaultIsSolvent`; Halmos `FeeVaultHalmos` solvency checks (`check_receiveForwardKeepsSolvencyWhenLive`, `..._WhenSunset`, `check_depositEdgeBidEarmarkKeepsSolvency`, `check_donationCreditsNoLedger`; `docs/security/halmos.md`) | pass | |
 | FEE-12 | | F | `Fees.prop` `testFuzz_FEE12_unattributedFeesFallBackToIndexZero` | pass | renamed (was `..._FallBackToGenesis`); the fallback is still index 0 of the sleeve, now the externally adopted token |
-| SLV-01 | | F | `Sleeve.prop` `testFuzz_SLV01_ancestorShareMatchesTheWeightFamily` | pass | tolerance `17 + j + j²` WAD units: the floor error of the three coefficients |
-| SLV-02 | | F | `Sleeve.prop` `testFuzz_SLV02_onlyAncestorsAreCredited` | pass | |
-| SLV-03 | ★ | F,I | `Sleeve.prop` `testFuzz_SLV03_sleeveIsNeverOverAllocated` | **divergent** | at the WAD scale the trees store, the point queries can sum to a few hundred WAD units (≈1e-16 wei) MORE than the sleeve: `c1` is stored as `-floor(5a/M)`, i.e. rounded towards zero, so the negative term of `w` is slightly under-subtracted |
+| SLV-01 | | F,H | `Sleeve.prop` `testFuzz_SLV01_ancestorShareMatchesTheWeightFamily`; Halmos `FenwickCheck.check_sleeveShapeNonNegative` (non-negativity only, `M = 8`) | pass | tolerance `17 + j + j²` WAD units: the floor error of the three coefficients |
+| SLV-02 | | F,H | `Sleeve.prop` `testFuzz_SLV02_onlyAncestorsAreCredited`; Halmos `FenwickCheck.check_noCreditOutsideRange` | pass | |
+| SLV-03 | ★ | F | `Sleeve.prop` `testFuzz_SLV03_sleeveIsNeverOverAllocated` | **divergent: known, permanently skipped** (`SKIP_DIVERGENT`, `vm.skip(true)`; the one skip of every run) | the test is kept as the spec states it and does not run. I-tier and H-tier: **no automated test** (no invariant and no Halmos check sums the point queries). At the WAD scale the trees store, the point queries can sum to a few hundred WAD units (≈1e-16 wei) MORE than the sleeve: `c1` is stored as `-floor(5a/M)`, i.e. rounded towards zero, so the negative term of `w` is slightly under-subtracted |
 | SLV-03 | ★ | F | `Sleeve.prop` `testFuzz_SLV03_creditedWeiNeverExceedsTheSleeve`, `..._underAllocationHoldsAcrossManySleeves` | pass | at wei granularity (what `claimableAncestor` can ever pay) the sleeve is strictly under-allocated, which is what FEE-11 leans on |
-| SLV-04 | | F,I | `Sleeve.prop` `testFuzz_SLV04_pointQueryEqualsBruteForce`, `..._signedRangeAddsMatchBruteForce` | pass | signed intermediates covered |
+| SLV-04 | | F,H | `Sleeve.prop` `testFuzz_SLV04_pointQueryEqualsBruteForce`, `..._signedRangeAddsMatchBruteForce`; Halmos `FenwickCheck.check_rangeAddMatchesClosedForm`, `check_rangeAddIsAdditive` | pass | signed intermediates covered. I-tier: **no automated test** |
 | SLV-07 | | U | `Sleeve.prop` `testFuzz_SLV07_indexAboveTheCapReverts` | pass | structural half only |
 | SCR-01 | | F | `Score.prop` `testFuzz_SCR01_theAccumulatorIntegratesTheNetParentLevel` | pass | |
 | SCR-02 | | U,I | `Score.prop` `testFuzz_SCR02_buysRaiseAndSellsLowerTheLevel` | pass | the stateless half; no invariant asserts "no other call moves `acc`" |
 | SCR-03 | | F | `Score.prop` `testFuzz_SCR03_aSnipedBuyStillScoresItsPostFeeDelta` | pass | |
-| SCR-04 | ★ | F,I | `Score.prop` `testFuzz_SCR04_averageOverIsExact` | pass | swaps spaced into their own coarse slots, as the property's "within the rings' span" requires. RESTATED: exactness is claimed only when both edges resolve to a bracket or to the live state; the inexact case is SCR-14 |
+| SCR-04 | ★ | F | `Score.prop` `testFuzz_SCR04_averageOverIsExact` | pass | I-tier: **no automated test**. Swaps spaced into their own coarse slots, as the property's "within the rings' span" requires. RESTATED: exactness is claimed only when both edges resolve to a bracket or to the live state; the inexact case is SCR-14 |
 | SCR-13 | | U,I | `HookScore.t.sol` `test_aSecondSwapInTheBellsOwnSlotCannotDenyTheScore`, `test_aRingBuriedUnderPostBellDustStillAnswers`, `test_theFarEdgeOfTheWindowIsAlwaysResolvable`; `HookScore.t.sol` `test_postRevealDustCannotSelectADifferentScore`; Medusa `property_SCR13_scoreIsAlwaysSubmittable` | pass (new) | FAILED before the fix: a swap placed later in `T_end`'s own 5-second slot made `submitScore` revert `CheckpointUnavailable` for every candidate of the round. Availability is unchanged: the freeze removes the fallback's REACH into post-bell state, not the fallback itself |
 | SCR-14 | | U,F | `HookScore.t.sol` `test_postBellFlowStillCannotMoveTheScore` (the never-after-`t` half); `test_aRingBuriedUnderPostBellDustStillAnswers` (the exactness half: the fallback reproduces the pre-dust average to the wei); `HookScore.t.sol` `test_farEdgeDriftIsAtMostOneCoarseSlot` (the DRIFT BOUND itself) | pass (restated) | the one-coarse-slot bound is now MEASURED, not merely argued: `averageOver` return `tStartUsed`/`tEndUsed`, so the instants actually used are readable and the test asserts the far edge is at or before `T_end - W` and within `scoreSlotFor(n)` of it. `BadScoreWindow` replaces a silent zero when the two edges collapse (F6), which `DeployConstants.t.sol` shows unreachable on both accepted schedule divisors |
-| SCR-05 | | F,I | `Score.prop` `testFuzz_SCR05_aSlotIsWrittenOnceByItsFirstSwap` | pass | |
-| SCR-06 | | U,H | `Round.prop` `testFuzz_SCR06_theCoarseRingSpansTheWholeRead`; `Schedule.t.sol` `test_theScoreRingsCoverTheFlatWindowAndTheRandomEnd`; `Schedule.t.sol` `test_theScoreRingCoversTheWholeClosingWindow` | pass (restated) | added at F. RESTATED (F1): the requirement is `W + RANDOM_END_S` (1080 s on mainnet, 18 s slots, 1134 s of reach), not `W + RANDOM_END_S + END_TIMEOUT + SUBMIT_S` - ring writes freeze at the pool's published end, so the ring must REACH the scored span and no longer has to SURVIVE churn during settlement |
+| SCR-05 | | F | `Score.prop` `testFuzz_SCR05_aSlotIsWrittenOnceByItsFirstSwap` | pass | I-tier: **no automated test** |
+| SCR-06 | | U | `Round.prop` `testFuzz_SCR06_theCoarseRingSpansTheWholeRead`; `Schedule.t.sol` `test_theScoreRingsCoverTheFlatWindowAndTheRandomEnd`; `Schedule.t.sol` `test_theScoreRingCoversTheWholeClosingWindow` | pass (restated) | added at F. RESTATED (F1): the requirement is `W + RANDOM_END_S` (1080 s on mainnet, 18 s slots, 1134 s of reach), not `W + RANDOM_END_S + END_TIMEOUT + SUBMIT_S` - ring writes freeze at the pool's published end, so the ring must REACH the scored span and no longer has to SURVIVE churn during settlement |
 | SCR-09 | | F | `Score.prop` `testFuzz_SCR09_supportSoldBeforeTheWindowDoesNotCount` | pass | needs a round longer than its own closing window (round 3+), otherwise the window covers the whole round |
-| SCR-12 | | F | - | not covered | the tie comparator `_beats` is `internal` and no view exposes it; covered indirectly at U by `Round.t.sol::test_submitOrderingAttackCannotWin` |
+| SCR-12 | | F | - | **no automated test** at F | the tie comparator `_beats` is `internal` and no view exposes it; covered indirectly at U by `Round.t.sol::test_submitOrderingAttackCannotWin` |
 | RND-01 | | F | `Round.prop` `testFuzz_RND01_scheduleIsAPureFunctionOfTheRoundNumber` | pass | asserted at the deployed `DURATION_SCALE_DIV`; see spec-gap 7 |
-| RND-02 | | U,H | `Round.prop` `testFuzz_RND02_lateEntryEndsBeforeTheClosingWindowStarts` | pass | added at F |
+| RND-02 | | U | `Round.prop` `testFuzz_RND02_lateEntryEndsBeforeTheClosingWindowStarts` | pass | added at F |
 | RND-03 | | I | `invariant_RND03_phasesNeverGoBackwards` | pass | monotonicity of the phase machine over any action sequence |
 | RND-07 | | U,I,K | existing `Round.t.sol::test_staleFinalizeIsIdempotent` | pass | not duplicated at I |
 | RND-08 | | U,I | `invariant_RND08_onlyOneRoundIsEverOpen` | pass | |
@@ -82,7 +100,7 @@ there is no genesis curve.
 | RND-12 | | F | `Round.prop` `testFuzz_RND12_bondScheduleSaturates`, `..._bondIsMonotone` | pass | |
 | RND-13 | | F,I | `Round.prop` `testFuzz_RND13_thresholdDecaysOnlyAcrossFailures`; `invariant_RND13_theThresholdStaysInItsBand` | pass | |
 | RND-14 | | F | `Round.prop` `testFuzz_RND14_registrationRequiresTheExactBond` | pass | |
-| RND-16 | | I,K | - | not covered | an invariant cannot place a swap (invariant functions are `view` here); the handler trades losers' pools continuously, but nothing asserts tradability directly. Covered at U by `RouterGuards.t.sol` / `Router.prop` `testFuzz_ROU08_...` |
+| RND-16 | | I,K | - | **no automated test** at I | an invariant cannot place a swap (invariant functions are `view` here); the handler trades losers' pools continuously, but nothing asserts tradability directly. Covered at U by `RouterGuards.t.sol` / `Router.prop` `testFuzz_ROU08_candidateRoutesFollowTheRoundPhase` |
 | PAR-01 | | I | `invariant_PAR01_theHeadMovesOnlyAtFinalize` | pass | head moves are counted against finalizing actions |
 | PAR-02 | | I | `invariant_RND09_canonicalHistoryIsAppendOnly` | pass | `parentOf(i) == canonical(i-1)` for every i |
 | PUR-02 | | F | `Purse.prop` `testFuzz_PUR02_theDestinationIsAlwaysTheTrunk` | pass | restated: the destination is `canonical(j)`, and a loser's pool receives no bid however well supported it is. It covers `j = 0` (`NoPoolAtIndex`) and `j = 1` (self-funded via `deployEdgeBid()`, `dollValueOfParent(1, x) == x`) as covered cases |
@@ -92,7 +110,7 @@ there is no genesis curve.
 | BID-02 | | F | `Bid.prop` `testFuzz_BID02_theConversionNeverPaysAboveSpot`, `..._theConversionIsLinearInTheAmount` | pass | the min-of-three is asserted through its consequence (never above spot, linear in size); the 30-minute-pump case is the existing `Keeper.t.sol` test |
 | BID-05 | ★ | I | `invariant_BID05_theKeeperLeashIsNeverSlack` | pass | `deployerCredit == 0` outside a keeper call, and the deployer holds no ETH |
 | BID-06 | | F | `Bid.prop` `testFuzz_BID06_theBountyIsTheStatedShape` | pass | all three branches; the keeper is paid value + bounty |
-| BID-07 | | F,I | `Bid.prop` `testFuzz_BID07_theDrawdownBucketBindsAndRefills` | pass | bucket never above cap, second draw refused, continuous refill |
+| BID-07 | | F | `Bid.prop` `testFuzz_BID07_theDrawdownBucketBindsAndRefills` | pass | bucket never above cap, second draw refused, continuous refill. I-tier: **no automated test** |
 | BID-10 | | F,K | `Bid.prop` `testFuzz_BID10_theQuoteIsAcceptedAsIs` | pass | |
 | BID-14 | | I | `invariant_BID05_theKeeperLeashIsNeverSlack` | pass | no residual credit after any keeper call |
 | CON-02 | | U | `Continuation.prop` `testFuzz_CON02_noRoundBeforeTheHandover` | pass | added at F |
@@ -100,26 +118,26 @@ there is no genesis curve.
 | CON-04 | | F | `Continuation.prop` `testFuzz_CON04_thePostSunsetEdgeNeverBooksLocally` | pass | also pins CON-11 (the hop fee stays with the charging version) |
 | CON-05 | | F | `Continuation.prop` `testFuzz_CON05_flushMovesExactlyWhatItSays` | pass | partial flushes included |
 | CON-09 | | U,K,I | `Continuation.prop` `testFuzz_CON09_theOldVaultKeepsWhatItEarned` | pass | asserted at F rather than by a two-stack handler |
-| ROL-01 | ★ | I | `invariant_ROL01_thePrivilegedSurfaceIsUnreachable` | pass | no action of the handler moves a role, a sunset or a successor |
+| ROL-01 | ★ | I | `Invariants.prop` `invariant_ROL01_thePrivilegedSurfaceIsUnreachable`, `test_ROL01_theProbeIsRefusedEverywhere` | pass | the handler's `propProbePrivileged` action attempts every role, sunset, successor and creator-right move from an address holding none of them (announce, cancel and execute for steward and developer, `announceSunset`, `cancelSunset`, `transferCreatorRecipient`); the invariant fails if any takes effect or any role, pending transfer, sunset or successor moves. Scope: the role-moving calls, not a full ABI enumeration of every privileged function |
 | ROL-05 | | F | `Roles.prop` `testFuzz_ROL05_*` (steward, developer, cancel) | pass | 7-day delay, holder-only announce/cancel, permissionless execute |
 | ROL-07 | | F | `Roles.prop` `testFuzz_ROL07_transferSweepsTheAccrualToTheOldRecipient`, `..._onlyTheCurrentRecipientTransfers` | pass | |
 | RAN-02 | | F | `Randomness.prop` `testFuzz_RAN02_*` (tampered, junk, wrong round) | pass | against a real `evmnet` beacon |
 | RAN-03 | | F | `Randomness.prop` `testFuzz_RAN03_thePinnedBeaconIsAlwaysInTheFuture`, `..._pinningIsMonotoneInTime` | pass | |
-| RAN-04 | | U,I | - | not covered | no test asserts that a beacon round consumed by one round cannot settle another; the code has no such check, see spec-gap 11 |
+| RAN-04 | | U,I | - | **no automated test** | no test asserts that a beacon round consumed by one round cannot settle another; the code has no such check, see spec-gap 11 |
 | ROU-01 | | F | `Router.prop` `testFuzz_ROU01_minOutIsEnforced`, `..._aRoundTripReportsItsLastLeg` | pass | |
 | ROU-02 | | F | `Router.prop` `testFuzz_ROU02_theRouterIsNeverFeePrivileged` | pass | |
-| ROU-04 | | F | `Router.prop` `testFuzz_ROU04_adjacencyIsEnforced`, `..._theEthEdgeOnlyTouchesGenesis`, `..._maxHopsBoundsTheWholeRoute` | pass | |
-| ROU-05 | | F | `Router.prop` `testFuzz_ROU05_valueMustMatchThePath`, `..._theRouterHoldsNoEth` | pass | |
+| ROU-04 | | F | `Router.prop` `testFuzz_ROU04_adjacencyIsEnforced`, `..._theEdgeCurrencyOnlyTouchesLinkOne`, `..._maxHopsBoundsTheWholeRoute` | pass | |
+| ROU-05 | | F | `Router.prop` `testFuzz_ROU05_aRouteSpendsOnlyWhatTheCallerApproved`, `..._theRouterHoldsNoEth` | pass | |
 | ROU-08 | | U,K | `Router.prop` `testFuzz_ROU08_candidateRoutesFollowTheRoundPhase` | pass | added at F |
-| REN-01 | | I | `invariant_REN01_nothingReentersFromInsideAnUnlock`; measured by `test_REN01_whichCallsAreReachableFromInsideAnUnlock`; `RoundGuards.t.sol::test_REN01_*` | pass (**was divergent; closed in code**) | being inside a `PoolManager` unlock used not to be a state the protocol checked, so `RoundManager.finalize()` was measured executing from inside one. `RoundManager.finalize`, `requestEnd`, `finalizeDeterministic`, `submitScore` and `FeeVault`'s three claim paths now carry `notInsideUnlock`, which reads v4-core's own transient lock flag (`Lock.IS_UNLOCKED_SLOT`) with one `exttload` through the PoolManager's inherited `Exttload`; the keeper entrypoints and `flushForward` reach a nested `poolManager.unlock` and revert `AlreadyUnlocked`. The hook's accrual path is deliberately NOT guarded - it is the one call that is meant to run inside the swap's unlock, on every swap. Closed in code |
-| REN-02 | | U,I | - | not covered at I | ledger-before-transfer ordering is asserted at U in `FeeVault.t.sol`; an invariant cannot observe intra-call ordering |
-| REN-03 | | F | - | not covered at F | covered at U by `Round.t.sol::test_claimRefundIsThePullFallbackForAWinnerThatRejectsEth` |
+| REN-01 | | I | `Invariants.prop` `invariant_REN01_nothingReentersFromInsideAnUnlock`, `test_REN01_whichCallsAreReachableFromInsideAnUnlock`; `RoundGuards.t.sol::test_REN01_everyGuardedEntrypointRefusesFromInsideAnUnlock`, `test_REN01_theGuardChangesNothingOutsideAnUnlock`, `test_REN01_theGuardReadsV4sOwnLockSlot` | pass (**was divergent; closed in code**) | the invariant and the test both assert that no probe took effect, that each of the 11 guarded probes was refused by `InsideUnlock()` itself (not by an unrelated precondition), and that the probing unlock ran to completion (a rolled-back unlock would hide a success). | being inside a `PoolManager` unlock used not to be a state the protocol checked, so `RoundManager.finalize()` was measured executing from inside one. `RoundManager.finalize`, `requestEnd`, `finalizeDeterministic`, `submitScore` and `FeeVault`'s three claim paths now carry `notInsideUnlock`, which reads v4-core's own transient lock flag (`Lock.IS_UNLOCKED_SLOT`) with one `exttload` through the PoolManager's inherited `Exttload`; the keeper entrypoints and `flushForward` reach a nested `poolManager.unlock` and revert `AlreadyUnlocked`. The hook's accrual path is deliberately NOT guarded - it is the one call that is meant to run inside the swap's unlock, on every swap. Closed in code |
+| REN-02 | | U,I | - | **no automated test** at I | ledger-before-transfer ordering is asserted at U in `FeeVault.t.sol`; an invariant cannot observe intra-call ordering |
+| REN-03 | | F | - | **no automated test** at F | covered at U by `Round.t.sol::test_claimRefundIsThePullFallbackForAWinnerThatRejectsEth` |
 
 ## 2. The 14 spec gaps: what the implementation actually does
 
 | # | Gap | What the code does |
 |---|---|---|
-| 1 | edge → … → edge round trip inside one `swapPath` | One protocol fee per traversal of an edge pool: a round trip pays two, each 1% of that leg's own $DOLL side (measured, `testFuzz_FEE01_aRoundTripPaysOneFeePerTraversal`). Restated in terms of `isEdge` rather than "the ETH edge", there is no native ETH anywhere in this stack. |
+| 1 | edge → … → edge round trip inside one `swapPath` | One protocol fee per traversal of an edge pool: a round trip pays two, each 1% of that leg's own $DOLL side (measured, `testFuzz_FEE01_aRoundTripPaysOneFeePerTraversal`). Restated in terms of `isEdge` rather than "the ETH edge", no native ETH reaches the core stack (`EthZap`, a stateless periphery, converts ETH to $DOLL before it calls the router). |
 | 2 | Purse split rounding | CLOSED: there is no split. The whole `parentAmount` goes into one bid, under `canonical(j)`. |
 | 3 | `MIN_BOUNTY_DOLL` mainnet value | There is none in code: it is a constructor argument of `BidDeployer` (`MIN_BOUNTY_DOLL`, immutable, renamed from `MIN_BOUNTY_WEI`), a placeholder in `script/Deploy.s.sol` to be calibrated from the graduated Pons price at deploy. Both the floor and the 20% ceiling branch are asserted against the deployed value. |
 | 4 | Board staleness vs board correctness | CLOSED: there is no board. |
@@ -135,22 +153,23 @@ there is no genesis curve.
 
 ## 3. Files
 
-Counts below are for the current tree.
+Counts below are for the current tree (`forge test --list`, 2026-09-26).
 
 | File | Tests |
 |---|---|
-| `test/properties/Supply.prop.t.sol` | 3 |
-| `test/properties/Fees.prop.t.sol` | 9 |
+| `test/properties/Supply.prop.t.sol` | 4 (2 fuzz, 2 single-case) |
+| `test/properties/Fees.prop.t.sol` | 11 (two suites: 9 + 2) |
 | `test/properties/Sleeve.prop.t.sol` | 8 (1 divergent-skipped) |
 | `test/properties/Score.prop.t.sol` | 6 |
 | `test/properties/Round.prop.t.sol` | 8 |
-| `test/properties/Purse.prop.t.sol` | 3 |
+| `test/properties/Purse.prop.t.sol` | 5 |
 | `test/properties/Bid.prop.t.sol` | 6 |
 | `test/properties/Continuation.prop.t.sol` | 5 |
-| `test/properties/Roles.prop.t.sol` | 6 |
+| `test/properties/Roles.prop.t.sol` | 5 |
 | `test/properties/Randomness.prop.t.sol` | 5 |
 | `test/properties/Router.prop.t.sol` | 9 |
-| `test/properties/Invariants.prop.t.sol` (+ `PropHandler.sol`) | 15 invariants (1 divergent) + 1 measurement test |
+| `test/properties/Invariants.prop.t.sol` (+ `PropHandler.sol`) | 16 invariants + 2 tests (REN-01, ROL-01) |
+| **Total** | **90** (70 fuzz, 16 invariants, 4 single-case tests) |
 
 ## 4. Deep run
 
@@ -181,7 +200,7 @@ skipped. Total forge wall time across the nine files: 2,056s (~34.3 minutes).**
 
 `Continuation.prop.t.sol` deploys a full second or third protocol stack inside several of its fuzz
 cases (`CON05` alone runs at a mean 58.1M gas per call), which is why it takes 27.1 minutes. No
-contract or test-harness finding turned up in this run.
+contract or test-harness finding turned up in this run. This deep run predates the ROL-01 probe action and `test_ROL01_theProbeIsRefusedEverywhere` (2026-09-26); the file counts in section 3 are the current ones.
 
 ### SCR-10: the sampled instant
 

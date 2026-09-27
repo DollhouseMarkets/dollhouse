@@ -1,15 +1,18 @@
 # Tests
 
 Five groups, each proving a different kind of claim. Counts are test functions in the files
-(`test*`, `invariant*`, `testFork*`, `check_*`, `property_*`).
+(`test*`, `invariant*`, `testFork*`, `check_*`, `property_*`), taken from `forge test --list` on
+2026-09-26. A forge run reports all of one suite's invariants as a single result, so its result
+count is lower than the function count; the per-tier breakdown and the last recorded run are in
+`docs/security/PROPERTY_RESULTS.md` section 0.
 
 | Group | Where | What it proves | Count |
 |---|---|---|---|
-| Unit tests by contract | `test/*.t.sol` | The behaviour of each contract, one file per component, including the regression tests for fixed findings | 322 (317 unit and fuzz tests, 5 invariants), all passing |
-| Properties and invariants | `test/properties/` | Every property of `docs/spec/PROPERTIES.md` with a fuzz or invariant tier, stated as the specification states it | 89 (70 fuzz properties, 16 invariants, 3 measurements) |
+| Unit tests by contract | `test/*.t.sol` | The behaviour of each contract, one file per component, including the regression tests for fixed findings | 326 (321 unit and fuzz tests, 5 invariants), all passing; 322 results in a forge run |
+| Properties and invariants | `test/properties/` | Every property of `docs/spec/PROPERTIES.md` with a fuzz or invariant tier, stated as the specification states it | 90 (70 fuzz properties, 16 invariants, 4 single-case tests); 75 results in a forge run, 1 of them the known-divergent SLV-03 skip |
 | Fork tests | `test/fork/` | The protocol against the real Uniswap v4 `PoolManager` singleton on a fork of the live chain | 38 |
 | Symbolic checks | `test/halmos/` | Bounded proofs over the shipped `FeeVault` and `RoundManager` bytecode and the curve and Fenwick libraries | 34 (32 in the default run) |
-| Medusa harness | `test/medusa/` | Protocol-wide properties under coverage-guided fuzzing of the whole deployed stack | 7 properties, 1 harness self-test |
+| Medusa harness | `test/medusa/` | Protocol-wide properties under coverage-guided fuzzing of the whole deployed stack | 7 properties, 1 harness self-test (a forge test) |
 
 Shared fixtures live in `test/utils/`: `FamilyTestBase.sol` and `RoundTestBase.sol` deploy and wire a
 complete stack, `FamilyHandler.sol` drives the invariant runs, and `HostileDoll.sol` is the edge

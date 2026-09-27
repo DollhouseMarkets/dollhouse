@@ -6,6 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FeeVault} from "../contracts/FeeVault.sol";
 import {RoundManager} from "../contracts/RoundManager.sol";
+import {DeployConstantsLib} from "../script/DeployConstantsLib.sol";
 
 /// @notice The stack as it will actually be deployed: every number here is the LOCKED value from
 /// docs/DEPLOY_CONSTANTS.md (and `script/Deploy.s.sol`), not the tranche-1 test values the rest
@@ -18,26 +19,32 @@ import {RoundManager} from "../contracts/RoundManager.sol";
 /// the last two as shares of what is left after dev and creator, hence 5000/5000 of a 40%
 /// remainder. This test is the proof that the two descriptions are the same thing.
 contract DeployConstantsTest is RoundTestBase {
-    // ---- docs/DEPLOY_CONSTANTS.md, transcribed exactly ----
-    uint256 internal constant D_HOP_FEE_PPM = 750; // 7.5 bps, parent side, per hop
-    uint256 internal constant D_PROTOCOL_FEE_PPM = 10_000; // 1% = 100 bps, edge pools only
-    uint256 internal constant D_DEV_BPS = 2_000;
-    uint256 internal constant D_CREATOR_BPS = 4_000;
+    // ---- bound to script/DeployConstantsLib.sol, the values script/Deploy.s.sol actually sends
+    // on chain, NOT a transcribed copy: a value that changes there and is not carried through to
+    // docs/DEPLOY_CONSTANTS.md fails this test instead of the two silently drifting apart. Values
+    // with no counterpart in the deploy script (they are hardcoded contract constants instead)
+    // are still transcribed, and say so.
+    uint256 internal constant D_HOP_FEE_PPM = DeployConstantsLib.HOP_FEE_PPM; // 7.5 bps, parent side, per hop
+    uint256 internal constant D_PROTOCOL_FEE_PPM = 10_000; // 1% = 100 bps, edge pools only; hardcoded in FamilyHook
+    uint256 internal constant D_DEV_BPS = 2_000; // hardcoded in FeeVault, not a Deploy.s.sol constant
+    uint256 internal constant D_CREATOR_BPS = DeployConstantsLib.CREATOR_BPS;
     uint256 internal constant D_ANCESTOR_OF_FEE_BPS = 2_000;
     uint256 internal constant D_REINFORCE_OF_FEE_BPS = 2_000;
     /// @dev Bond: flat on mainnet, base == max, so `bondFor` clamps
-    /// to the same amount at every depth regardless of `BOND_DOUBLING_EVERY`.
-    uint256 internal constant D_BOND_BASE = 0.008 ether;
-    uint256 internal constant D_BOND_DOUBLING_EVERY = 4;
-    uint256 internal constant D_BOND_MAX = 0.008 ether;
-    uint256 internal constant D_H_FRAC_WAD = 0; // threshold disabled in this deployment
+    /// to the same amount at every depth regardless of `BOND_DOUBLING_EVERY`. In the edge
+    /// currency's own 18 decimals, NOT wei/ETH - see script/Deploy.s.sol's MIN_BOUNTY_DOLL comment
+    /// for how a figure of this order is calibrated.
+    uint256 internal constant D_BOND_BASE = DeployConstantsLib.BOND_BASE;
+    uint256 internal constant D_BOND_DOUBLING_EVERY = DeployConstantsLib.BOND_DOUBLING_EVERY;
+    uint256 internal constant D_BOND_MAX = DeployConstantsLib.BOND_MAX;
+    uint256 internal constant D_H_FRAC_WAD = DeployConstantsLib.H_FRAC_WAD; // threshold disabled in this deployment
     uint64 internal constant D_TRADING_S = 900;
     uint64 internal constant D_SUBMIT_S = 300;
-    /// @dev Developer allocation: 3% of the GENESIS supply, 1-month cliff, 12-month linear.
-    uint256 internal constant D_DEV_ALLOCATION_BPS = 300;
-    uint64 internal constant D_VESTING_CLIFF_S = 30 days;
-    uint64 internal constant D_VESTING_DURATION_S = 365 days;
-    /// @dev Steward / developer role transfer delay.
+    /// @dev Steward / developer role transfer delay. Hardcoded in RoundManager/FeeVault, not a
+    /// Deploy.s.sol constant. There is no developer allocation and no vesting-related deploy
+    /// constant of any kind: the team's 3% lock is a separate launch-day run of
+    /// script/DeployVesting.s.sol against two independent OpenZeppelin VestingWallets, entirely
+    /// outside this deployment (docs/DEPLOY_CONSTANTS.md, "Developer allocation").
     uint64 internal constant D_ROLE_TRANSFER_DELAY = 7 days;
 
     uint256 internal constant BUY = 1 ether;
@@ -53,11 +60,11 @@ contract DeployConstantsTest is RoundTestBase {
     /// @dev The ancestor/reinforce split is taken against the REMAINDER after dev and creator,
     /// which is 40% of the fee here - so 50/50 of it is 20/20 of the whole.
     function _ancestorBps() internal pure override returns (uint256) {
-        return 5_000;
+        return DeployConstantsLib.ANCESTOR_BPS;
     }
 
     function _reinforceBps() internal pure override returns (uint256) {
-        return 5_000;
+        return DeployConstantsLib.REINFORCE_BPS;
     }
 
     /// @dev The round threshold is disabled in this deployment: both the base and the floor
@@ -88,12 +95,12 @@ contract DeployConstantsTest is RoundTestBase {
         assertEq(hook.PROTOCOL_FEE_PPM(), D_PROTOCOL_FEE_PPM, "protocol fee 100 bps on the edge");
         assertEq(vault.DEV_BPS(), D_DEV_BPS, "developer 20%");
         assertEq(vault.CREATOR_BPS(), D_CREATOR_BPS, "creator 40%");
-        assertEq(vault.ANCESTOR_BPS(), 5_000, "half the remainder to the ancestor sleeve");
-        assertEq(vault.REINFORCE_BPS(), 5_000, "and half to the immediate parent");
-        assertEq(roundManager.currentBond(), D_BOND_BASE, "bond 0.001 ETH at index 1");
-        assertEq(roundManager.BOND_BASE(), D_BOND_BASE, "bond base 0.001 ETH");
+        assertEq(vault.ANCESTOR_BPS(), DeployConstantsLib.ANCESTOR_BPS, "half the remainder to the ancestor sleeve");
+        assertEq(vault.REINFORCE_BPS(), DeployConstantsLib.REINFORCE_BPS, "and half to the immediate parent");
+        assertEq(roundManager.currentBond(), D_BOND_BASE, "bond base at index 1, in $DOLL wei");
+        assertEq(roundManager.BOND_BASE(), D_BOND_BASE, "bond base, in $DOLL wei");
         assertEq(roundManager.BOND_DOUBLING_EVERY(), D_BOND_DOUBLING_EVERY, "doubling every 4 links");
-        assertEq(roundManager.BOND_MAX(), D_BOND_MAX, "bond cap 64x base");
+        assertEq(roundManager.BOND_MAX(), D_BOND_MAX, "bond cap equals base: flat, not doubling, on mainnet");
         // A `maxIndex` of 0 is the Fenwick sleeve's own cap, not "unlimited"
         assertEq(roundManager.MAX_INDEX(), 4095, "testnet: capped only by the ancestor sleeve");
         assertEq(bidDeployer.TWAP_WINDOW(), 1800, "fast TWAP window 30 min");
@@ -108,8 +115,11 @@ contract DeployConstantsTest is RoundTestBase {
         assertEq(roundManager.sunsetDelay(), 7 days, "sunset delay 7 days");
         assertEq(roundManager.ROLE_TRANSFER_DELAY(), D_ROLE_TRANSFER_DELAY, "steward transfer delay 7 days");
         assertEq(vault.ROLE_TRANSFER_DELAY(), D_ROLE_TRANSFER_DELAY, "developer transfer delay 7 days");
-        // There is no developer allocation and no vesting contract. 100% of every
-        // family supply is locked liquidity, and the edge currency is an adopted external token.
+        // This deployment itself has no developer allocation and deploys no vesting contract:
+        // 100% of every family supply is locked liquidity, and the edge currency is an adopted
+        // external token. The team's separate 3% $DOLL lock (two OpenZeppelin VestingWallets,
+        // linear 365 days, no cliff) is a launch-day run of script/DeployVesting.s.sol, entirely
+        // outside this stack.
         assertEq(factory.GENESIS_TOKEN(), address(doll), "the adopted edge currency");
         assertEq(vault.EDGE().toId(), uint256(uint160(address(doll))), "and the vault is denominated in it");
         assertEq(roundManager.H_FRAC_WAD(), D_H_FRAC_WAD, "H0 = 0, threshold disabled in this deployment");

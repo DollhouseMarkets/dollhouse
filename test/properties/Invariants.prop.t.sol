@@ -33,7 +33,7 @@ contract InvariantsPropTest is RoundTestBase {
             handler.notePosition(poolId, ranges[i].tickLower, ranges[i].tickUpper);
         }
 
-        bytes4[] memory selectors = new bytes4[](11);
+        bytes4[] memory selectors = new bytes4[](12);
         selectors[0] = PropHandler.propBuy.selector;
         selectors[1] = PropHandler.propSell.selector;
         selectors[2] = PropHandler.propRegister.selector;
@@ -45,6 +45,7 @@ contract InvariantsPropTest is RoundTestBase {
         selectors[8] = PropHandler.propClaim.selector;
         selectors[9] = PropHandler.propReenterFromUnlock.selector;
         selectors[10] = PropHandler.propDonate.selector;
+        selectors[11] = PropHandler.propProbePrivileged.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -237,14 +238,31 @@ contract InvariantsPropTest is RoundTestBase {
         _assertNoEth();
     }
 
-    /// @notice ROL-01: nothing outside the named role calls can move a role. The handler never
-    /// announces or executes a transfer, so every role holder is still the one set at deployment.
+    /// @notice ROL-01: nothing outside the named role calls can move a role. The handler's
+    /// `propProbePrivileged` action attempts every role, sunset and creator-right move from an
+    /// address that holds none of them; none may take effect, and every holder is still the one
+    /// set at deployment. The handler itself holds no role, so no other action can move one
+    /// legitimately either.
     function invariant_ROL01_thePrivilegedSurfaceIsUnreachable() public view {
+        assertEq(handler.privilegedSucceeded(), 0, "a non-holder moved a role, a sunset or a creator right");
         assertEq(roundManager.steward(), initialSteward, "the steward moved");
+        assertEq(roundManager.pendingSteward(), address(0), "a steward transfer was announced");
         assertEq(vault.developer(), initialDeveloper, "the developer moved");
+        assertEq(vault.pendingDeveloper(), address(0), "a developer transfer was announced");
         assertEq(vault.creatorRecipient(address(token)), initialGenesisCreator, "a creator right moved");
         assertEq(roundManager.sunsetAt(), 0, "a sunset was announced by something other than the steward");
         assertEq(roundManager.successor(), address(0), "a successor was named without the steward");
+    }
+
+    /// @notice ROL-01, the probe itself: one call of the handler's action really reaches the role
+    /// surface from a non-holder and is refused everywhere.
+    function test_ROL01_theProbeIsRefusedEverywhere() public {
+        handler.propProbePrivileged(7);
+        assertEq(handler.privilegedAttempts(), 1, "the probe did not run");
+        assertEq(handler.privilegedSucceeded(), 0, "a non-holder moved a role");
+        assertEq(roundManager.steward(), initialSteward, "the steward moved");
+        assertEq(vault.developer(), initialDeveloper, "the developer moved");
+        assertEq(roundManager.sunsetAt(), 0, "a sunset was announced");
     }
 
     /// @notice REN-01: no call originating inside a `PoolManager` unlock reaches a
@@ -263,6 +281,12 @@ contract InvariantsPropTest is RoundTestBase {
     // that is MEANT to run inside the swap's unlock, on every swap.
     function invariant_REN01_nothingReentersFromInsideAnUnlock() public view {
         assertEq(handler.reentrySucceeded(), 0, "a call from inside an unlock took effect");
+        assertEq(handler.reentryCallbacksRun(), handler.reentryAttempts(), "an unlock probe was rolled back");
+        assertEq(
+            handler.reentryBlockedByGuard(),
+            handler.reentryAttempts() * handler.GUARDED_PROBES(),
+            "a guarded probe failed for a reason other than the unlock guard"
+        );
     }
 
     /// @notice REN-01, measured: which state-changing calls are actually reachable from inside a
@@ -270,17 +294,24 @@ contract InvariantsPropTest is RoundTestBase {
     function test_REN01_whichCallsAreReachableFromInsideAnUnlock() public {
         handler.propRegister(43200);
         handler.propSucceed(type(uint256).max);
+        assertGt(roundManager.headIndex(), 0, "precondition: no generation was crowned");
         handler.propReenterFromUnlock(2992);
-        emit log_named_uint("finalize", handler.reentryFinalizeSucceeded());
-        emit log_named_uint("claims", handler.reentryClaimSucceeded());
-        emit log_named_uint("flushForward", handler.reentryFlushSucceeded());
-        emit log_named_uint("keeper entrypoints", handler.reentryKeeperSucceeded());
-        emit log_named_uint("bond refund", handler.reentryRefundSucceeded());
-        emit log_named_uint("requestEnd", handler.reentryRequestEndSucceeded());
-        emit log_named_uint("fulfilEnd", handler.reentryFulfilEndSucceeded());
-        emit log_named_uint("finalizeDeterministic", handler.reentryDeterministicSucceeded());
-        emit log_named_uint("submitScore", handler.reentrySubmitSucceeded());
         emit log_named_uint("total reachable", handler.reentrySucceeded());
+        // the probe really ran inside an unlock that completed (a rolled-back unlock would
+        // also roll back every success counter below)
+        assertEq(handler.reentryCallbacksRun(), 1, "the unlock callback did not run to completion");
+        // and every guarded target was refused BY the unlock guard, not by some other check
+        assertEq(handler.reentryBlockedByGuard(), handler.GUARDED_PROBES(), "a probe failed for a reason other than the unlock guard");
+        assertEq(handler.reentryFinalizeSucceeded(), 0, "finalize is reachable from inside an unlock");
+        assertEq(handler.reentryClaimSucceeded(), 0, "a vault claim is reachable from inside an unlock");
+        assertEq(handler.reentryFlushSucceeded(), 0, "flushForward is reachable from inside an unlock");
+        assertEq(handler.reentryKeeperSucceeded(), 0, "a keeper entrypoint is reachable from inside an unlock");
+        assertEq(handler.reentryRefundSucceeded(), 0, "claimRefund is reachable from inside an unlock");
+        assertEq(handler.reentryRequestEndSucceeded(), 0, "requestEnd is reachable from inside an unlock");
+        assertEq(handler.reentryFulfilEndSucceeded(), 0, "fulfilEnd is reachable from inside an unlock");
+        assertEq(handler.reentryDeterministicSucceeded(), 0, "finalizeDeterministic is reachable from inside an unlock");
+        assertEq(handler.reentrySubmitSucceeded(), 0, "submitScore is reachable from inside an unlock");
+        assertEq(handler.reentrySucceeded(), 0, "a call from inside an unlock took effect");
     }
 
     /// @notice The run must actually have reached the interesting paths.

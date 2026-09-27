@@ -19,6 +19,7 @@ import {V4UnlockGuardProbe} from "../contracts/libraries/V4UnlockGuardProbe.sol"
 import {MockRandomnessSource} from "../contracts/randomness/MockRandomnessSource.sol";
 import {DrandSource} from "../contracts/randomness/DrandSource.sol";
 import {CurveSegment} from "../contracts/types/CurveSegment.sol";
+import {DeployConstantsLib} from "./DeployConstantsLib.sol";
 
 /// @title Deploy
 /// @notice Deploys the whole family stack against an EXISTING Uniswap v4 PoolManager and ADOPTS
@@ -52,16 +53,18 @@ contract Deploy is Script {
     // ---------------------------------------------------------------------------------------
 
     /// @dev Per-hop parent-side fee: DEPLOY_CONSTANTS says 7.5 bps, which is exactly 750 ppm now
-    /// that the hook charges in parts-per-million.
-    uint256 internal constant HOP_FEE_PPM = 750;
+    /// that the hook charges in parts-per-million. Sourced from `DeployConstantsLib`, the single
+    /// place this value (and the ones below) is written, so `test/DeployConstants.t.sol` binds to
+    /// the same constant this script sends on chain rather than a transcribed copy of it.
+    uint256 internal constant HOP_FEE_PPM = DeployConstantsLib.HOP_FEE_PPM;
     /// @dev Fee split: dev 20% (hardcoded `FeeVault.DEV_BPS`), creator 40%, and the 40% remainder
     /// split 50/50 between the ancestor sleeve (20% of the whole) and reinforcement (20%).
-    uint256 internal constant CREATOR_BPS = 4_000;
-    uint256 internal constant ANCESTOR_BPS = 5_000;
-    uint256 internal constant REINFORCE_BPS = 5_000;
+    uint256 internal constant CREATOR_BPS = DeployConstantsLib.CREATOR_BPS;
+    uint256 internal constant ANCESTOR_BPS = DeployConstantsLib.ANCESTOR_BPS;
+    uint256 internal constant REINFORCE_BPS = DeployConstantsLib.REINFORCE_BPS;
     /// @dev Threshold: disabled in this deployment (both the base and the floor are zero).
-    uint256 internal constant H_FRAC_WAD = 0;
-    uint256 internal constant H_MIN_FRAC_WAD = 0;
+    uint256 internal constant H_FRAC_WAD = DeployConstantsLib.H_FRAC_WAD;
+    uint256 internal constant H_MIN_FRAC_WAD = DeployConstantsLib.H_MIN_FRAC_WAD;
 
     uint256 internal constant SUPPLY = 1e9 * 1e18;
     /// @dev Candidate bond (the contract supports a schedule: `base`, doubling every
@@ -75,27 +78,41 @@ contract Deploy is Script {
     /// launch price: the figure below is a placeholder of the right order for a beta run and is
     /// meaningless until that price is known. Overridable per deployment through `BOND_BASE` /
     /// `BOND_DOUBLING_EVERY` / `BOND_MAX`.
-    uint256 internal constant BOND_BASE = 25_000e18;
-    uint256 internal constant BOND_DOUBLING_EVERY = 4;
-    uint256 internal constant BOND_MAX = 25_000e18;
+    uint256 internal constant BOND_BASE = DeployConstantsLib.BOND_BASE;
+    uint256 internal constant BOND_DOUBLING_EVERY = DeployConstantsLib.BOND_DOUBLING_EVERY;
+    uint256 internal constant BOND_MAX = DeployConstantsLib.BOND_MAX;
     /// @dev Sunset delay: the public warning between `announceSunset(successor)` and
     /// the first refused round. Mainnet: 7 days. A testnet run overrides it through
     /// `SUNSET_DELAY_S` (1 hour is the contract floor) so the handover can be exercised live.
-    uint64 internal constant SUNSET_DELAY_S = 7 days;
+    uint64 internal constant SUNSET_DELAY_S = DeployConstantsLib.SUNSET_DELAY_S;
     /// @dev Keeper bounty floor: the 1% proportional bounty is far below the gas of a
     /// deployment at beta scale, so every deployment pays at least this much out of the same
     /// generation's entitlement (capped at 20% of what the call consumes).
     ///
-    /// @dev IN $DOLL, NOT WEI. Calibrate it from the graduated launch price so the
-    /// floor is 3 to 5 times the gas of a keeper call at that price; the 20% ceiling bounds an
-    /// oversized floor. The figure below is a placeholder. Override with `MIN_BOUNTY_DOLL`.
-    uint256 internal constant MIN_BOUNTY_DOLL = 1_000e18;
+    /// @dev IN $DOLL, NOT WEI. F-06 CALIBRATION (2026-09-26), so this is not a guess: gas price
+    /// observed live via `eth_gasPrice` on `https://rpc.mainnet.chain.robinhood.com` was
+    /// 22,634,000 wei/gas (`eth_maxPriorityFeePerGas` answered 0, so that is also the effective
+    /// price). Gas per placement: `docs/spec/PROTOCOL_SPEC.md` measures a whole live
+    /// `deployAncestor(1)` at ~589k gas, but `j = 1` is exactly the generation the floor does NOT
+    /// bind for (no keeper capital, no TWAP walk); deeper generations carry the O(j) consult-chain
+    /// walk on top (measured ~140k at j=1's chain, ~2.20M at j=32), so ~1,000,000 gas is used as
+    /// the representative deeper-generation placement. Gas cost: 22,634,000 * 1,000,000 wei =
+    /// 2.2634e13 wei = 0.000022634 ETH. Launch price: the Pons curve's first parcel (phantom
+    /// reserve 1.68 ETH, supply 1e9, constant product) sells 30,000,000 tokens for 0.0531 ETH, so
+    /// the post-buy real reserve is 1.68 + 0.0531 = 1.7331 ETH against a token reserve of
+    /// 970,000,000, giving a marginal price of 1.7331 / 970,000,000 = 1.7867e-9 ETH/$DOLL. Gas
+    /// cost in $DOLL: 0.000022634 / 1.7867e-9 ≈ 12,668 $DOLL, rounded up to a clean 13,000 and
+    /// then HALVED per the design call (the floor should sit at about half a placement's gas at
+    /// launch prices and fall further below gas as $DOLL appreciates): MIN_BOUNTY_DOLL = 6,500e18.
+    /// Re-calibrate this at the actual launch price; it is not a substitute for that. Override
+    /// with the `MIN_BOUNTY_DOLL` env var.
+    uint256 internal constant MIN_BOUNTY_DOLL = DeployConstantsLib.MIN_BOUNTY_DOLL;
     /// @dev sec.3. END_TIMEOUT_S: how long a round waits for the drand relay before
     /// ending deterministically at `T`. DURATION_SCALE_DIV: 1 on mainnet; a testnet run sets 60
     /// (through the environment) so a 12-hour round is exercised in 12 minutes. RANDOMNESS_DELAY_S
     /// is only used when this script has to deploy the labelled mock source.
-    uint64 internal constant END_TIMEOUT_S = 30 minutes;
-    uint64 internal constant DURATION_SCALE_DIV = 1;
+    uint64 internal constant END_TIMEOUT_S = DeployConstantsLib.END_TIMEOUT_S;
+    uint64 internal constant DURATION_SCALE_DIV = DeployConstantsLib.DURATION_SCALE_DIV;
     /// @dev drand `evmnet` (`bls-bn254-unchained-on-g1`, BN254, 3 s period), from
     /// `https://api.drand.sh/v2/beacons/evmnet/info`, re-verified live. The four words
     /// are the beacon's 128-byte G2 group key in the order the API serves it; `test/Drand.t.sol`
@@ -195,6 +212,10 @@ contract Deploy is Script {
         // (the deployment can then never be sunset), so it cannot be distinguished from "forgot
         // to set it" unless the variable is required.
         address steward = vm.envAddress("STEWARD");
+        require(
+            steward != deployer || vm.envOr("ALLOW_STEWARD_EQ_DEPLOYER", uint256(0)) == 1,
+            "STEWARD equals the deployer key: set ALLOW_STEWARD_EQ_DEPLOYER=1 to allow it"
+        );
         // CONTINUE_FROM: the RoundManager of the version this deployment continues the trunk
         // from. Unset (address(0)) = a fresh trunk, which is the only mode that has a genesis.
         address continueFrom = vm.envOr("CONTINUE_FROM", address(0));
@@ -370,6 +391,18 @@ contract Deploy is Script {
         RoundManager roundManager = factory.roundManager();
         string memory o = "deployment";
 
+        // F-25: READ-MODIFY-WRITE, the same way DeployZap.s.sol and DeployVesting.s.sol already
+        // do. A re-run of this script used to overwrite the whole record with a fresh object,
+        // clobbering `ethZap` / `venuePoolId` (DeployZap) and `devVesting` (DeployVesting) if
+        // either had already run. Loading the existing record's keys into `o` FIRST means every
+        // key below - all of them keys this script itself owns - overwrites its own prior value,
+        // while any key this script never writes (the two above, and anything else appended
+        // later) survives untouched.
+        string memory path = string.concat("deployments/", vm.toString(block.chainid), ".json");
+        if (vm.isFile(path)) {
+            vm.serializeJson(o, vm.readFile(path));
+        }
+
         vm.serializeUint(o, "chainId", block.chainid);
         vm.serializeUint(o, "deployBlock", startBlock);
         vm.serializeAddress(o, "deployer", msg.sender);
@@ -456,7 +489,6 @@ contract Deploy is Script {
         vm.serializeString(o, "constants", constantsJson);
         string memory out = vm.serializeString(o, "hookPermissions", flagsJson);
 
-        string memory path = string.concat("deployments/", vm.toString(block.chainid), ".json");
         vm.writeJson(out, path);
         console2.log("wrote", path);
     }

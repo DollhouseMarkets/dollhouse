@@ -46,6 +46,25 @@ contract PropHandler is FamilyHandler {
     uint256 public reentryFulfilEndSucceeded;
     uint256 public reentryDeterministicSucceeded;
     uint256 public reentrySubmitSucceeded;
+    /// @notice How many times the unlock callback actually ran to completion. A success above
+    /// that also left an unsettled delta would make `unlock` revert and roll every counter back
+    /// with it, so REN-01 is only meaningful while this equals `reentryAttempts`.
+    uint256 public reentryCallbacksRun;
+    /// @notice How many probes were refused by the protocol's own unlock guard (`InsideUnlock()`)
+    /// rather than by some unrelated precondition. Cause, not effect: REN-01 is asserted on the
+    /// guard firing, not merely on the call failing.
+    uint256 public reentryBlockedByGuard;
+    /// @notice The probes in {unlockCallback} whose target carries `notInsideUnlock`: `finalize`,
+    /// the three vault claims, `claimRefund`, `deployEdgeBid`, `deployHopPot`, `requestEnd`,
+    /// `fulfilEnd`, `finalizeDeterministic` and `submitScore`. `flushForward` is the twelfth
+    /// probe and is refused by v4-core's `AlreadyUnlocked` (or by an empty queue) instead.
+    uint256 public constant GUARDED_PROBES = 11;
+
+    /// @notice ROL-01: attempts to move a role, a sunset or a creator right from a caller that
+    /// holds none of them, and how many of those attempts took effect. The second must stay at
+    /// zero.
+    uint256 public privilegedAttempts;
+    uint256 public privilegedSucceeded;
 
     /// @notice SUP-04: the edge currency donated into the vault over the run, and how
     /// many of those donations moved a ledger. The second must stay at zero: a gift credits
@@ -162,64 +181,146 @@ contract PropHandler is FamilyHandler {
         _observe();
     }
 
+    /// @dev ROL-01: from a seeded address that holds no role, attempt every call that moves a
+    /// role, a sunset, a successor or a creator right. Each must revert; if any access check were
+    /// missing, the role would move and `invariant_ROL01_thePrivilegedSurfaceIsUnreachable`
+    /// would fail on the next check.
+    function propProbePrivileged(uint256 seed) external {
+        address caller = address(uint160(uint256(keccak256(abi.encode("ROL-01", seed)))));
+        address tok = roundManager.canonical(bound(seed, 0, roundManager.headIndex()));
+        if (caller == roundManager.steward() || caller == vault.developer() || caller == vault.creatorRecipient(tok)) {
+            return;
+        }
+        privilegedAttempts++;
+        vm.prank(caller);
+        try roundManager.announceSunset(address(roundManager)) {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try roundManager.cancelSunset() {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try roundManager.announceStewardTransfer(caller) {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try roundManager.cancelStewardTransfer() {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try roundManager.executeStewardTransfer() {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try vault.announceDeveloperTransfer(caller) {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try vault.cancelDeveloperTransfer() {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try vault.executeDeveloperTransfer() {
+            privilegedSucceeded++;
+        } catch {}
+        vm.prank(caller);
+        try vault.transferCreatorRecipient(tok, caller) {
+            privilegedSucceeded++;
+        } catch {}
+        _observe();
+    }
+
+    /// @dev Counts a probe refused by the protocol's own unlock guard. `RoundManager`,
+    /// `FeeVault` and `BidDeployer` declare the same `InsideUnlock()` error, so one selector
+    /// covers all three.
+    function _noteGuard(bytes memory reason) internal {
+        if (reason.length >= 4 && bytes4(reason) == RoundManager.InsideUnlock.selector) reentryBlockedByGuard++;
+    }
+
     /// @dev The unlock callback the action above lands in. Every call is wrapped: a revert is
     /// the expected outcome and must not end the run.
     function unlockCallback(bytes calldata) external returns (bytes memory) {
         require(msg.sender == address(poolManager), "not the PoolManager");
+        reentryCallbacksRun++;
         uint256 guarded;
         try roundManager.finalize() {
             guarded++;
             reentryFinalizeSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try vault.claimDev(address(this)) returns (uint256) {
             guarded++;
             reentryClaimSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try vault.claimCreator(roundManager.canonical(0), address(this)) returns (uint256) {
             guarded++;
             reentryClaimSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try vault.claimCreatorAccrued(address(this)) returns (uint256) {
             guarded++;
             reentryClaimSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         // The round manager's own pull payment, guarded like the vault's claims
         try roundManager.claimRefund(address(this)) {
             guarded++;
             reentryRefundSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try vault.flushForward(0, 1) returns (uint256) {
             guarded++;
             reentryFlushSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try bidDeployer.deployEdgeBid() returns (uint256) {
             guarded++;
             reentryKeeperSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try bidDeployer.deployHopPot(1) returns (uint256, uint256) {
             guarded++;
             reentryKeeperSucceeded++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         reentryGuardedSucceeded += guarded;
 
         uint256 open;
         try roundManager.requestEnd() returns (bytes32) {
             reentryRequestEndSucceeded++;
             open++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         // The relay half of the random end is guarded too
         try roundManager.fulfilEnd("") returns (uint64) {
             reentryFulfilEndSucceeded++;
             open++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try roundManager.finalizeDeterministic() {
             reentryDeterministicSucceeded++;
             open++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         try roundManager.submitScore(0) returns (int256) {
             reentrySubmitSucceeded++;
             open++;
-        } catch {}
+        } catch (bytes memory reason) {
+            _noteGuard(reason);
+        }
         reentrySucceeded += guarded + open;
         return "";
     }

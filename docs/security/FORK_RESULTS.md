@@ -47,7 +47,9 @@ recorded run). Identity of the singleton is pinned instead by the code hash abov
 | 9. Locked-liquidity negative tests | SUP-05, SUP-06, SUP-07, REN-01 | `Edge.fork.t.sol`: `testFork_SUP05_lockedLiquidityCannotBeRemoved`, `testFork_SUP06_addLiquidityAndDonateAreRefused`, `testFork_SUP07_unregisteredKeyAndWrongPriceAreRefused` | pass |
 | 10. Role transfers under real time | ROL-04, ROL-05 | `Continuation.fork.t.sol`: `testFork_ROL05_theStewardRoleMovesOnlyOnItsPublicDelay` | pass for the steward role. **Not run here:** the developer transfer (ROL-06), which touches no pool; covered at U by `RoleTransfer.t.sol`. |
 
-Recorded run: **38 tests, 38 passed, 0 failed, 0 skipped**, single-threaded.
+Recorded run: **38 tests, 38 passed, 0 failed, 0 skipped**, single-threaded. The tier has 38 test
+functions in 8 suites (`forge test --list`, 2026-09-26), the same count `test/README.md`,
+`docs/security/README.md` and `docs/security/PROPERTY_RESULTS.md` state.
 
 ## 3. Differences against the local mock-based tiers
 

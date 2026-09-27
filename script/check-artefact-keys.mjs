@@ -19,15 +19,28 @@
 //
 // AND THE VALUES, when a written record is there to check:
 //
-//   node script/check-artefact-keys.mjs [path/to/record.json]
+//   node script/check-artefact-keys.mjs [path/to/record.json] [--launch] [--rpc <url>] [--mode <m>] [--quiet]
 //
-// The record is `deployments/<chainId>.json` for the chain in CHAIN_ID (or VITE_CHAIN_ID). A
-// different file can be named on the command line or in DEPLOYMENT_RECORD.
+// `--quiet` (what `npm run build` passes, via web/scripts/check-record.mjs) names each checked
+// key without echoing its value, so a build log never carries the record's addresses.
 //
-// A key that is present and ZERO is as silent as a key that is missing. With a record resolved,
-// this also fails on a zero `genesisToken`, and WARNS on a zero or missing
-// `entrancePoolId` or `stateView` - the legitimate but easily unnoticed "no venue behind the edge
-// currency" deployment.
+// The record is resolved exactly as `web/scripts/sync-contracts.mjs` resolves it:
+// `private/deployments/<chainId>.json` when present, else `deployments/<chainId>.json`, for the
+// chain in CHAIN_ID or VITE_CHAIN_ID (process environment first, then web/'s .env files with
+// Vite's precedence for `--mode`, default `production`). A different file can be named on the
+// command line or in DEPLOYMENT_RECORD.
+//
+// A record whose own `chainId` is not the chain being checked, or whose deployer / developer /
+// steward is a well-known Anvil account (a fork rehearsal), fails outright.
+//
+// A key that is present and ZERO is as silent as a key that is missing. REQUIRED non-zero on
+// every chain: the seven core contracts (router, lens, roundManager, factory, feeVault,
+// bidDeployer, hook), genesisToken and deployBlock; on mainnet (4663) also entrancePoolId; with
+// `--launch` also ethZap. The rest WARN when zero or missing - the legitimate but easily
+// unnoticed "no venue behind the edge currency" deployment among them.
+//
+// `--rpc <url>` also asks that node, for every contract address in the record, `eth_getCode`,
+// and fails on any address with no code (and on an `eth_chainId` that is not the record's).
 //
 // WHAT IS ALLOWED TO BE ZERO. `constants.bondBaseDoll` and `constants.minBountyDoll`
 // were failures, and neither is wrong at zero: a bond of zero is a chain anyone may enter, and a
@@ -38,7 +51,20 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DIRECT_READ_KEYS, VENUE_VIEW_KEY } from './contract-keys.mjs'
+import {
+  ALWAYS_REQUIRED_EXTRA,
+  CORE_ADDRESS_KEYS,
+  DIRECT_READ_KEYS,
+  flagValue,
+  LAUNCH_REQUIRED_EXTRA,
+  MAINNET_CHAIN_ID,
+  MAINNET_REQUIRED_EXTRA,
+  recordPathFor,
+  recordProblems,
+  ROLE_KEYS,
+  VENUE_VIEW_KEY,
+  viteEnv,
+} from './contract-keys.mjs'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const deploy = readFileSync(join(repo, 'script', 'Deploy.s.sol'), 'utf8')
@@ -55,21 +81,53 @@ for (const m of deploy.matchAll(/vm\.serializeString\(\s*"deployment"\s*,\s*"([A
 /// this script needing to read `web/` at all.
 const read = new Set([...DIRECT_READ_KEYS, VENUE_VIEW_KEY])
 
+// ---- arguments ----------------------------------------------------------------------
+const argv = process.argv.slice(2)
+const launch = argv.includes('--launch')
+const rpcUrl = flagValue(argv, '--rpc')
+const mode = flagValue(argv, '--mode') ?? 'production'
+const quiet = argv.includes('--quiet')
+/// One checked value: the label and the value, or only the label under `--quiet`.
+const shown = (label, v) => (quiet ? `  ${label}: ok` : `  ${label} = ${v}`)
+if (argv.includes('--rpc') && !rpcUrl) {
+  console.error('--rpc needs a URL')
+  process.exit(1)
+}
+const valueFlags = new Set(['--rpc', '--mode'])
+const positional = argv.filter((a, i) => !a.startsWith('--') && !valueFlags.has(argv[i - 1]))
+
+/// The chain being checked: CHAIN_ID / VITE_CHAIN_ID from the process, else web/'s env files
+/// with Vite's precedence (the same value the web build would use), when web/ is present.
+function expectedChainId() {
+  const fromProcess = process.env.CHAIN_ID || process.env.VITE_CHAIN_ID
+  if (fromProcess) return Number(fromProcess)
+  const web = join(repo, 'web')
+  if (!existsSync(web)) return undefined
+  const v = viteEnv(web, mode)('VITE_CHAIN_ID')
+  return v ? Number(v) : undefined
+}
+const chainId = expectedChainId()
+
 /// The record whose VALUES are checked: named on the command line or in DEPLOYMENT_RECORD, else
-/// `deployments/<chainId>.json`. No record is not a
-/// failure: the key check is the part that runs everywhere, toolchain or not.
+/// the same private-first record the web sync reads. No record is not a failure: the key check
+/// is the part that runs everywhere, toolchain or not.
 function recordPath() {
-  const named = process.argv[2] || process.env.DEPLOYMENT_RECORD
+  const named = positional[0] || process.env.DEPLOYMENT_RECORD
   if (named) return resolve(named)
-  const chainId = process.env.CHAIN_ID || process.env.VITE_CHAIN_ID
   if (!chainId) return null
-  const p = join(repo, 'deployments', `${chainId}.json`)
-  return existsSync(p) ? p : null
+  return recordPathFor(repo, chainId) ?? null
 }
 
-/// Every value that must be non-zero for the deployment to mean anything, and the two that are
-/// allowed to be absent but must say so out loud.
-const REQUIRED = [['genesisToken', (r) => r.genesisToken]]
+/// Every value that must be non-zero for the deployment to mean anything. Mainnet and
+/// `--launch` add to it (script/contract-keys.mjs).
+function requiredKeys(isMainnet) {
+  return [
+    ...CORE_ADDRESS_KEYS,
+    ...ALWAYS_REQUIRED_EXTRA,
+    ...(isMainnet ? MAINNET_REQUIRED_EXTRA : []),
+    ...(launch ? LAUNCH_REQUIRED_EXTRA : []),
+  ]
+}
 /// Zero here is a legitimate deployment, not a broken record - but it is one nobody should
 /// discover by accident, so each one says what zero MEANS on the chain that ships it.
 const OPTIONAL = [
@@ -83,6 +141,7 @@ const OPTIONAL = [
   ],
   ['ethZap', (r) => r.ethZap, 'the site hides the ETH buy/sell option and keeps the $DOLL-only flow'],
   ['devVesting', (r) => r.devVesting, 'the site does not link the developer vesting wallet'],
+  ['artistVesting', (r) => r.artistVesting, 'the site does not link the artist vesting wallet'],
 ]
 
 const isZero = (v) =>
@@ -90,6 +149,11 @@ const isZero = (v) =>
 
 const valueErrors = []
 const record = recordPath()
+if (!record && chainId === MAINNET_CHAIN_ID) {
+  valueErrors.push(
+    'no mainnet deployment record (private/deployments/4663.json or deployments/4663.json) exists yet',
+  )
+}
 if (record) {
   let raw
   try {
@@ -100,16 +164,22 @@ if (record) {
     process.exit(1)
   }
   console.log(`\nvalues checked against ${record}`)
-  for (const [label, get] of REQUIRED) {
-    const v = get(raw)
+  const checkedChain = chainId ?? Number(raw.chainId)
+  if (chainId === undefined) console.log(`  (no CHAIN_ID/VITE_CHAIN_ID: checking as the record's own chain ${raw.chainId})`)
+  for (const p of recordProblems(raw, checkedChain)) valueErrors.push(p)
+  const isMainnet = checkedChain === MAINNET_CHAIN_ID
+  const required = requiredKeys(isMainnet)
+  for (const label of required) {
+    const v = raw[label]
     if (isZero(v)) valueErrors.push(`${label} is ${v === undefined ? 'missing' : `zero (${v})`}`)
-    else console.log(`  ${label} = ${v}`)
+    else console.log(shown(label, v))
   }
   for (const [label, get, meaning] of OPTIONAL) {
+    if (required.includes(label)) continue
     const v = get(raw)
     const why = v === undefined ? 'missing' : 'zero'
     if (isZero(v)) console.log(`  WARNING: ${label} is ${why}: ${meaning}`)
-    else console.log(`  ${label} = ${v}`)
+    else console.log(shown(label, v))
   }
   // The zap swaps ETH against the SAME pool the site prices $DOLL in ETH with. If a record
   // names both, they must be the same pool - a zap pointed at a different venue would swap
@@ -123,11 +193,68 @@ if (record) {
     } else if (String(raw.venuePoolId).toLowerCase() !== String(raw.entrancePoolId).toLowerCase()) {
       valueErrors.push(`venuePoolId (${raw.venuePoolId}) != entrancePoolId (${raw.entrancePoolId})`)
     } else {
-      console.log(`  venuePoolId = ${raw.venuePoolId} (matches entrancePoolId)`)
+      console.log(`${shown('venuePoolId', raw.venuePoolId)} (matches entrancePoolId)`)
     }
   }
+  if (rpcUrl && valueErrors.length === 0) await checkCode(raw, rpcUrl, valueErrors)
 } else {
   console.log('\nno deployment record checked: pass one as an argument, or set CHAIN_ID')
+  if (rpcUrl) valueErrors.push('--rpc was given but there is no record to check')
+}
+
+/// One JSON-RPC call with a 15 s timeout and two bounded retries; throws with the reason.
+async function rpc(url, method, params) {
+  let last
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const body = await res.json()
+      if (body.error) throw new Error(`${body.error.code}: ${body.error.message}`)
+      return body.result
+    } catch (err) {
+      last = err
+      await new Promise((r) => setTimeout(r, 500 * 2 ** attempt))
+    }
+  }
+  throw new Error(`${method} failed after 3 attempts: ${last?.message ?? last}`)
+}
+
+/// `eth_getCode` on every CONTRACT address in the record (role accounts are EOAs and are
+/// skipped). An address with no code is a record that points at nothing.
+async function checkCode(raw, url, errors) {
+  console.log(`\ncode checked over RPC`)
+  try {
+    const remote = Number(await rpc(url, 'eth_chainId', []))
+    if (remote !== Number(raw.chainId)) {
+      errors.push(`the RPC is chain ${remote}, the record is chain ${raw.chainId}`)
+      return
+    }
+  } catch (err) {
+    errors.push(`eth_chainId: ${err.message}`)
+    return
+  }
+  const roles = new Set(ROLE_KEYS)
+  const entries = Object.entries(raw).filter(
+    ([k, v]) => !roles.has(k) && typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v) && !isZero(v),
+  )
+  // `entrancePool` is the venue pool's address REFERENCE (a v4 pool has no contract of its own)
+  const skip = new Set(['entrancePool'])
+  for (const [k, v] of entries) {
+    if (skip.has(k)) continue
+    try {
+      const code = await rpc(url, 'eth_getCode', [v, 'latest'])
+      if (!code || code === '0x') errors.push(`${k} (${v}) has no code on chain ${raw.chainId}`)
+      else console.log(`  ${k}: ${(code.length - 2) / 2} bytes`)
+    } catch (err) {
+      errors.push(`eth_getCode ${k}: ${err.message}`)
+    }
+  }
 }
 
 const missing = [...read].filter((k) => !produced.has(k)).sort()
@@ -143,7 +270,7 @@ if (missing.length > 0) {
   process.exit(1)
 }
 if (valueErrors.length > 0) {
-  console.error(`\nEMPTY where the record needs a value: ${valueErrors.join('; ')}`)
+  console.error(`\nRECORD NOT USABLE (empty, wrong chain, rehearsal, or no code):${valueErrors.join('; ')}`)
   process.exit(1)
 }
 console.log('\nok: every key the web build reads is written by the deploy script')
