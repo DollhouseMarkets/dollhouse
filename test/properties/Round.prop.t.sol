@@ -18,9 +18,10 @@ contract RoundPropTest is RoundTestBase {
     // the schedule
     // ---------------------------------------------------------------------------------
 
-    /// @notice `durationFor(n) = min(15 min * 2^floor((n-1)/2), 12 h)/DURATION_SCALE_DIV`,
-    /// `registrationFor(n) = clamp(D(n)/5, 3 min, 1 h)`, `lateEntryUntil(n) = D(n)/3` iff
-    /// `D(n) >= 1 h` else 0, `closingWindowFor(n) = CLOSING_WINDOW_S` (a flat 15 min),
+    /// @notice The whole round `L(n) = min(10 min * 2^floor((n-1)/2), 12 h)`,
+    /// `registrationFor(n) = clamp(L(n)/5, 3 min, 1 h)/DURATION_SCALE_DIV`,
+    /// `durationFor(n) = (L(n) - R(n))/DURATION_SCALE_DIV`, `lateEntryUntil(n) = D(n)/3` iff the
+    /// unscaled `D(n) >= 1 h` else 0, `closingWindowFor(n) = CLOSING_WINDOW_S` (a flat 15 min),
     /// `randomEndWindowFor(n) = max(1, min(180 s, D(n)/4))` - each a pure function of `n` alone.
     function testFuzz_RND01_scheduleIsAPureFunctionOfTheRoundNumber(uint256 n, uint256 warpSeed, address caller)
         public
@@ -28,14 +29,16 @@ contract RoundPropTest is RoundTestBase {
         n = bound(n, 1, 4096);
         uint64 div = roundManager.DURATION_SCALE_DIV();
 
-        uint64 raw = _rawDurationSpec(n);
-        uint64 d = raw / div;
-        assertEq(roundManager.durationFor(n), d, "D(n)");
-
-        uint64 reg = raw / 5;
+        uint64 len = _rawRoundSpec(n);
+        uint64 reg = len / 5;
         if (reg < 3 minutes) reg = 3 minutes;
         if (reg > 1 hours) reg = 1 hours;
         assertEq(roundManager.registrationFor(n), reg / div, "R(n)");
+
+        uint64 raw = len - reg;
+        uint64 d = raw / div;
+        assertEq(roundManager.durationFor(n), d, "D(n) = L(n) - R(n)");
+        assertEq(roundManager.roundLengthFor(n), reg / div + d, "L(n), as the chain publishes it");
 
         assertEq(roundManager.lateEntryUntil(n), raw >= 1 hours ? (raw / 3) / div : 0, "late entry");
 
@@ -205,11 +208,11 @@ contract RoundPropTest is RoundTestBase {
         assertEq(roundManager.hWad(), roundManager.H_FRAC_WAD(), "H does not persist across a win");
     }
 
-    /// @dev The published raw duration: `min(15 min * 2^floor((n-1)/2), 12 h)`.
-    function _rawDurationSpec(uint256 n) internal pure returns (uint64) {
+    /// @dev The published whole round: `min(10 min * 2^floor((n-1)/2), 12 h)`.
+    function _rawRoundSpec(uint256 n) internal pure returns (uint64) {
         uint256 doublings = n <= 1 ? 0 : (n - 1) / 2;
-        if (doublings >= 6) return 12 hours;
-        uint256 d = uint256(15 minutes) << doublings;
-        return uint64(d > 12 hours ? 12 hours : d);
+        if (doublings >= 16) return 12 hours;
+        uint256 l = uint256(10 minutes) << doublings;
+        return uint64(l > 12 hours ? 12 hours : l);
     }
 }

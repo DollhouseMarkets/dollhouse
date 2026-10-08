@@ -21,69 +21,88 @@ contract ScheduleTest is RoundTestBase {
     // the schedule is a pure function of the round number
     // ---------------------------------------------------------------------------------
 
-    /// @notice The published table of sec.2, row by row, to the second.
+    /// @notice The published table of sec.2, row by row, to the second. The doubling is on the
+    /// WHOLE round `L(n)`, entries included: `R(n) = clamp(L/5, 3 min, 1 h)` and the round clock
+    /// runs `D(n) = L(n) - R(n)`.
     function test_theScheduleTableIsExact() public view {
-        uint64[14] memory d = [
-            uint64(15 minutes),
-            15 minutes,
-            30 minutes,
-            30 minutes,
-            1 hours,
-            1 hours,
-            2 hours,
-            2 hours,
-            4 hours,
-            4 hours,
-            8 hours,
-            8 hours,
+        uint64[16] memory l = [
+            uint64(10 minutes),
+            10 minutes,
+            20 minutes,
+            20 minutes,
+            40 minutes,
+            40 minutes,
+            80 minutes,
+            80 minutes,
+            160 minutes,
+            160 minutes,
+            320 minutes,
+            320 minutes,
+            640 minutes,
+            640 minutes,
             12 hours,
             12 hours
         ];
-        uint64[14] memory r = [
+        uint64[16] memory r = [
             uint64(3 minutes),
             3 minutes,
-            6 minutes,
-            6 minutes,
-            12 minutes,
-            12 minutes,
-            24 minutes,
-            24 minutes,
-            48 minutes,
-            48 minutes,
+            4 minutes,
+            4 minutes,
+            8 minutes,
+            8 minutes,
+            16 minutes,
+            16 minutes,
+            32 minutes,
+            32 minutes,
+            1 hours,
+            1 hours,
             1 hours,
             1 hours,
             1 hours,
             1 hours
         ];
-        uint64[14] memory late = [
+        uint64[16] memory late = [
             uint64(0),
             0,
             0,
             0,
-            20 minutes,
-            20 minutes,
-            40 minutes,
-            40 minutes,
-            80 minutes,
-            80 minutes,
-            160 minutes,
-            160 minutes,
-            4 hours,
-            4 hours
+            0,
+            0,
+            1280,
+            1280,
+            2560,
+            2560,
+            5200,
+            5200,
+            11_600,
+            11_600,
+            13_200,
+            13_200
         ];
-        for (uint256 n = 1; n <= 14; n++) {
-            assertEq(roundManager.durationFor(n), d[n - 1], "D(n)");
+        uint64[16] memory randomEnd =
+            [uint64(105), 105, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180];
+        for (uint256 n = 1; n <= 16; n++) {
+            assertEq(roundManager.roundLengthFor(n), l[n - 1], "L(n)");
             assertEq(roundManager.registrationFor(n), r[n - 1], "R(n)");
+            assertEq(roundManager.durationFor(n), l[n - 1] - r[n - 1], "D(n) = L(n) - R(n)");
             assertEq(roundManager.lateEntryUntil(n), late[n - 1], "late entry window");
+            assertEq(roundManager.randomEndWindowFor(n), randomEnd[n - 1], "random-end window");
         }
+        // the first two rounds: ten minutes from the first entry, seven of them on the clock
+        assertEq(roundManager.durationFor(1), 420, "D(1) = 420 s");
+        // late entry first appears on round 7, the first whose clock reaches an hour
+        assertEq(roundManager.lateEntryUntil(6), 0, "round 6: D = 32 min, no late entry");
+        assertGe(roundManager.durationFor(7), roundManager.LATE_ENTRY_FROM_S(), "round 7: D >= 1 h");
     }
 
     /// @notice The cap really is a cap: round 100 is still a 12-hour round with a 1-hour
     /// registration, and the doubling can never overflow the shift.
     function test_theScheduleIsCappedForever() public view {
-        assertEq(roundManager.durationFor(100), 12 hours, "capped duration");
+        assertEq(roundManager.roundLengthFor(100), 12 hours, "capped round");
+        assertEq(roundManager.durationFor(100), 11 hours, "capped trading");
         assertEq(roundManager.registrationFor(100), 1 hours, "capped registration");
-        assertEq(roundManager.durationFor(type(uint64).max), 12 hours, "no overflow at absurd depth");
+        assertEq(roundManager.durationFor(type(uint64).max), 11 hours, "no overflow at absurd depth");
+        assertEq(roundManager.roundLengthFor(type(uint256).max), 12 hours, "nor at the end of the type");
     }
 
     /// @notice THE CLOSING WINDOW IS FLAT: 15 minutes on every round, not a
@@ -92,13 +111,13 @@ contract ScheduleTest is RoundTestBase {
     /// support, never how that support is measured.
     function test_theClosingWindowIsFlatOnEveryRound() public view {
         assertEq(roundManager.CLOSING_WINDOW_S(), 15 minutes, "the published constant");
-        assertEq(roundManager.closingWindowFor(1), 15 minutes, "15 min round");
-        assertEq(roundManager.closingWindowFor(3), 15 minutes, "30 min round");
-        assertEq(roundManager.closingWindowFor(5), 15 minutes, "1 h round");
-        assertEq(roundManager.closingWindowFor(7), 15 minutes, "2 h round");
-        assertEq(roundManager.closingWindowFor(9), 15 minutes, "4 h round");
-        assertEq(roundManager.closingWindowFor(11), 15 minutes, "8 h round");
-        assertEq(roundManager.closingWindowFor(13), 15 minutes, "12 h round");
+        assertEq(roundManager.closingWindowFor(1), 15 minutes, "10 min round (W > D)");
+        assertEq(roundManager.closingWindowFor(3), 15 minutes, "20 min round");
+        assertEq(roundManager.closingWindowFor(5), 15 minutes, "40 min round");
+        assertEq(roundManager.closingWindowFor(7), 15 minutes, "80 min round");
+        assertEq(roundManager.closingWindowFor(9), 15 minutes, "160 min round");
+        assertEq(roundManager.closingWindowFor(11), 15 minutes, "5 h 20 min round");
+        assertEq(roundManager.closingWindowFor(15), 15 minutes, "12 h round");
         assertEq(roundManager.closingWindowFor(100), 15 minutes, "and every capped round after");
     }
 
@@ -108,7 +127,7 @@ contract ScheduleTest is RoundTestBase {
     /// scored can overwrite an entry. The ring only has to reach back `W + RANDOM_END_S`.
     function test_theScoreRingCoversTheWholeClosingWindow() public view {
         uint256 slots = hook.SCORE_COARSE_SLOTS();
-        for (uint256 n = 1; n <= 14; n++) {
+        for (uint256 n = 1; n <= 16; n++) {
             uint256 slot = roundManager.scoreSlotFor(n);
             uint256 needed = roundManager.closingWindowFor(n) + roundManager.RANDOM_END_S();
             assertGe((slots - 1) * slot, needed, "the ring reaches back over the whole scored span");
@@ -121,7 +140,7 @@ contract ScheduleTest is RoundTestBase {
     /// makes one window for everybody well defined: no candidate is ever scored over a span that
     /// starts before its own pool did.
     function test_lateEntryAlwaysEndsBeforeTheClosingWindowStarts() public view {
-        for (uint256 n = 5; n <= 20; n++) {
+        for (uint256 n = 1; n <= 20; n++) {
             uint64 late = roundManager.lateEntryUntil(n);
             if (late == 0) continue;
             uint64 windowOpens =
@@ -130,13 +149,16 @@ contract ScheduleTest is RoundTestBase {
         }
     }
 
-    /// @notice A round's stored schedule is the schedule of its own number.
+    /// @notice A round's stored schedule is the schedule of its own number, and its published
+    /// end is exactly `L(n)` after the first registration opened it.
     function test_anOpenedRoundUsesItsOwnRowOfTheTable() public {
         _registerCandidate(address(0xA11CE), "A");
         RoundManager.Round memory r = roundManager.roundInfo(2);
         assertEq(r.registrationEnd - r.openedAt, roundManager.registrationFor(2), "registration window");
         assertEq(r.nominalEnd - r.tradingStart, roundManager.durationFor(2), "trading window");
-        assertEq(r.lateEntryEnd, 0, "a 15-minute round has no late entry");
+        assertEq(r.nominalEnd - r.openedAt, roundManager.roundLengthFor(2), "nominalEnd = openedAt + L(n)");
+        assertEq(r.nominalEnd - r.openedAt, 10 minutes, "ten minutes from the first entry");
+        assertEq(r.lateEntryEnd, 0, "a 10-minute round has no late entry");
     }
 
     // ---------------------------------------------------------------------------------
@@ -157,23 +179,24 @@ contract ScheduleTest is RoundTestBase {
         factory.registerCandidate("late", "L", "", type(uint256).max);
     }
 
-    /// @notice On a one-hour round a late entrant is accepted for the first third of trading,
-    /// its pool opens at that moment, and it is refused one second after the window.
+    /// @notice On round 7 (64 minutes on the clock, the first round of an hour or more) a late
+    /// entrant is accepted for the first third of trading, its pool opens at that moment, and it is
+    /// refused one second after the window.
     function test_lateEntryIsAcceptedInTheWindowAndRefusedAfterIt() public {
-        _reachRound(5);
+        _reachRound(7);
         Cand memory early = _registerCandidate(address(0xA11CE), "A");
-        RoundManager.Round memory r = roundManager.roundInfo(5);
-        assertEq(r.lateEntryEnd, r.tradingStart + 20 minutes, "20 minutes of open entry");
+        RoundManager.Round memory r = roundManager.roundInfo(7);
+        assertEq(r.lateEntryEnd, r.tradingStart + 1280, "21 min 20 s of open entry");
 
         // trading has started and registration is closed - and a late entrant still gets in
         vm.warp(r.tradingStart + 10 minutes);
         Cand memory late = _registerCandidate(address(0xB0B), "B");
-        assertEq(roundManager.candidateInfo(late.id).roundId, 5, "same round");
+        assertEq(roundManager.candidateInfo(late.id).roundId, 7, "same round");
         assertEq(roundManager.candidateInfo(late.id).bond, roundManager.candidateInfo(early.id).bond, "same bond");
         assertEq(roundManager.candidateInfo(late.id).tradingStart, block.timestamp, "its pool opens right now");
         assertEq(hook.poolInfo(late.poolId).tradingStart, block.timestamp, "and the hook agrees");
-        // the early candidate's own window is unchanged
-        assertEq(roundManager.candidateInfo(early.id).tradingStart, r.tradingStart, "the early pool is untouched");
+        // the early candidate's own start is unchanged: the moment it registered, which opened the round
+        assertEq(roundManager.candidateInfo(early.id).tradingStart, r.openedAt, "the early pool is untouched");
 
         // ...and its pool is live immediately: no gate, its own 3-second snipe tax instead
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
@@ -194,9 +217,9 @@ contract ScheduleTest is RoundTestBase {
     /// scores the same as a coin that has been there from the start. The handicap is having less
     /// time to build that support, not a smaller number once it has.
     function test_aLateEntrantWithTheSameClosingSupportScoresTheSame() public {
-        _reachRound(5);
+        _reachRound(7);
         Cand memory early = _registerCandidate(address(0xA11CE), "A");
-        RoundManager.Round memory r = roundManager.roundInfo(5);
+        RoundManager.Round memory r = roundManager.roundInfo(7);
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
 
         vm.warp(r.tradingStart + 60);
@@ -228,7 +251,7 @@ contract ScheduleTest is RoundTestBase {
         _tradeCandidate(held, true, WINNING_BUY);
 
         // the first one is sold back well before the bell
-        vm.warp(r.nominalEnd - 10 minutes);
+        vm.warp(r.nominalEnd - 5 minutes);
         _tradeCandidate(dumped, false, bought);
 
         _settleEnd();
@@ -260,8 +283,10 @@ contract ScheduleTest is RoundTestBase {
 
         uint64 tEnd = r.nominalEnd;
         uint64 tStart = tEnd - roundManager.closingWindowFor(1);
-        // the closing window of a 15-minute round reaches back past the pool's own open, so it is
-        // floored there and the average is over the whole round
+        // the closing window of a 10-minute round reaches back past the round clock, so it is
+        // floored there, exactly as {RoundManager.submitScore} does, and the average is over the
+        // whole trading period
+        if (tStart < r.tradingStart) tStart = r.tradingStart;
         (int256 avg, uint64 attained,,) = hook.averageOver(a.poolId, tStart, tEnd);
         assertEq(attained, r.tradingStart + 30, "the last update before the bell");
         int256 expected =
@@ -323,18 +348,21 @@ contract ScheduleTest is RoundTestBase {
         roundManager.requestEnd();
     }
 
-    /// @notice The true end always falls inside the last {RANDOM_END_S} seconds, and it is
-    /// exactly `T - (word mod 180)` - so the offset is the beacon's, not anybody's choice.
+    /// @notice The true end always falls inside the round's random-end window - 105 s on the
+    /// two ten-minute rounds, {RANDOM_END_S} after them - and it is exactly
+    /// `T - (word mod window)`, so the offset is the beacon's, not anybody's choice.
     function test_theTrueEndFallsInTheLastThreeMinutes() public {
         uint256[5] memory words = [uint256(0), 1, 179, 180, type(uint256).max];
         for (uint256 i = 0; i < words.length; i++) {
             _registerCandidate(address(uint160(0xA11CE + i)), "A");
             uint256 roundId = roundManager.roundCount();
             RoundManager.Round memory r = roundManager.roundInfo(roundId);
+            uint64 window = roundManager.randomEndWindowFor(roundId);
             (uint64 tEnd, uint64 submitEnd) = _settleEndWith(words[i]);
-            assertEq(tEnd, r.nominalEnd - uint64(words[i] % roundManager.RANDOM_END_S()), "T - (r mod 180)");
+            assertEq(tEnd, r.nominalEnd - uint64(words[i] % window), "T - (r mod window)");
             assertLe(tEnd, r.nominalEnd, "never after T");
-            assertGe(tEnd, r.nominalEnd - roundManager.RANDOM_END_S(), "never more than 3 minutes before T");
+            assertGe(tEnd, r.nominalEnd - window, "never further back than the window");
+            assertLe(window, roundManager.RANDOM_END_S(), "and never more than 3 minutes before T");
             vm.warp(submitEnd);
             roundManager.finalize();
         }
@@ -439,14 +467,16 @@ contract ScheduleTest is RoundTestBase {
     // The random-end window is clamped to a quarter of the round; the closing window is flat
     // ---------------------------------------------------------------------------------
 
-    /// @notice MAINNET IS UNCHANGED. The shortest round is 15 minutes, so `D(n)/4 >= 225 s` and
-    /// the window is always the full {RoundManager.RANDOM_END_S}.
-    function test_theRandomEndWindowIsUnchangedOnTheMainnetSchedule() public view {
+    /// @notice On the mainnet schedule the quarter-duration clamp binds only on the two
+    /// ten-minute rounds: `D = 420 s`, so their end is drawn from the last 105 s. From round 3
+    /// (`D = 960 s`, `D/4 = 240 s`) the window is the full {RoundManager.RANDOM_END_S}.
+    function test_theRandomEndWindowOnTheMainnetSchedule() public view {
         assertEq(roundManager.DURATION_SCALE_DIV(), 1, "this stack runs the published schedule");
-        assertEq(roundManager.durationFor(1), 15 minutes, "the shortest round");
-        assertEq(roundManager.randomEndWindowFor(1), 180, "the window is RANDOM_END_S exactly");
-        for (uint256 n = 1; n <= 16; n++) {
-            assertEq(roundManager.randomEndWindowFor(n), roundManager.RANDOM_END_S(), "every round");
+        assertEq(roundManager.durationFor(1), 420, "the shortest trading period");
+        assertEq(roundManager.randomEndWindowFor(1), 105, "a quarter of it");
+        assertEq(roundManager.randomEndWindowFor(2), 105, "both ten-minute rounds");
+        for (uint256 n = 3; n <= 16; n++) {
+            assertEq(roundManager.randomEndWindowFor(n), roundManager.RANDOM_END_S(), "every later round");
         }
     }
 
@@ -456,10 +486,10 @@ contract ScheduleTest is RoundTestBase {
     function test_theClosingWindowIsTheSameConstantOnEveryRound() public view {
         uint64 w = roundManager.CLOSING_WINDOW_S();
         assertEq(w, 15 minutes, "the published constant");
-        assertEq(roundManager.closingWindowFor(1), w, "round 1, a 15-minute round");
-        assertEq(roundManager.closingWindowFor(5), w, "round 5, a 1-hour round");
-        assertEq(roundManager.closingWindowFor(7), w, "round 7, a 2-hour round (was 30 min)");
-        assertEq(roundManager.closingWindowFor(13), w, "round 13, a 12-hour round (was 3 h)");
+        assertEq(roundManager.closingWindowFor(1), w, "round 1, a 10-minute round");
+        assertEq(roundManager.closingWindowFor(5), w, "round 5, a 40-minute round");
+        assertEq(roundManager.closingWindowFor(7), w, "round 7, an 80-minute round");
+        assertEq(roundManager.closingWindowFor(15), w, "round 15, a 12-hour round");
     }
 
     /// @notice The hook's checkpoint rings reach back over `W + RANDOM_END_S` on every row of the
@@ -495,14 +525,15 @@ contract ScheduleScaledTest is RoundTestBase {
     }
 
     /// @notice `RANDOM_END_S` is not scaled by {RoundManager.DURATION_SCALE_DIV}, so on a divisor
-    /// of 5 the first round trades for 180 s; without a clamp the end would be drawn from a
-    /// window as long as the whole round, and `T_end` could land at `tradingStart` itself,
+    /// of 5 the first round trades for 84 s; without a clamp the end would be drawn from a
+    /// window longer than the whole round, and `T_end` could land at `tradingStart` itself,
     /// leaving nothing to score. The clamp keeps three quarters of every round unconditionally
     /// inside the round.
     function test_theRandomEndWindowIsAQuarterOfAScaledRound() public view {
         assertEq(roundManager.DURATION_SCALE_DIV(), 5, "the scaled testnet schedule");
-        assertEq(roundManager.durationFor(1), 180, "a 180-second round");
-        assertEq(roundManager.randomEndWindowFor(1), 45, "and a 45-second random-end window");
+        assertEq(roundManager.durationFor(1), 84, "an 84-second round (420 / 5)");
+        assertEq(roundManager.registrationFor(1), 36, "after a 36-second registration (180 / 5)");
+        assertEq(roundManager.randomEndWindowFor(1), 21, "and a 21-second random-end window");
         assertLt(roundManager.randomEndWindowFor(1), roundManager.RANDOM_END_S(), "clamped, not RANDOM_END_S");
     }
 
@@ -527,6 +558,23 @@ contract ScheduleScaledTest is RoundTestBase {
             assertGt(w, 0, "the modulus is defined");
             assertLe(w, roundManager.RANDOM_END_S(), "never longer than RANDOM_END_S");
             assertLe(uint256(w) * 4, roundManager.durationFor(n), "never more than a quarter of the round");
+        }
+    }
+
+    /// @notice LATE ENTRY ON A SCALED SCHEDULE. The divisor shrinks the late-entry window with
+    /// the round but never decides WHETHER a round offers one: that is read off the unscaled
+    /// `D(n)`, so late entry starts on round 7 here too, at a fifth of the mainnet length.
+    function test_lateEntryFollowsTheUnscaledRuleAtADivisor() public view {
+        for (uint256 n = 1; n <= 6; n++) {
+            assertEq(roundManager.lateEntryUntil(n), 0, "no late entry below an unscaled hour");
+        }
+        assertEq(roundManager.lateEntryUntil(7), 256, "1280 / 5");
+        assertEq(roundManager.lateEntryUntil(9), 512, "2560 / 5");
+        assertEq(roundManager.lateEntryUntil(15), 2640, "13200 / 5");
+        for (uint256 n = 7; n <= 20; n++) {
+            uint64 windowOpens =
+                roundManager.durationFor(n) - roundManager.closingWindowFor(n) - roundManager.randomEndWindowFor(n);
+            assertLt(roundManager.lateEntryUntil(n), windowOpens, "still closes before the closing window opens");
         }
     }
 }

@@ -65,7 +65,7 @@ contract MirroredTest is RoundTestBase {
 
         // CurveMath's mirrored branch: higher FDV is a HIGHER tick, so the curve sits ABOVE spot
         (CurveRange[] memory rs, uint160 initSqrt) = StandardCurve.build(
-            factory.curveSpec(), IERC20(parent).totalSupply(), FamilyToken(m.token).TOTAL_SUPPLY(), 60, true
+            factory.curveSpec(), factory.curveBasisOf(m.token), FamilyToken(m.token).TOTAL_SUPPLY(), 60, true
         );
         (uint160 spot, int24 tick,,) = im.getSlot0(m.poolId);
         assertEq(spot, initSqrt, "opened at the mirrored price");

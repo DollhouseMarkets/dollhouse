@@ -103,6 +103,10 @@ interface IFamilyHook {
     }
 
     event PoolRegistered(PoolId indexed poolId, bool isEdge, uint160 initSqrtPriceX96, uint64 tradingStart);
+    /// @notice The side-tax credit fixed at registration: which sides of the pool take this
+    /// hook's canonical settlement credit (bit 1 the child token, bit 2 the parent). Emitted for
+    /// every registered pool, zero included.
+    event CreditMaskSet(PoolId indexed poolId, uint8 mask);
     event FeeAccrued(
         PoolId indexed poolId,
         Currency indexed currency,
@@ -148,6 +152,9 @@ interface IFamilyHook {
     /// back from, so a zero or inverted end registers a pool that is frozen before it ever opens
     /// and can never be scored; see {registerPool}.
     error BadNominalEnd();
+    /// @notice Too little gas was left at {registerPool} to give a token's `isCanonicalHook` read
+    /// its full budget: registration reverts rather than leave a family token uncredited.
+    error CreditProbeGasShort();
 
     /// @notice Record a pool the factory has just created. Factory only, once per key.
     /// @dev Every pool is a round pool. `nominalEnd > tradingStart` is required of all

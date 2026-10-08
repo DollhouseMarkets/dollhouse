@@ -65,7 +65,7 @@ contract SnipeForkTest is ForkBase {
         }
         assertTrue(matched, "no twin pool with the same curve orientation");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-        (tradingStart,,) = _roundTimes(roundManager.roundCount());
+        tradingStart = _poolStart(a); // the pool's OWN start: its registration
     }
 
     /// @notice FEE-04: the tax at `t` is `SNIPE_START_PPM + (SNIPE_END_PPM - SNIPE_START_PPM) *
@@ -77,7 +77,7 @@ contract SnipeForkTest is ForkBase {
         Cand memory c2 = _registerCandidate(address(0xA11CE), "S2");
         Cand memory c3 = _registerCandidate(address(0xA11CE), "S3");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c1); // c1-c3 opened in one block
 
         assertEq(hook.SNIPE_START_PPM(), 990_000, "the window opens at 99%");
         assertEq(hook.SNIPE_END_PPM(), 10_000, "and lands at 1%");

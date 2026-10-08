@@ -39,9 +39,11 @@
 // artistVesting. `ethZap` is required only on mainnet (4663) AND only when the record also
 // carries a venue (a non-zero entrancePoolId): the Pons bonding curve has not graduated at
 // launch, so a curve-phase record has no venue, no zap and no ETH entry - a valid launch, not
-// a broken one, and the check says so and passes rather than failing on it. The rest WARN when
-// zero or missing - the legitimate but easily unnoticed "no venue behind the edge currency"
-// deployment among them.
+// a broken one, and the check says so and passes rather than failing on it. `expectedVenueId`
+// (the venue the factory's start rule may be bound to) is required on mainnet for a factory
+// with the ETH-anchored start, curve phase or not; `venueOracle` is optional until it is bound,
+// and when set it needs a non-zero expectedVenueId. The rest WARN when zero or missing - the
+// legitimate but easily unnoticed "no venue behind the edge currency" deployment among them.
 //
 // `--rpc <url>` also asks that node, for every contract address in the record, `eth_getCode`,
 // and fails on any address with no code (and on an `eth_chainId` that is not the record's).
@@ -61,6 +63,7 @@ import {
   DIRECT_READ_KEYS,
   ethZapRequired,
   flagValue,
+  expectedVenueIdRequired,
   isZeroValue,
   LAUNCH_REQUIRED_EXTRA,
   MAINNET_CHAIN_ID,
@@ -135,6 +138,7 @@ function requiredKeys(isMainnet, raw) {
     ...(isMainnet ? MAINNET_REQUIRED_EXTRA : []),
     ...(launch ? LAUNCH_REQUIRED_EXTRA : []),
     ...(launch && ethZapRequired(raw, isMainnet) ? ['ethZap'] : []),
+    ...(launch && expectedVenueIdRequired(raw, isMainnet) ? ['expectedVenueId'] : []),
   ]
 }
 /// Zero here is a legitimate deployment, not a broken record - but it is one nobody should
@@ -149,6 +153,16 @@ const OPTIONAL = [
     'keeper bounties are the proportional rate with NO floor under them',
   ],
   ['ethZap', (r) => r.ethZap, 'the site hides the ETH buy/sell option and keeps the $DOLL-only flow'],
+  [
+    'venueOracle',
+    (r) => r.venueOracle,
+    'not bound yet: every coin opens on the constant START_FALLBACK_DOLL start until script/BindOracle.s.sol binds it',
+  ],
+  [
+    'expectedVenueId',
+    (r) => r.expectedVenueId,
+    'the factory expects no venue: the ETH-anchored start can never be bound',
+  ],
   ['devVesting', (r) => r.devVesting, 'the site does not link the developer vesting wallet'],
   ['artistVesting', (r) => r.artistVesting, 'the site does not link the artist vesting wallet'],
 ]
@@ -194,10 +208,28 @@ if (record) {
         'ethZap is set but entrancePoolId is zero/missing: a zap with no venue behind it cannot swap anything',
       )
     }
+    console.log(
+      isZero(raw.venueOracle)
+        ? '  venue oracle unbound (curve phase): bind it after graduation with script/BindOracle.s.sol'
+        : shown('venueOracle', raw.venueOracle),
+    )
+  }
+  // A bound oracle is always one for the expected venue (the factory checks it on chain), so a
+  // record naming an oracle but no expected venue did not come from this deploy script.
+  if (!isZero(raw.venueOracle) && isZero(raw.expectedVenueId)) {
+    valueErrors.push('venueOracle is set but expectedVenueId is zero/missing: the factory could never have bound it')
+  }
+  // The venue the start rule binds to and the venue the site prices ETH with must be one pool.
+  if (!isZero(raw.expectedVenueId) && !isZero(raw.entrancePoolId)) {
+    if (String(raw.expectedVenueId).toLowerCase() !== String(raw.entrancePoolId).toLowerCase()) {
+      valueErrors.push(`expectedVenueId (${raw.expectedVenueId}) != entrancePoolId (${raw.entrancePoolId})`)
+    } else {
+      console.log(`${shown('expectedVenueId', raw.expectedVenueId)} (matches entrancePoolId)`)
+    }
   }
   for (const [label, get, meaning] of OPTIONAL) {
     if (required.includes(label)) continue
-    if (label === 'ethZap' && isMainnet && launch && !hasVenue) continue // said above, not warned here
+    if ((label === 'ethZap' || label === 'venueOracle') && isMainnet && launch && !hasVenue) continue // said above
     const v = get(raw)
     const why = v === undefined ? 'missing' : 'zero'
     if (isZero(v)) console.log(`  WARNING: ${label} is ${why}: ${meaning}`)

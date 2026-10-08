@@ -17,6 +17,12 @@ import {IFeeVault} from "./interfaces/IFeeVault.sol";
 import {IPriorRegistry} from "./interfaces/IPriorRegistry.sol";
 import {IVersionFactory} from "./interfaces/IVersionFactory.sol";
 
+/// @dev The two side-tax entry points of a family token this hook calls (see FamilyToken).
+interface ICanonicalCredit {
+    function creditCanonical(int256 delta) external;
+    function acceptCanonicalHook() external returns (bool);
+}
+
 /// @title FamilyHook
 /// @notice The single hook behind every pool in the family. It is the protocol's only rule
 /// engine: pools may only be created by the factory at the registered price, liquidity may only
@@ -111,6 +117,15 @@ contract FamilyHook is IHooks, IFamilyHook {
     /// whose `factory()` burns gas would make every swap of every pool of this version revert
     /// under the 63/64 rule, forever and with no way back.
     uint256 internal constant STATIC_GAS = 30_000;
+
+    /// @notice Gas given to each `acceptCanonicalHook` call at pool registration. A parent from
+    /// an earlier version answers through its successor walk (a few capped static calls per
+    /// version) and caches this stack.
+    uint256 public constant CREDIT_PROBE_GAS = 500_000;
+    /// @dev {creditMask} bits: the pool's child token, and its parent token, take this hook's
+    /// canonical settlement credit (FamilyToken.creditCanonical).
+    uint8 internal constant CREDIT_CHILD = 1;
+    uint8 internal constant CREDIT_PARENT = 2;
 
     /// @notice Number of FAST TWAP observations kept per pool, and the minimum spacing between
     /// them.
@@ -209,6 +224,12 @@ contract FamilyHook is IHooks, IFamilyHook {
     /// after `T`, so `[tState, tSwap)` covers the whole of the scored span, forever, and one
     /// write closes it for good.
     mapping(PoolId => ScoreCheckpoint) internal endSeal;
+    /// @notice THE CANONICAL CREDIT (private/V2_SIDE_TAX_DESIGN.md). Which sides of a pool this
+    /// hook mirrors every swapper delta into, as that token's transient canonical allowance
+    /// ({CREDIT_CHILD}, {CREDIT_PARENT}). Fixed at {registerPool}: a side is credited when the
+    /// token there accepts this hook (`acceptCanonicalHook()`), and the parent never on an edge
+    /// pool (the external genesis is not a family token).
+    mapping(PoolId => uint8) public creditMask;
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -273,7 +294,44 @@ contract FamilyHook is IHooks, IFamilyHook {
         p.scoreSlotS = scoreSlotS < SCORE_SLOT_S ? DEFAULT_SCORE_SLOT_S : scoreSlotS;
         // scored pools accumulate from their OWN start, not from their first swap
         p.tLast = tradingStart;
+        uint8 mask;
+        if (_acceptsCredit(parentIsCurrency0 ? key.currency1 : key.currency0)) mask = CREDIT_CHILD;
+        if (!isEdge && _acceptsCredit(parentIsCurrency0 ? key.currency0 : key.currency1)) mask |= CREDIT_PARENT;
+        if (mask != 0) creditMask[id] = mask;
         emit PoolRegistered(id, isEdge, initSqrtPriceX96, tradingStart);
+        // emitted for every pool, zero included: a family side that failed to take the credit
+        // (its every canonical sell would be taxed) is visible in the logs at registration
+        emit CreditMaskSet(id, mask);
+    }
+
+    /// @dev `currency` takes this hook's canonical credit: `acceptCanonicalHook()` answers a clean
+    /// `true` (a token of an earlier version resolves and caches this stack as its successor in
+    /// the same call). A token that does not implement it (the external genesis, a pre-side-tax
+    /// version's token) is simply not credited. The call is capped, and refused outright when the
+    /// caller left too little gas for the full cap, so a starved answer can never leave a family
+    /// token uncredited (its every canonical sell would then be taxed).
+    ///
+    /// The call copies AT MOST one word of return data (scratch space, never the free memory
+    /// pointer): a token answering with a huge return buffer cannot charge this frame for the
+    /// memory expansion of copying it. Anything but exactly 32 bytes reading 1 is "not a family
+    /// token".
+    function _acceptsCredit(Currency currency) internal returns (bool accepted) {
+        address t = Currency.unwrap(currency);
+        if (t.code.length == 0) return false;
+        uint256 g = CREDIT_PROBE_GAS;
+        if (gasleft() < g + g / 63 + 5_000) revert CreditProbeGasShort();
+        bytes4 selector = ICanonicalCredit.acceptCanonicalHook.selector;
+        assembly ("memory-safe") {
+            mstore(0, selector)
+            let ok := call(g, t, 0, 0, 4, 0, 0x20)
+            accepted := and(ok, and(eq(returndatasize(), 0x20), eq(mload(0), 1)))
+        }
+    }
+
+    /// @dev Add `delta` (the swapper's delta in `currency`, v4 sign) to that token's canonical
+    /// settlement allowance for this transaction.
+    function _credit(Currency currency, int256 delta) internal {
+        if (delta != 0) ICanonicalCredit(Currency.unwrap(currency)).creditCanonical(delta);
     }
 
     /// @inheritdoc IFamilyHook
@@ -399,6 +457,9 @@ contract FamilyHook is IHooks, IFamilyHook {
         // up exactly like the exact-output buy in {afterSwap}: the pool pays
         // `parentAmount / (1 - rate)` and the fee is `rate` of that gross, not `rate/(1 + rate)`.
         uint256 total = _collect(id, p, parent, parentAmount, exactOutput, sender, hookData);
+        // the swapper pays this fee on top of the pool's own parent delta: mirror it into the
+        // parent's canonical allowance (the pool's share follows in `afterSwap`)
+        if (creditMask[id] & CREDIT_PARENT != 0) _credit(parent, -int256(total));
         // exact-in: the fee is skimmed OFF the input by this return delta, so the pool only ever
         // sees the NET parent. v4 applies the beforeSwap delta before the pool swap, so the
         // parent delta `afterSwap` reads is already net of it — no second adjustment is needed.
@@ -447,6 +508,18 @@ contract FamilyHook is IHooks, IFamilyHook {
         // has switched a protocol fee on for this pool.
         int256 scored = -int256(parentDelta) - int256(_protocolFeeTaken(parent));
         _updateScore(id, p, scored);
+
+        // THE CANONICAL CREDIT: the swapper's final delta in each family currency of this pool
+        // (v4 subtracts the hook's own delta from the pool's), so the settle and take that
+        // follow - by any router, in any order after the swap - pass untaxed up to exactly it
+        uint8 mask = creditMask[id];
+        if (mask != 0) {
+            if (mask & CREDIT_CHILD != 0) {
+                Currency child = parentIsCurrency0 ? key.currency1 : key.currency0;
+                _credit(child, parentIsCurrency0 ? delta.amount1() : delta.amount0());
+            }
+            if (mask & CREDIT_PARENT != 0) _credit(parent, int256(parentDelta) - int256(feeDelta));
+        }
 
         return (IHooks.afterSwap.selector, feeDelta);
     }
@@ -606,33 +679,41 @@ contract FamilyHook is IHooks, IFamilyHook {
     /// @dev A GAS-CAPPED static call that may fail or answer nonsense: `address(0)` means "no
     /// answer". The cap is what makes a hostile or broken successor a non-event for traders.
     ///
-    /// The word is read RAW and validated, never `abi.decode`d. A successor that
+    /// The call copies AT MOST one word of return data (scratch space, never the free memory
+    /// pointer): a candidate answering with a huge return buffer cannot charge this frame for the
+    /// memory expansion of copying it (the same return-bomb class {_acceptsCredit} guards
+    /// against). The word is read RAW and validated, never `abi.decode`d. A successor that
     /// returns a well-formed 32-byte word with dirty upper bits (`0xdead...` in the top 96) would
     /// make `abi.decode(ret, (address))` REVERT - inside a swap, which would turn every attributed
     /// third-party route into a failing transaction. A dirty word is simply "no answer" here, and
     /// the caller caches that negative exactly as it caches a timeout.
     function _staticAddress(address target, bytes memory data) internal view returns (address) {
-        (bool ok, bytes memory ret) = target.staticcall{gas: STATIC_GAS}(data);
-        if (!ok || ret.length != 32) return address(0);
+        uint256 g = STATIC_GAS;
+        bool okWord;
         uint256 word;
         assembly ("memory-safe") {
-            word := mload(add(ret, 32))
+            let ok := staticcall(g, target, add(data, 32), mload(data), 0, 0x20)
+            okWord := and(ok, eq(returndatasize(), 0x20))
+            word := mload(0)
         }
-        if (word >> 160 != 0) return address(0); // dirty upper bits: not an address
+        if (!okWord || word >> 160 != 0) return address(0); // short answer or dirty upper bits
         return address(uint160(word));
     }
 
-    /// @dev As {_staticAddress}: a bool word that is anything other than 0 or 1 is nonsense, and
-    /// `abi.decode(ret, (bool))` would revert on it. Anything non-zero and clean is
-    /// true; anything else is "no answer", which is `false` for every caller here.
+    /// @dev As {_staticAddress}: bounded to one word of return data, and a bool word that is
+    /// anything other than 0 or 1 is nonsense, and `abi.decode(ret, (bool))` would revert on it.
+    /// Anything non-zero and clean is true; anything else is "no answer", which is `false` for
+    /// every caller here.
     function _staticBool(address target, bytes memory data) internal view returns (bool) {
-        (bool ok, bytes memory ret) = target.staticcall{gas: STATIC_GAS}(data);
-        if (!ok || ret.length != 32) return false;
+        uint256 g = STATIC_GAS;
+        bool okWord;
         uint256 word;
         assembly ("memory-safe") {
-            word := mload(add(ret, 32))
+            let ok := staticcall(g, target, add(data, 32), mload(data), 0, 0x20)
+            okWord := and(ok, eq(returndatasize(), 0x20))
+            word := mload(0)
         }
-        return word == 1;
+        return okWord && word == 1;
     }
 
     /// @dev Transient slot holding what the PoolManager had accrued in `currency` before the

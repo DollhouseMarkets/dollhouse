@@ -19,6 +19,13 @@ import {CurrencySettler} from "v4-core/test/utils/CurrencySettler.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {RoundManager} from "../contracts/RoundManager.sol";
 
+/// @dev The start of the window {RoundManager.submitScore} actually scores:
+/// `max(tEnd - W, r.tradingStart)`. On the ten-minute rounds `W > D`, so the floor binds.
+function _scoredFrom(uint64 tEnd, uint64 w, uint64 tradingStart) pure returns (uint64) {
+    uint64 from = tEnd > w ? tEnd - w : 0;
+    return from < tradingStart ? tradingStart : from;
+}
+
 /// @notice The score is the NET PARENT THAT STAYS IN THE POOL, in every one of the four
 /// swap orientations, and a fee skimmed in `beforeSwap` is counted exactly once.
 ///
@@ -143,9 +150,9 @@ contract HookScoreTest is RoundTestBase {
         _buyLink(1, 5 ether);
         Cand memory c = _registerCandidate(address(0xA11CE), "SNIPE");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c); // the pool's OWN start
 
-        // exactly at tradingStart the tax is SNIPE_START_PPM = 99%
+        // exactly at the pool's own start the tax is SNIPE_START_PPM = 99%
         vm.warp(tradingStart);
         uint256 amountIn = 1 ether; // 1e18 units of the PARENT token
         uint256 feePpm = hook.SNIPE_START_PPM() + hook.hopFeePpm();
@@ -168,7 +175,7 @@ contract HookScoreTest is RoundTestBase {
         Cand memory a = _registerCandidate(address(0xA11CE), "A");
         Cand memory b = _registerCandidate(address(0xB0B), "B");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(a); // a and b opened in one block
 
         vm.warp(tradingStart);
         _tradeCandidate(a, true, 1 ether);
@@ -239,11 +246,12 @@ contract HookScoreTest is RoundTestBase {
         _tradeCandidate(lead, true, WINNING_BUY);
         // one more buy INSIDE the closing window, so the far edge of the window is resolved by a
         // coarse checkpoint rather than by the pool's live state
-        vm.warp(nominalEnd - w / 2);
+        uint64 from = _scoredFrom(nominalEnd, w, tradingStart);
+        vm.warp(from + (nominalEnd - from) / 2);
         _tradeCandidate(lead, true, WINNING_BUY / 50);
 
         vm.warp(nominalEnd);
-        (expected,,,) = hook.averageOver(lead.poolId, nominalEnd - w, nominalEnd);
+        (expected,,,) = hook.averageOver(lead.poolId, from, nominalEnd);
         assertGt(expected, 0, "the leader has a real closing-window average");
     }
 
@@ -389,7 +397,7 @@ contract HookScoreRingFreezeTest is RoundTestBase {
         vm.warp(nominalEnd);
         _tradeCandidate(a, true, WINNING_BUY / 1000);
         uint64 w = roundManager.closingWindowFor(roundManager.roundCount());
-        (int256 expected,,,) = hook.averageOver(a.poolId, nominalEnd - w, nominalEnd);
+        (int256 expected,,,) = hook.averageOver(a.poolId, _scoredFrom(nominalEnd, w, tradingStart), nominalEnd);
 
         (uint64 tradingEnd,) = _settleEnd();
         assertEq(tradingEnd, nominalEnd, "the word is 0, so T_end is the nominal end");
@@ -427,7 +435,7 @@ contract HookScoreRingFreezeTest is RoundTestBase {
         (uint64 tradingEnd, uint64 submitEnd) = _settleEndWith(word);
         assertEq(tradingEnd, tEnd, "T_end is the coarse-slot boundary");
         uint64 w = roundManager.closingWindowFor(roundManager.roundCount());
-        (int256 expected,,,) = hook.averageOver(a.poolId, tradingEnd - w, tradingEnd);
+        (int256 expected,,,) = hook.averageOver(a.poolId, _scoredFrom(tradingEnd, w, tradingStart), tradingEnd);
 
         // one dust swap per fast slot, for the whole 180 s the fast ring covers
         for (uint256 i = 0; i <= hook.SCORE_SLOTS(); i++) {
@@ -445,7 +453,7 @@ contract HookScoreRingFreezeTest is RoundTestBase {
     /// every later slot stamped from after it, so no checkpoint brackets it once the fast ring
     /// has moved on. Round 2, because round 1's window reaches back past the pool's own open.
     function test_theFarEdgeOfTheWindowIsAlwaysResolvable() public {
-        // round 3 is the first whose trading duration (30 min) EXCEEDS the flat 15-minute closing
+        // round 3 is the first whose trading duration (16 min) EXCEEDS the flat 15-minute closing
         // window, so `T_end - W` falls strictly inside the round rather than on its own open.
         // `_setUpEdge` already ran round one, so one more round reaches it.
         _runWinningRound(1, WINNING_BUY);
@@ -518,20 +526,16 @@ contract HookScoreRingFreezeTest is RoundTestBase {
         assertEq(after2, expected, "and neither does a second one");
     }
 
-    /// @notice A pool that is registered but not yet open has no history at all. The question is
-    /// answerable without underflow, and the answer is "nothing covered".
-    function test_trailingAverageBeforeTheOpenDoesNotRevert() public {
+    /// @notice A pool at the instant it opens - its own registration, before the round clock -
+    /// has no history at all. The question is answerable without underflow, and the answer is
+    /// "nothing covered".
+    function test_trailingAverageAtTheOpenDoesNotRevert() public {
         Cand memory a = _registerCandidate(address(0xA11CE), "A");
         (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
-        assertLt(block.timestamp, tradingStart, "the pool has not opened yet");
+        assertEq(_poolStart(a), block.timestamp, "the pool opens at its registration");
+        assertLt(block.timestamp, tradingStart, "before the round clock starts");
 
         (int256 avg, uint32 covered) = hook.trailingAverage(a.poolId, 1800);
-        assertEq(avg, 0, "no average before the open");
-        assertEq(covered, 0, "and no coverage claimed");
-
-        // and at the open itself, still nothing covered rather than a revert
-        vm.warp(tradingStart);
-        (avg, covered) = hook.trailingAverage(a.poolId, 1800);
         assertEq(avg, 0, "no average at the open");
         assertEq(covered, 0, "and no coverage claimed");
     }
@@ -562,7 +566,8 @@ contract HookScoreRingFreezeTest is RoundTestBase {
         vm.warp(nominalEnd - 1);
         _tradeCandidate(a, true, WINNING_BUY / 1000);
 
-        (int256 expected,,, uint64 tEndUsed) = hook.averageOver(a.poolId, nominalEnd - w, nominalEnd);
+        (int256 expected,,, uint64 tEndUsed) =
+            hook.averageOver(a.poolId, _scoredFrom(nominalEnd, w, tradingStart), nominalEnd);
         assertEq(tEndUsed, nominalEnd, "the edge resolves at the bell exactly, off the live state");
 
         (uint64 tradingEnd, uint64 submitEnd) = _settleEnd();
@@ -577,7 +582,8 @@ contract HookScoreRingFreezeTest is RoundTestBase {
             vm.warp(block.timestamp + hook.SCORE_SLOT_S());
         }
 
-        (int256 got,,, uint64 tEndAfter) = hook.averageOver(a.poolId, nominalEnd - w, nominalEnd);
+        (int256 got,,, uint64 tEndAfter) =
+            hook.averageOver(a.poolId, _scoredFrom(nominalEnd, w, tradingStart), nominalEnd);
         assertEq(tEndAfter, nominalEnd, "the edge still resolves at the bell");
         assertEq(got, expected, "and post-reveal dust cannot select a different score");
 
@@ -658,7 +664,7 @@ contract HookScoreRingFreezeTest is RoundTestBase {
     /// nearest earlier sample. That drift is bounded by ONE COARSE SLOT - 18 s on the mainnet
     /// schedule against a 900-second window - and the instant is never later than the edge.
     function test_farEdgeDriftIsAtMostOneCoarseSlot() public {
-        // round 3 is the first whose duration (30 min) exceeds the flat 15-minute window, so the
+        // round 3 is the first whose duration (16 min) exceeds the flat 15-minute window, so the
         // far edge falls strictly inside the round rather than on the pool's own open
         _runWinningRound(1, WINNING_BUY);
         _runWinningRound(1, WINNING_BUY);

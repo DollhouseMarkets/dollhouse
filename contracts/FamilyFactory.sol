@@ -16,6 +16,9 @@ import {Locker} from "./Locker.sol";
 import {RoundManager, RoundManagerDeployer} from "./RoundManager.sol";
 import {IFeeVault} from "./interfaces/IFeeVault.sol";
 import {IFamilyHook} from "./interfaces/IFamilyHook.sol";
+import {IVenueOracle} from "./interfaces/IVenueOracle.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {FixedPoint96} from "v4-core/src/libraries/FixedPoint96.sol";
 import {StandardCurve} from "./libraries/StandardCurve.sol";
 import {FenwickRangeAdd} from "./libraries/FenwickRangeAdd.sol";
 import {V4UnlockGuard} from "./libraries/V4UnlockGuard.sol";
@@ -91,6 +94,15 @@ contract FamilyFactory {
     /// EIP-3860 limit.
     address public immutable tokenImplementation;
 
+    /// @notice Base URL every family token's on-chain metadata document
+    /// ({FamilyToken.tokenURI} / {FamilyToken.metadataURI}) is served from: the full document URL
+    /// is this string plus the token's own lowercase hex address. Set once here, at construction;
+    /// there is no setter. Not `immutable` - Solidity immutables cannot hold a dynamically-sized
+    /// type - but written exactly once and read by every clone through a view call rather than
+    /// copied into each clone's storage at `initialize` (see {FamilyToken.metadataURI} for why
+    /// that keeps per-launch gas lower).
+    string public metadataBase;
+
     /// @notice The account that deployed this factory, and the creator recorded against
     /// canonical index 0 when {wire} adopts the genesis token. Fixed at construction
     /// so that adoption has nothing left for a caller to win by front-running it.
@@ -108,6 +120,125 @@ contract FamilyFactory {
     /// creator fee attribution and for nothing else.
     address public genesisCreator;
 
+    /// @notice The parent-unit amount every candidate of a round had its launch curve built
+    /// against (the `parentSupply` argument of {StandardCurve.build}), keyed by round id. Written
+    /// by the round's FIRST registration and reused by every sibling after it, so all candidates
+    /// of one round open at the same price whatever happens to the parent in between.
+    mapping(uint256 => uint256) public roundCurveBasis;
+    /// @notice The curve basis a launched token's pool was built against. Read by the
+    /// BidDeployer and the web to rebuild a pool's launch curve exactly, instead of re-deriving
+    /// it from the parent's live supply, which drifts: {FamilyToken.burn} is permissionless.
+    mapping(address => uint256) public curveBasisOf;
+
+    // -------------------------------------------------------------------------------------
+    // the ETH-anchored start (private/V2_ORACLE_SPEC.md)
+    // -------------------------------------------------------------------------------------
+
+    /// @notice The {IVenueOracle} the start rule reads $DOLL's averaged ETH price from, or
+    /// `address(0)` until {bindVenueOracle} has run: every round then opens on
+    /// {START_FALLBACK_DOLL}, flagged. Written once, never changed after.
+    address public venueOracle;
+    /// @notice The PoolId of the ETH/$DOLL venue the start rule may be bound to (native ETH as
+    /// currency0, {GENESIS_TOKEN} as currency1, the venue's fee, spacing and hooks), fixed at
+    /// deploy from the same key the ETH zap uses. Zero: no venue, {bindVenueOracle} is dead and
+    /// every start is the constant fallback.
+    bytes32 public immutable EXPECTED_VENUE_ID;
+    /// @notice The runtime code hash of the one {VenueOracle} {bindVenueOracle} accepts: that
+    /// contract's code with its immutables (this PoolManager, {EXPECTED_VENUE_ID} and the two
+    /// pokers) filled in, computed by the deploy script. The getters alone could be answered by
+    /// any contract; the code hash cannot, so a permissionless bind cannot be won with a
+    /// look-alike that reports any price it likes.
+    bytes32 public immutable EXPECTED_ORACLE_CODEHASH;
+    /// @notice E0: the ETH market cap every candidate aims to open at, in wei.
+    uint256 public immutable START_FDV_WEI;
+    /// @notice Upper clamp: a candidate never opens above this share (bps) of its parent's cap.
+    uint256 public immutable START_MAX_PARENT_BPS;
+    /// @notice Lower clamp (WAD): a candidate never opens below this share of its parent's cap.
+    /// At the curve's `spec[0].fdvRatioLowerWad` it is exactly the old parent-relative rule.
+    uint256 public immutable START_MIN_PARENT_WAD;
+    /// @notice The $DOLL amount a start aims at when the oracle is absent, unusable or failing.
+    uint256 public immutable START_FALLBACK_DOLL;
+    /// @notice Gas forwarded to each oracle read; a read that runs out falls back, never reverts.
+    uint256 public immutable ORACLE_GAS;
+    /// @notice A chain link whose averages cover less than this opens the coin at the lower clamp.
+    uint32 public immutable START_LINK_MIN_COVER_S;
+    /// @notice The most chain links one start walks live; deeper parents rescale an anchor.
+    uint256 public immutable START_WALK_MAX;
+
+    /// @dev The two hook averages a link is priced with (the keeper path's own windows).
+    uint32 internal constant LINK_FAST_WINDOW_S = 1800;
+    uint32 internal constant LINK_SLOW_WINDOW_S = 7 days;
+
+    /// @dev {StartPriced} flag bits (also {roundStartFlags}). LOW BYTE, the factory's own:
+    ///   1   VENUE_FALLBACK    the constant {START_FALLBACK_DOLL} was used (no usable venue price)
+    ///   2   LINK_YOUNG        a chain link's averages were too short: opened at the lower clamp
+    ///   4   CLAMP_LO          raised to the lower clamp
+    ///   8   CLAMP_HI          capped at the upper clamp
+    ///   16  WALK_CAPPED       the walk started from an anchor ({START_WALK_MAX})
+    ///   32  LIMITER           the oracle's step limiter is clamping (streak > 0)
+    ///   64  ANCHOR_MISSING    no anchor deep enough: opened at the lower clamp
+    ///   128 VENUE_STALE_USED  the oracle was stale (no poke for over 30 min, under 24 h) and its
+    ///                         averages up to the last sample were used
+    /// HIGH BYTE (bits 8-15): the oracle's {IVenueOracle.startPrice} status (1 noData, 2 stale,
+    /// 4 fastShort, 8 slowShort), or 16 when there was no read: unbound, reverted, out of gas or
+    /// malformed.
+    /// FAST-ONLY (no bit of its own; the low byte is full): high byte == 8 with VENUE_FALLBACK
+    /// clear means the oracle priced from its last ten clean minutes, max(fast, slow so far),
+    /// before 24 h of slow history existed. High byte 8 with VENUE_FALLBACK set means fast-only
+    /// was refused (the constructor seed or a clamped sample lies in the last ten minutes) and
+    /// the constant was used.
+    uint16 internal constant VENUE_FALLBACK = 1;
+    uint16 internal constant LINK_YOUNG = 2;
+    uint16 internal constant CLAMP_LO = 4;
+    uint16 internal constant CLAMP_HI = 8;
+    uint16 internal constant WALK_CAPPED = 16;
+    uint16 internal constant LIMITER = 32;
+    uint16 internal constant ANCHOR_MISSING = 64;
+    uint16 internal constant VENUE_STALE_USED = 128;
+    uint8 internal constant ORACLE_FAILED = 16;
+    /// @dev The oracle's stale-only status, the one status whose price is still used.
+    uint256 internal constant ORACLE_STALE = 2;
+    /// @dev The oracle's slow-short-only status: priced (fast-only) when it carries a price.
+    uint256 internal constant ORACLE_SLOW_SHORT = 8;
+    /// @dev Gas an oracle read needs on top of {ORACLE_GAS} for the call itself (a cold account)
+    /// and the 1/64 the EVM withholds, so the callee always receives the full {ORACLE_GAS}.
+    uint256 internal constant ORACLE_CALL_OVERHEAD = 5000;
+
+    /// @notice The {StartPriced} flags of round `roundId`'s start, for readers without logs.
+    mapping(uint256 => uint16) public roundStartFlags;
+    /// @notice Walk-cap anchors: `anchorUnits[i]` units of canonical index `i` were worth
+    /// `anchorDoll[i]` $DOLL on the walk that recorded them. A parent deeper than
+    /// {START_WALK_MAX} starts from the newest anchor, rescaled to today's $DOLL target, and walks
+    /// only the links below it, so registration gas is bounded at any depth.
+    mapping(uint256 => uint256) public anchorUnits;
+    mapping(uint256 => uint256) public anchorDoll;
+    /// @notice The deepest index holding an anchor (0: none).
+    uint256 public anchorTop;
+
+    /// @notice How the ETH-anchored start is configured. See the immutables of the same names.
+    struct StartSetup {
+        bytes32 expectedVenueId;
+        bytes32 oracleCodehash;
+        uint256 fdvWei;
+        uint256 maxParentBps;
+        uint256 minParentWad;
+        uint256 fallbackDoll;
+        uint256 oracleGas;
+        uint32 linkMinCoverS;
+        uint256 walkMax;
+    }
+
+    /// @dev One start computation, before it is cached.
+    struct StartQuote {
+        uint160 sqrtP;
+        uint256 doll;
+        uint256 cap;
+        uint256 basis;
+        uint16 flags;
+        uint256 anchorIndex;
+        uint256 anchorUnits;
+    }
+
     /// @notice Canonical index 0 was adopted from an externally launched token.
     event GenesisAdopted(address indexed adopter, address indexed token, uint256 totalSupply);
     event CandidateCreated(
@@ -118,6 +249,28 @@ contract FamilyFactory {
         uint160 initSqrtPriceX96,
         bool tokenIsCurrency0
     );
+    /// @notice `token`'s launch curve was built against `basis` parent units (see {curveBasisOf}).
+    event CurveBasis(uint256 indexed roundId, address indexed token, uint256 basis);
+    /// @notice Round `roundId`'s start, priced once: venue sqrt price `sqrtP` (0 on the
+    /// fallback), $DOLL target `dollTarget`, start cap `startCap` in `parent` units after the
+    /// clamps, curve basis `basis`, and `flags` (low byte: 1 venue fallback, 2 young link,
+    /// 4 lower clamp, 8 upper clamp, 16 walk capped, 32 oracle limiter active, 64 anchor
+    /// missing, 128 stale oracle averages used; high byte: the oracle's status, 16 = no read:
+    /// unbound or failed). The layout is spelled out at {VENUE_FALLBACK}.
+    event StartPriced(
+        uint256 indexed roundId,
+        address indexed parent,
+        uint160 sqrtP,
+        uint256 dollTarget,
+        uint256 startCap,
+        uint256 basis,
+        uint16 flags
+    );
+    /// @notice A walk-cap anchor was written: `anchorUnits` units of canonical index `index` were
+    /// worth `anchorDoll` $DOLL (see {anchorUnits}). Deeper starts rescale from it.
+    event AnchorWritten(uint256 indexed index, uint256 anchorUnits, uint256 anchorDoll);
+    /// @notice The start rule now reads `oracle` (see {bindVenueOracle}). Emitted once, ever.
+    event VenueOracleBound(address indexed oracle);
 
     /// @notice Canonical index 0 has already been adopted; it can only ever happen once.
     error GenesisAlreadyAdopted();
@@ -138,6 +291,19 @@ contract FamilyFactory {
     error BadTokenImplementation();
     /// @notice A candidate cannot be registered before canonical index 0 exists.
     error GenesisNotAdopted();
+    /// @notice The {StartSetup} is inconsistent (clamps inverted or zero, no walk, a venue id
+    /// without an oracle code hash or the reverse).
+    error BadStartSetup();
+    /// @notice {bindVenueOracle} has already run; the binding is permanent.
+    error OracleAlreadyBound();
+    /// @notice The oracle offered to {bindVenueOracle} is not the expected {VenueOracle} on the
+    /// expected venue and PoolManager (or this deployment has no venue).
+    error BadVenueOracle();
+    /// @notice Too little gas is left to give an oracle read its full {ORACLE_GAS}: the call
+    /// reverts rather than let a starved read fall back silently.
+    error OracleGasShort();
+    /// @notice {quoteStart} was asked about a token that is not on the canonical chain.
+    error NotCanonical();
 
     /// @notice How the RoundManager is built. `deployer` is the {RoundManagerDeployer} this
     /// factory CREATEs it through - kept out of this factory's own init code for EIP-3860. The
@@ -167,8 +333,26 @@ contract FamilyFactory {
         CurveSegment[] memory _standardCurve,
         bytes32 _hookSalt,
         address _tokenImplementation,
-        RoundSetup memory _roundSetup
+        string memory _metadataBase,
+        RoundSetup memory _roundSetup,
+        StartSetup memory _startSetup
     ) {
+        // the clamps must bracket a non-empty band, and the walk must take at least one link
+        if (
+            (_startSetup.expectedVenueId == bytes32(0)) != (_startSetup.oracleCodehash == bytes32(0))
+                || _startSetup.fdvWei == 0 || _startSetup.fdvWei > type(uint96).max || _startSetup.maxParentBps == 0
+                || _startSetup.maxParentBps > BPS || _startSetup.minParentWad == 0
+                || _startSetup.minParentWad * BPS > _startSetup.maxParentBps * 1e18 || _startSetup.walkMax == 0
+        ) revert BadStartSetup();
+        EXPECTED_VENUE_ID = _startSetup.expectedVenueId;
+        EXPECTED_ORACLE_CODEHASH = _startSetup.oracleCodehash;
+        START_FDV_WEI = _startSetup.fdvWei;
+        START_MAX_PARENT_BPS = _startSetup.maxParentBps;
+        START_MIN_PARENT_WAD = _startSetup.minParentWad;
+        START_FALLBACK_DOLL = _startSetup.fallbackDoll;
+        ORACLE_GAS = _startSetup.oracleGas;
+        START_LINK_MIN_COVER_S = _startSetup.linkMinCoverS;
+        START_WALK_MAX = _startSetup.walkMax;
         // the edge currency must at least be a contract at construction time; its decimals and
         // supply are checked when it is adopted, which is the moment the chain starts
         if (_genesisToken == address(0) || _genesisToken.code.length == 0) revert BadGenesisToken();
@@ -176,6 +360,7 @@ contract FamilyFactory {
         DEPLOYER = msg.sender;
         if (FamilyToken(_tokenImplementation).factory() != address(this)) revert BadTokenImplementation();
         tokenImplementation = _tokenImplementation;
+        metadataBase = _metadataBase;
         StandardCurve.validate(_standardCurve);
         for (uint256 i = 0; i < _standardCurve.length; i++) {
             _curveSpec.push(_standardCurve[i]);
@@ -188,6 +373,14 @@ contract FamilyFactory {
         hook = new FamilyHook{salt: _hookSalt}(
             _poolManager, address(this), address(locker), _feeVault, _router, _hopFeePpm
         );
+        // the venue lock trusts the implementation's immutables: they must be exactly this stack
+        {
+            FamilyToken impl = FamilyToken(_tokenImplementation);
+            if (
+                impl.HOOK() != address(hook) || impl.LOCKER() != address(locker) || impl.FEE_VAULT() != _feeVault
+                    || impl.POOL_MANAGER() != address(_poolManager)
+            ) revert BadTokenImplementation();
+        }
         priorRegistry = _priorRegistry;
         roundManagerDeployer = _roundSetup.deployer;
         roundManager = RoundManagerDeployer(_roundSetup.deployer)
@@ -265,14 +458,45 @@ contract FamilyFactory {
         emit GenesisAdopted(DEPLOYER, token, supply);
     }
 
+    /// @notice ONE-SHOT, OWNERLESS BIND of the venue oracle the start rule reads. The stack may
+    /// deploy before $DOLL's venue exists (its bonding curve has not graduated), so the oracle
+    /// cannot be a constructor argument; it is bound here, by anyone, exactly once. Only the
+    /// oracle fixed at deploy passes: its runtime code must hash to {EXPECTED_ORACLE_CODEHASH}
+    /// (the {VenueOracle} code with this PoolManager, the expected venue and the two pokers
+    /// baked in), and it must report {EXPECTED_VENUE_ID} and this {poolManager}. That it has code
+    /// at all proves its constructor's venue checks passed (initialised, in-range liquidity).
+    /// Until bound, every start is the constant fallback, flagged. A fresh bind keeps the fallback
+    /// until the oracle has ten clean minutes (fast-only, status 8: no seed or clamped sample in
+    /// the 10 min window); it needs 24 h of slow history for status 0.
+    function bindVenueOracle(address oracle) external {
+        if (venueOracle != address(0)) revert OracleAlreadyBound();
+        bytes32 expected = EXPECTED_VENUE_ID;
+        if (
+            expected == bytes32(0) || oracle.codehash != EXPECTED_ORACLE_CODEHASH
+                || PoolId.unwrap(IVenueOracle(oracle).venueId()) != expected
+                || address(IVenueOracle(oracle).poolManager()) != address(poolManager)
+        ) revert BadVenueOracle();
+        venueOracle = oracle;
+        emit VenueOracleBound(oracle);
+    }
+
     /// @notice The deploy-constant standard curve every candidate is launched on.
     function curveSpec() public view returns (CurveSegment[] memory) {
         return _curveSpec;
     }
 
-    /// @notice The starting FDV, in parent units, of a candidate launched against `parentSupply`.
+    /// @notice The starting FDV, in parent units, of a candidate launched against a curve basis of
+    /// `parentSupply`. A pure function of the argument: it does NOT say what a given token opened
+    /// at - a candidate's basis is fixed per round (see {roundCurveBasis}) and the parent's live
+    /// supply can drift away from it. Prefer {startFdvOf} for a launched token.
     function startFdv(uint256 parentSupply) external view returns (uint256) {
         return StandardCurve.startFdv(_curveSpec, parentSupply);
+    }
+
+    /// @notice The starting FDV, in parent units, `token`'s pool was launched at, from its stored
+    /// {curveBasisOf}. Zero for an address this factory never launched.
+    function startFdvOf(address token) external view returns (uint256) {
+        return StandardCurve.startFdv(_curveSpec, curveBasisOf[token]);
     }
 
     /// @notice The one and only genesis token of the trunk this factory is part of. For a
@@ -288,9 +512,11 @@ contract FamilyFactory {
     /// factory for it first.
     ///
     /// The candidate is quoted in the CURRENT HEAD token, gets the identical {StandardCurve}
-    /// starting at `START_RATIO` of the head's supply, and its pool is gated by the hook until
-    /// the round's synchronized `tradingStart`. The child token's address may sort either side
-    /// of its parent, so both curve orientations are supported.
+    /// starting at `START_RATIO` of the head's supply, and its pool trades from the moment it is
+    /// created (its own 3-second snipe tax runs from that moment); the round clock still starts at
+    /// the round's `tradingStart`, which is what every candidate is scored from. The child
+    /// token's address may sort either side of its parent, so both curve orientations are
+    /// supported.
     ///
     /// @dev No longer `payable`. The bond is an ERC-20 transfer of the edge currency,
     /// pulled from `msg.sender` here and forwarded to the RoundManager in the same call, so the
@@ -339,9 +565,12 @@ contract FamilyFactory {
         });
 
         // a candidate sells its WHOLE supply: `saleSupply == tokenSupply`, no allocation
+        uint256 basis = _curveBasis(roundId, parent);
+        curveBasisOf[token] = basis;
+        emit CurveBasis(roundId, token, basis);
         (CurveRange[] memory ranges, uint160 initSqrtPriceX96) = StandardCurve.build(
             curveSpec(),
-            IERC20(parent).totalSupply(),
+            basis,
             FAMILY_TOTAL_SUPPLY,
             FAMILY_TOTAL_SUPPLY,
             TICK_SPACING,
@@ -365,5 +594,194 @@ contract FamilyFactory {
         candidateId = roundManager.addCandidate(roundId, token, key, msg.sender, bondAmount);
 
         emit CandidateCreated(roundId, candidateId, token, key.toId(), initSqrtPriceX96, tokenIsCurrency0);
+    }
+
+    /// @notice The start round `parent`'s next candidates would open at if the round were
+    /// priced right now: the start cap `startCap` in `parent` units after the clamps, the curve
+    /// basis `basis` and the {StartPriced} `flags`. A view of the rule {registerCandidate}
+    /// applies once per round; the cached figure for an open round is {roundCurveBasis}.
+    function quoteStart(address parent) external view returns (uint256 startCap, uint256 basis, uint16 flags) {
+        if (!roundManager.isCanonical(parent)) revert NotCanonical();
+        StartQuote memory q = _quoteStart(roundManager.indexOf(parent), parent);
+        return (q.cap, q.basis, q.flags);
+    }
+
+    /// @dev The curve basis of round `roundId`, whose candidates are quoted in `parent`: computed
+    /// by the round's first registration ({_quoteStart}), cached in {roundCurveBasis}, and
+    /// returned unchanged to every sibling after it, so all of them open at one price whatever
+    /// the venue, the chain or the parent's supply does in between.
+    function _curveBasis(uint256 roundId, address parent) internal returns (uint256 basis) {
+        basis = roundCurveBasis[roundId];
+        if (basis != 0) return basis;
+        StartQuote memory q = _quoteStart(roundManager.roundInfo(roundId).parentIndex, parent);
+        if (q.anchorIndex != 0 && q.anchorUnits != 0) {
+            anchorUnits[q.anchorIndex] = q.anchorUnits;
+            anchorDoll[q.anchorIndex] = q.doll;
+            if (q.anchorIndex > anchorTop) anchorTop = q.anchorIndex;
+            emit AnchorWritten(q.anchorIndex, q.anchorUnits, q.doll);
+        }
+        basis = q.basis;
+        roundCurveBasis[roundId] = basis;
+        roundStartFlags[roundId] = q.flags;
+        emit StartPriced(roundId, parent, q.sqrtP, q.doll, q.cap, basis, q.flags);
+    }
+
+    /// @dev THE START RULE. `D` = E0 in $DOLL at the venue's averaged price (or the constant
+    /// fallback), walked down the chain into parent units (`p` = the parent's canonical index),
+    /// clamped to [Y, X] of the parent's supply, and turned into the curve basis whose first
+    /// range starts exactly at that cap. Never zero: the lower clamp is at least one unit.
+    function _quoteStart(uint256 p, address parent) internal view returns (StartQuote memory q) {
+        uint256 status;
+        uint256 streak;
+        (q.sqrtP, status, streak) = _venueStart();
+        q.flags = uint16(status << 8);
+        if (streak != 0) q.flags |= LIMITER;
+        // stale only, with a price: the oracle's averages up to its last sample (under 24 h old)
+        bool staleUsed = status == ORACLE_STALE && q.sqrtP != 0;
+        if (staleUsed) q.flags |= VENUE_STALE_USED;
+        // slow-short only, with a price: the oracle's last ten clean minutes, max with slow so far
+        bool fastOnly = status == ORACLE_SLOW_SHORT && q.sqrtP != 0;
+        if (status != 0 && !staleUsed && !fastOnly) {
+            q.flags |= VENUE_FALLBACK;
+            q.sqrtP = 0;
+            q.doll = START_FALLBACK_DOLL;
+        } else {
+            q.doll =
+                FullMath.mulDiv(FullMath.mulDiv(START_FDV_WEI, q.sqrtP, FixedPoint96.Q96), q.sqrtP, FixedPoint96.Q96);
+        }
+
+        uint256 a = q.doll;
+        if (a != 0 && p != 0) {
+            uint16 walkFlags;
+            (a, walkFlags, q.anchorIndex, q.anchorUnits) = _walkToParent(p, a);
+            q.flags |= walkFlags;
+        }
+
+        uint256 supply = IERC20(parent).totalSupply();
+        uint256 lo = FullMath.mulDiv(supply, START_MIN_PARENT_WAD, 1e18);
+        uint256 hi = FullMath.mulDiv(supply, START_MAX_PARENT_BPS, BPS);
+        if (a < lo) {
+            a = lo;
+            q.flags |= CLAMP_LO;
+        } else if (a > hi) {
+            a = hi;
+            q.flags |= CLAMP_HI;
+        }
+        if (a == 0) a = 1;
+        q.cap = a;
+        q.basis = FullMath.mulDiv(a, 1e18, _curveSpec[0].fdvRatioLowerWad);
+        if (q.basis == 0) q.basis = 1;
+    }
+
+    /// @dev The venue's start price and status, read with {ORACLE_GAS} per call and decoded by
+    /// hand, so a reverting, gas-burning, code-less or malformed oracle is a status of
+    /// {ORACLE_FAILED} and never a revert; so is an unbound one. `streak` is the oracle's current
+    /// clamped streak, read through {IVenueOracle.latest} in the same guarded section: if either
+    /// read fails, both do. A caller that leaves too little gas for a full read gets a revert
+    /// ({OracleGasShort}), never a silent fallback.
+    function _venueStart() internal view returns (uint160 sqrtP, uint256 status, uint256 streak) {
+        address o = venueOracle;
+        if (o == address(0)) return (0, ORACLE_FAILED, 0);
+        (bool ok, uint256 w0, uint256 w1,) = _oracleCall(o, IVenueOracle.startPrice.selector, 64);
+        if (!ok || w0 > type(uint160).max || w1 > type(uint8).max || (w1 == 0 && w0 == 0)) {
+            return (0, ORACLE_FAILED, 0);
+        }
+        (bool ok2,,, uint256 s) = _oracleCall(o, IVenueOracle.latest.selector, 96);
+        if (!ok2 || s > type(uint32).max) return (0, ORACLE_FAILED, 0);
+        return (uint160(w0), w1, s);
+    }
+
+    /// @dev A gas-capped staticcall copying at most three return words (no return-data bomb);
+    /// `ok` is false on a revert or when fewer than `minLen` bytes came back.
+    function _oracleCall(address o, bytes4 selector, uint256 minLen)
+        internal
+        view
+        returns (bool ok, uint256 w0, uint256 w1, uint256 w2)
+    {
+        uint256 g = ORACLE_GAS;
+        // the EVM forwards at most 63/64 of what is left: below this the callee could get less
+        // than `g`, run out, and turn a caller's gas limit into a chosen fallback
+        if (gasleft() < g + g / 63 + ORACLE_CALL_OVERHEAD) revert OracleGasShort();
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            ok := staticcall(g, o, ptr, 4, ptr, 0x60)
+            if lt(returndatasize(), minLen) { ok := 0 }
+            w0 := mload(ptr)
+            w1 := mload(add(ptr, 0x20))
+            w2 := mload(add(ptr, 0x40))
+        }
+    }
+
+    /// @dev `doll` $DOLL in units of canonical index `p`, walked link by link with
+    /// {_startLinkPrice}. At most {START_WALK_MAX} links are walked: a deeper parent starts from
+    /// the newest anchor (rescaled to `doll`); if that anchor is too shallow, the walk covers the
+    /// next {START_WALK_MAX} links only to record a deeper anchor and the coin opens at the lower
+    /// clamp ({ANCHOR_MISSING}). A young link returns 0 (the lower clamp, {LINK_YOUNG}); an
+    /// amount that would overflow returns the maximum (the upper clamp).
+    function _walkToParent(uint256 p, uint256 doll)
+        internal
+        view
+        returns (uint256 amount, uint16 flags, uint256 anchorIndex, uint256 anchorAmount)
+    {
+        uint256 k = START_WALK_MAX;
+        uint256 from;
+        uint256 stop = p;
+        // the index the NEXT round's walk will start from: it keeps that walk within the cap
+        uint256 target = p + 1 > k ? p + 1 - k : 0;
+        amount = doll;
+        if (p > k) {
+            flags = WALK_CAPPED;
+            from = anchorTop;
+            if (from != 0) amount = _scale(anchorUnits[from], doll, anchorDoll[from]);
+            if (from + k < p) {
+                flags |= ANCHOR_MISSING;
+                stop = from + k;
+                target = stop;
+            }
+        }
+        address prev = roundManager.canonical(from);
+        for (uint256 i = from + 1; i <= stop; ++i) {
+            (uint160 price, bool parentIsCurrency0, address child) = _startLinkPrice(i, prev);
+            if (price == 0) return (0, flags | LINK_YOUNG, anchorIndex, anchorAmount);
+            amount = parentIsCurrency0
+                ? _scale(_scale(amount, price, FixedPoint96.Q96), price, FixedPoint96.Q96)
+                : _scale(_scale(amount, FixedPoint96.Q96, price), FixedPoint96.Q96, price);
+            if (amount == type(uint256).max) return (amount, flags, anchorIndex, anchorAmount);
+            if (i == target) (anchorIndex, anchorAmount) = (i, amount);
+            prev = child;
+        }
+        if (flags & ANCHOR_MISSING != 0) amount = 0;
+    }
+
+    /// @dev Link `k`'s price for a start: the more conservative of its hook's fast (1800 s) and
+    /// slow (7 d) averages - the one valuing the link LOWEST, which opens the coin dearer - with
+    /// no spot read. Zero when either average covers less than {START_LINK_MIN_COVER_S}.
+    /// `parent` is canonical `k - 1`; `child` (canonical `k`) is returned for the next step.
+    function _startLinkPrice(uint256 k, address parent)
+        internal
+        view
+        returns (uint160 price, bool parentIsCurrency0, address child)
+    {
+        PoolKey memory key = roundManager.poolKeyOf(k);
+        parentIsCurrency0 = Currency.unwrap(key.currency0) == parent;
+        child = Currency.unwrap(parentIsCurrency0 ? key.currency1 : key.currency0);
+        if (address(key.hooks) == address(0)) return (0, parentIsCurrency0, child);
+        FamilyHook h = FamilyHook(address(key.hooks));
+        PoolId id = key.toId();
+        (uint160 fast, uint32 fastCovered) = h.consult(id, LINK_FAST_WINDOW_S);
+        (uint160 slow, uint32 slowCovered) = h.consultSlow(id, LINK_SLOW_WINDOW_S);
+        uint32 minCover = START_LINK_MIN_COVER_S;
+        if (fastCovered < minCover || slowCovered < minCover || fast == 0 || slow == 0) {
+            return (0, parentIsCurrency0, child);
+        }
+        price = parentIsCurrency0 ? (fast > slow ? fast : slow) : (fast < slow ? fast : slow);
+    }
+
+    /// @dev `x * num / den`, saturating at the maximum instead of reverting on overflow.
+    function _scale(uint256 x, uint256 num, uint256 den) internal pure returns (uint256) {
+        if (x == type(uint256).max) return x;
+        if (num > den && x > FullMath.mulDiv(type(uint256).max, den, num)) return type(uint256).max;
+        return FullMath.mulDiv(x, num, den);
     }
 }

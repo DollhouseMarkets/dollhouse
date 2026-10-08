@@ -72,7 +72,7 @@ contract ScorePropTest is RoundTestBase {
         uint256 amount = bound(amountSeed, 1e18, 200_000e18);
 
         Cand memory c = _registerCandidate(address(0xA11CE), "S");
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c); // the pool's OWN start: its registration
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
         vm.warp(tradingStart + dt);
 
@@ -91,11 +91,13 @@ contract ScorePropTest is RoundTestBase {
     /// `(acc(t1) - acc(t0))/(t1 - t0)` computed from the exact swap history.
     /// @dev The ring freeze is UNIVERSAL - every pool has a published end and stops
     /// accumulating at it - so the window this property is about is the one a LIVE round
-    /// measures, on a candidate pool inside its own trading span. Round three is the first that
-    /// is 30 minutes long, which comfortably holds the history below.
+    /// measures, on a candidate pool inside its own trading span. Round five is the first whose
+    /// trading (32 minutes) comfortably holds the up-to-1310-second history below.
     function testFuzz_SCR04_averageOverIsExact(uint256[4] memory amounts, uint256[4] memory gaps, uint256 windowSeed)
         public
     {
+        _runWinningRound(1, WINNING_BUY);
+        _runWinningRound(1, WINNING_BUY);
         _runWinningRound(1, WINNING_BUY);
         Cand memory c = _registerCandidate(address(0xA11CE), "SCR");
         (uint64 tradingStart, uint64 nominalEnd,) = _roundTimes(roundManager.roundCount());
@@ -171,11 +173,14 @@ contract ScorePropTest is RoundTestBase {
     function testFuzz_SCR09_supportSoldBeforeTheWindowDoesNotCount(uint256 amountSeed) public {
         uint256 amount = bound(amountSeed, 100_000e18, 4_000_000e18);
 
-        // a round long enough to HAVE a before-the-window: the closing window is 15 minutes and
-        // rounds 1 and 2 are 15 minutes long, so the window would cover the whole round
+        // a round long enough to HAVE a before-the-window: the closing window is 15 minutes,
+        // rounds 1 and 2 trade for 7 minutes (the window covers the whole round) and rounds 3 and 4
+        // for 16 (it opens a minute in); round 5 trades for 32
         _runWinningRound(1, WINNING_BUY);
         _runWinningRound(1, WINNING_BUY);
-        assertGt(roundManager.durationFor(3), roundManager.closingWindowFor(3), "round 3 is longer than its window");
+        _runWinningRound(1, WINNING_BUY);
+        _runWinningRound(1, WINNING_BUY);
+        assertGt(roundManager.durationFor(5), roundManager.closingWindowFor(5), "round 5 is longer than its window");
 
         Cand memory c = _registerCandidate(address(0xA11CE), "S");
         (uint64 tradingStart, uint64 nominalEnd,) = _roundTimes(roundManager.roundCount());

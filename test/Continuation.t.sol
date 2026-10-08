@@ -809,6 +809,46 @@ contract ContinuationTest is RoundTestBase {
         _assertVaultSolvent(v1.vault);
     }
 
+    /// @notice A successor whose `factory()` answers with a return-bomb (a huge, well-formed
+    /// return buffer) instead of a clean word must cost the swap no more than an ordinary broken
+    /// successor does, and must never be mistaken for a real answer. {FamilyHook._staticAddress}
+    /// copies AT MOST one word into scratch space, capped at {FamilyHook.STATIC_GAS} gas - the
+    /// same return-bomb class {FamilyHook._acceptsCredit} already guards against.
+    function test_returnBombSuccessorIsTreatedAsNoAnswerNotAnOutOfGas() public {
+        // baseline: one swap before any sunset is announced, so `_successorRouter` short-circuits
+        // on the cached `address(0)` and does no static call at all
+        uint256 gBaseline = gasleft();
+        v1.router.buyExactIn(1, 1 ether, 0, address(this), 2);
+        uint256 gasUsedBaseline = gBaseline - gasleft();
+
+        // a hostile "successor" whose `factory()` tries to return a MEGABYTE instead of an
+        // address: `rm.successor()` (a real, trusted call on v1's own RoundManager) resolves to
+        // this contract, and `_staticAddress(bomb, factory())` is the untrusted leg
+        address bomb = address(new BombFactory());
+        vm.prank(STEWARD);
+        v1.roundManager.announceSunset(bomb);
+        vm.warp(v1.roundManager.sunsetAt());
+
+        uint256 before = v1.vault.devBalance();
+        uint256 g = gasleft();
+        uint256 out = v1.router.buyExactIn(1, 1 ether, 0, address(this), 2);
+        uint256 gasUsed = g - gasleft();
+        assertGt(out, 0, "the swap went through anyway - a megabyte answer is not a family token");
+        uint256 fee = 1 ether / 100;
+        assertEq(v1.vault.devBalance(), before, "nothing was booked here");
+        assertEq(v1.vault.pendingForward(1), fee, "queued unattributed, exactly as a broken successor");
+        assertTrue(v1.vault.forwardingFailed(), "the negative resolution is cached");
+        // the return-bomb attempt costs no more than two failed/short STATIC_GAS-capped probes
+        // on top of the baseline: the probe is bounded regardless of how much the callee tries
+        // to return, never the multi-megagas a naive `staticcall(...)` copy would risk
+        uint256 staticGas = 30_000; // FamilyHook.STATIC_GAS, mirrored here (internal, not exposed)
+        assertLt(
+            gasUsed,
+            gasUsedBaseline + 2 * staticGas + 50_000,
+            "a megabyte return did not inflate the swap's gas beyond two bounded probes"
+        );
+    }
+
     /// @notice {accrueForwarded} is not an open door: only a vault in this version's own prior
     /// chain may book a forwarded fee, and {forwardProtocolFee} is callable only by the vault
     /// itself.
@@ -992,6 +1032,19 @@ contract ContinuationAttributionTest is RoundTestBase {
 contract NotAStack {
     function ping() external pure returns (bool) {
         return true;
+    }
+}
+
+/// @dev A hostile "successor" whose `factory()` answers with a return-bomb: a MEGABYTE return
+/// buffer instead of a clean 32-byte address. `FamilyHook._staticAddress` calls it with only
+/// `STATIC_GAS` (30,000) forwarded, so the attempt can never complete (building and returning a
+/// megabyte costs orders of magnitude more gas than that), and the probe must fail exactly as an
+/// ordinary reverting or code-less successor does - bounded, and never mistaken for a real answer.
+contract BombFactory {
+    function factory() external pure returns (address) {
+        assembly {
+            return(0, 1000000)
+        }
     }
 }
 

@@ -56,11 +56,17 @@ contract RoundTest is RoundTestBase {
         assertEq(r.candidateCount, 3);
         assertEq(r.parentToken, address(token), "candidates are quoted in the head");
         assertEq(r.hUsed, (token.totalSupply() * H_FRAC_WAD) / 1e18, "H is a fraction of the parent supply");
-        assertEq(r.nominalEnd - r.tradingStart, roundManager.durationFor(2), "15 minute trading window");
+        assertEq(r.nominalEnd - r.tradingStart, roundManager.durationFor(2), "the trading window of round two");
 
         // the curve starts at START_RATIO of the parent supply, in parent units
         // (within one tick spacing: the curve bounds are snapped to the pool's tick grid)
-        uint256 expectedFdv = factory.startFdv(token.totalSupply());
+        assertEq(
+            factory.curveBasisOf(a.token),
+            _lowerClampBasis(token.totalSupply()),
+            "the basis is the parent supply at registration (lower clamp, 1000-wei floor)"
+        );
+        uint256 expectedFdv = factory.startFdvOf(a.token);
+        assertEq(expectedFdv, factory.startFdv(token.totalSupply()), "startFdvOf agrees with startFdv");
         (uint160 sqrtP,,,) = im.getSlot0(a.poolId);
         uint256 fdv = CurveMath.fdvAtSqrtPrice(sqrtP, SUPPLY, a.tokenIsCurrency0);
         assertApproxEqRel(fdv, expectedFdv, 1e16, "start FDV = START_RATIO x parent supply");
@@ -72,36 +78,49 @@ contract RoundTest is RoundTestBase {
         factory.registerCandidate("late", "L", "", type(uint256).max);
     }
 
-    function test_candidatePoolIsGatedUntilTradingStart() public {
-        Cand memory a = _registerCandidate(address(0xA11CE), "A");
-        IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-
-        _expectHookRevert(address(hook), IHooks.beforeSwap.selector, IFamilyHook.TradingNotStarted.selector);
-        _tradeCandidate(a, true, 1e18);
-
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
-        vm.warp(tradingStart - 1);
-        _expectHookRevert(address(hook), IHooks.beforeSwap.selector, IFamilyHook.TradingNotStarted.selector);
-        _tradeCandidate(a, true, 1e18);
-
-        vm.warp(tradingStart);
-        assertGt(_tradeCandidate(a, true, 1e18), 0, "trading opens exactly at tradingStart");
-    }
-
-    /// @notice The snipe tax takes 99% -> 1% of the parent side over the first 3 seconds. Two
-    /// candidates in the same round have identical curves, so the same buy at +1 s and at +4 s is
-    /// a like-for-like comparison.
-    function test_snipeTaxBitesAtOneSecondButNotAtFour() public {
+    /// @notice INSTANT TRADING: a candidate's pool opens at its own registration, before the
+    /// round clock starts. The first block pays its own 99% snipe tax; three seconds later the
+    /// same buy is untaxed.
+    function test_candidatePoolTradesAtItsOwnRegistration() public {
         Cand memory a = _registerCandidate(address(0xA11CE), "A");
         Cand memory b = _registerCandidate(address(0xB0B), "B");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
+        uint64 t0 = uint64(vm.getBlockTimestamp());
         (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        assertEq(roundManager.candidateInfo(a.id).tradingStart, t0, "the pool opens at its registration");
+        assertEq(hook.poolInfo(a.poolId).tradingStart, t0, "and the hook gate agrees");
+        assertLt(t0, tradingStart, "before the round clock starts");
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Registration));
+
+        uint256 buy = 1_000e18;
+        uint256 outTaxed = _tradeCandidate(a, true, buy); // t + 0: 99%
+        assertGt(outTaxed, 0, "trades in its registration block");
+
+        vm.warp(t0 + 3);
+        uint256 outFree = _tradeCandidate(b, true, buy); // t + 3: no tax
+        assertLt(outTaxed, (outFree * 200) / 10_000, "99% of the parent side is taxed at t + 0");
+        // what survives the parent side: 1 - 99% - 0.1% hop at +0, against 1 - 0.1% hop at +3
+        assertApproxEqRel(outTaxed, (outFree * 9_000) / 999_000, 2e16, "the 99% tax runs from its own registration");
+    }
+
+    /// @notice The snipe tax takes 99% -> 1% of the parent side over the first 3 seconds of EACH
+    /// pool's own life. B registers a minute after A; each is bought at its own +1 s and +4 s.
+    /// Candidates in the same round have identical curves, so it is a like-for-like comparison.
+    function test_snipeTaxBitesAtOneSecondButNotAtFour() public {
+        Cand memory a = _registerCandidate(address(0xA11CE), "A");
+        uint64 startA = uint64(vm.getBlockTimestamp());
+        IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
 
         uint256 buy = 1_000e18; // small enough that price impact does not blur the comparison
-        vm.warp(tradingStart + 1);
+        vm.warp(startA + 1);
         uint256 outEarly = _tradeCandidate(a, true, buy);
 
-        vm.warp(tradingStart + 4);
+        vm.warp(startA + 60);
+        Cand memory b = _registerCandidate(address(0xB0B), "B");
+        uint64 startB = uint64(vm.getBlockTimestamp());
+        assertEq(roundManager.candidateInfo(b.id).tradingStart, startB, "B's pool opens at ITS registration");
+
+        vm.warp(startB + 4);
         uint256 outLate = _tradeCandidate(b, true, buy);
 
         // at +1 s the tax is 100 + 9800 * 2/3 = 6633 bps, at +4 s it is zero
@@ -122,7 +141,8 @@ contract RoundTest is RoundTestBase {
     // ---------------------------------------------------------------------------------
 
     /// @notice A low score submitted first cannot exclude a better candidate,
-    /// because `finalize()` only runs after the whole submission window.
+    /// because `finalize()` only runs once EVERY candidate has submitted or the whole
+    /// submission window has passed.
     function test_submitOrderingAttackCannotWin() public {
         Cand memory strong = _registerCandidate(address(0xA11CE), "STRONG");
         Cand memory weak = _registerCandidate(address(0xB0B), "WEAK");
@@ -173,7 +193,11 @@ contract RoundTest is RoundTestBase {
             2e16,
             "tail extension over the window less the 100 s before the buy"
         );
-        (int256 avgAtEnd, uint64 attained,,) = hook.averageOver(a.poolId, tradingEnd - roundManager.closingWindowFor(2), tradingEnd);
+        // the window {RoundManager.submitScore} scores, `max(T_end - W, r.tradingStart)`: on a
+        // ten-minute round W > D, so it is the whole of trading
+        uint64 from = tradingEnd - roundManager.closingWindowFor(2);
+        if (from < tradingStart) from = tradingStart;
+        (int256 avgAtEnd, uint64 attained,,) = hook.averageOver(a.poolId, from, tradingEnd);
         assertEq(avgAtEnd, expected, "averageOver reproduces the tail extension exactly");
         assertEq(attained, tradingStart + 100, "tFirstAttained is the last update before T_end");
 
@@ -186,10 +210,10 @@ contract RoundTest is RoundTestBase {
         assertTrue(accAfter != acc, "and it really moved");
 
         // ...and the reconstruction at T_end is unchanged by either dump
-        (int256 avgStill,,,) = hook.averageOver(a.poolId, tradingEnd - roundManager.closingWindowFor(2), tradingEnd);
+        (int256 avgStill,,,) = hook.averageOver(a.poolId, from, tradingEnd);
         assertEq(avgStill, expected, "the score at T_end is reconstructed identically after a dump");
         _tradeCandidate(a, false, IERC20(a.token).balanceOf(address(this)) / 2);
-        (avgStill,,,) = hook.averageOver(a.poolId, tradingEnd - roundManager.closingWindowFor(2), tradingEnd);
+        (avgStill,,,) = hook.averageOver(a.poolId, from, tradingEnd);
         assertEq(avgStill, expected, "and after a second one");
 
         roundManager.submitScore(a.id);
@@ -235,8 +259,62 @@ contract RoundTest is RoundTestBase {
         assertEq(roundManager.hWad(), H_FRAC_WAD, "a successful round does not decay H");
     }
 
+    /// @notice EARLY FINALIZE. With every candidate's score in there is nothing left a finalize
+    /// could exclude, so the round closes at once instead of waiting for `submitEnd`; with one
+    /// score missing it reverts right up to `submitEnd`, which stays the deadline.
+    function test_finalizeAsSoonAsAllScoresAreIn() public {
+        Cand memory a = _registerCandidate(address(0xA11CE), "A");
+        Cand memory b = _registerCandidate(address(0xB0B), "B");
+        IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
+        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        vm.warp(tradingStart + 5);
+        _tradeCandidate(a, true, WINNING_BUY);
+        _tradeCandidate(b, true, WINNING_BUY / 10);
+        (, uint64 submitEnd) = _settleEnd();
+        uint256 roundId = roundManager.roundCount();
+
+        // one score in, one missing: the window still guards the missing one
+        roundManager.submitScore(b.id);
+        assertEq(roundManager.submittedCount(roundId), 1, "one of two");
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Submission), "still submitting");
+        vm.expectRevert(RoundManager.SubmissionWindowOpen.selector);
+        roundManager.finalize();
+
+        // the second score lands: the round is finalizable now, well before submitEnd
+        roundManager.submitScore(a.id);
+        roundManager.submitScore(a.id); // a re-submission is a no-op and does not count twice
+        assertEq(roundManager.submittedCount(roundId), 2, "two of two, counted once each");
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Finalizable), "finalizable early");
+        assertLt(block.timestamp, submitEnd, "before the deadline");
+        roundManager.finalize();
+        assertEq(roundManager.head(), a.token, "the best candidate wins");
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Finalized));
+    }
+
+    /// @notice ...and the missing score keeps the round open until `submitEnd`, not a second longer.
+    function test_aMissingScoreHoldsFinalizeUntilSubmitEnd() public {
+        Cand memory a = _registerCandidate(address(0xA11CE), "A");
+        _registerCandidate(address(0xB0B), "B");
+        IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
+        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        vm.warp(tradingStart + 5);
+        _tradeCandidate(a, true, WINNING_BUY);
+        (, uint64 submitEnd) = _settleEnd();
+        roundManager.submitScore(a.id);
+
+        vm.warp(submitEnd - 1);
+        vm.expectRevert(RoundManager.SubmissionWindowOpen.selector);
+        roundManager.finalize();
+
+        vm.warp(submitEnd);
+        roundManager.finalize();
+        assertEq(roundManager.head(), a.token, "the deadline path still crowns");
+    }
+
     function test_staleFinalizeIsIdempotent() public {
         Cand memory a = _registerCandidate(address(0xA11CE), "A");
+        // a second candidate that never submits keeps the round on the submitEnd path
+        _registerCandidate(address(0xB0B), "B");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
         (uint64 tradingStart, uint64 tradingEnd, uint64 submitEnd) = _roundTimes(roundManager.roundCount());
 
@@ -310,7 +388,10 @@ contract RoundTest is RoundTestBase {
         uint256 parentSupply = IERC20(first.token).totalSupply();
         (uint160 sqrtP,,,) = im.getSlot0(second.poolId);
         uint256 fdv = CurveMath.fdvAtSqrtPrice(sqrtP, FamilyToken(second.token).TOTAL_SUPPLY(), second.tokenIsCurrency0);
-        assertApproxEqRel(fdv, factory.startFdv(parentSupply), 1e16, "start FDV = START_RATIO x #2 supply");
+        assertEq(
+            factory.curveBasisOf(second.token), _lowerClampBasis(parentSupply), "the basis is #2's supply at registration"
+        );
+        assertApproxEqRel(fdv, factory.startFdvOf(second.token), 1e16, "start FDV = START_RATIO x #2 supply");
         assertEq(r.hUsed, (parentSupply * H_FRAC_WAD) / 1e18, "H re-based on #2's supply");
     }
 

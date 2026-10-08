@@ -153,6 +153,13 @@ abstract contract RoundTestBase is FamilyTestBase {
         return (r.tradingStart, r.nominalEnd, r.nominalEnd + roundManager.SUBMIT_S());
     }
 
+    /// @dev The moment `c`'s OWN pool opened - its registration block - which its snipe tax and
+    /// accumulator run from. Not the round clock ({_roundTimes}), which is what scoring is
+    /// floored at.
+    function _poolStart(Cand memory c) internal view returns (uint64) {
+        return roundManager.candidateInfo(c.id).tradingStart;
+    }
+
     /// @dev Settle the current round's random end at `T` exactly: warp to the nominal end, pin
     /// the randomness and relay a word of 0 (the mock's default), so `T_end == T` and the
     /// submission window opens at `T`. Tests that want a real offset set

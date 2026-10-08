@@ -22,6 +22,7 @@ import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {FamilyFactory} from "../../contracts/FamilyFactory.sol";
+import {IVenueOracle} from "../../contracts/interfaces/IVenueOracle.sol";
 import {FamilyHook} from "../../contracts/FamilyHook.sol";
 import {FamilyToken} from "../../contracts/FamilyToken.sol";
 import {FamilyRouter} from "../../contracts/FamilyRouter.sol";
@@ -236,6 +237,7 @@ abstract contract FamilyTestBase is Test {
         plainRouter = new PoolSwapTest(manager);
         liquidityRouter = new PoolModifyLiquidityTest(manager);
         donateRouter = new PoolDonateTest(manager);
+        _beforeStack();
 
         Stack memory s = _deployStack(useFamilyRouter, steward, priorRegistry);
         factory = s.factory;
@@ -246,6 +248,9 @@ abstract contract FamilyTestBase is Test {
         bidDeployer = s.bidDeployer;
         familyRouter = s.router;
         lens = s.lens;
+        if (startOracle != address(0) && bindStartOracle && address(factory) != address(0)) {
+            factory.bindVenueOracle(startOracle);
+        }
 
         _approveDoll();
     }
@@ -385,10 +390,10 @@ abstract contract FamilyTestBase is Test {
     }
 
     /// @dev EVERY constructor argument, filled in field by field. `new FamilyFactory(...)` takes
-    /// seventeen of them, three of them structs, and evaluating that argument list in one frame
+    /// eighteen of them, three of them structs, and evaluating that argument list in one frame
     /// leaves the IR pipeline a stack slot short: a nested call or a struct literal among the
     /// arguments needs a temporary that does not fit. Built here and loaded one field at a time,
-    /// the deployment below is seventeen memory reads off a single pointer. Nothing about what is
+    /// the deployment below is eighteen memory reads off a single pointer. Nothing about what is
     /// deployed changes; this is purely where the values are assembled.
     struct FactoryArgs {
         IPoolManager poolManager;
@@ -407,8 +412,62 @@ abstract contract FamilyTestBase is Test {
         CurveSegment[] standardCurve;
         bytes32 hookSalt;
         address tokenImplementation;
+        string metadataBase;
         FamilyFactory.RoundSetup roundSetup;
+        FamilyFactory.StartSetup startSetup;
     }
+
+    /// @dev The ETH-anchored start the stack under test deploys with. The default is NO oracle and
+    /// a fallback of zero $DOLL, which the lower clamp turns into exactly the old parent-relative
+    /// start (`spec[0].fdvRatioLowerWad` of the parent's supply), so the rest of the suite keeps
+    /// its launch curves. Tests of the start rule set these before {_deployProtocol}.
+    address internal startOracle;
+    /// @dev Whether {_deployProtocol} binds {startOracle} once the stack exists (the deploy
+    /// script does the same when the venue is live). A test of the unbound phase clears it.
+    bool internal bindStartOracle = true;
+    uint256 internal startFallbackDoll;
+    uint256 internal startWalkMax = 24;
+    uint256 internal startOracleGas = 200_000;
+    uint32 internal startLinkMinCoverS = 1800;
+
+    function _startSetup() internal view virtual returns (FamilyFactory.StartSetup memory) {
+        // the expected venue and code are those of the oracle the test deployed, if any
+        bytes32 venueId;
+        bytes32 codehash;
+        if (startOracle != address(0)) {
+            venueId = PoolId.unwrap(IVenueOracle(startOracle).venueId());
+            codehash = startOracle.codehash;
+        }
+        return FamilyFactory.StartSetup({
+            expectedVenueId: venueId,
+            oracleCodehash: codehash,
+            fdvWei: 5e18,
+            maxParentBps: 5_000,
+            minParentWad: 1e15,
+            fallbackDoll: startFallbackDoll,
+            oracleGas: startOracleGas,
+            linkMinCoverS: startLinkMinCoverS,
+            walkMax: startWalkMax
+        });
+    }
+
+    /// @dev The curve basis the DEFAULT start setup gives a round whose parent has `supply`: the
+    /// lower clamp (1/1000 of the supply, rounded down to the wei) over `spec[0]`'s 1/1000, i.e.
+    /// the parent supply rounded down to a multiple of 1000 wei - the old parent-supply basis.
+    function _lowerClampBasis(uint256 supply) internal pure returns (uint256) {
+        return ((supply * 1e15) / 1e18) * 1e18 / 1e15;
+    }
+
+    /// @dev Runs after the PoolManager and the test routers exist and before the stack's nonce
+    /// ladder is read: a test that needs a contract the factory is built against (the venue
+    /// oracle) deploys it here.
+    function _beforeStack() internal virtual {}
+
+    /// @dev The metadata base the test stack's factory is deployed with; tests that assert
+    /// `tokenURI`/`metadataURI` build their expectation off `factory.metadataBase()` rather than
+    /// duplicating this string, but it has to be set to SOMETHING non-empty for those tests to be
+    /// meaningful.
+    string internal constant TEST_METADATA_BASE = "https://meta.test/token/4663/";
 
     function _factoryArgs(FactorySpec memory sp) internal view returns (FactoryArgs memory a) {
         a.poolManager = IPoolManager(address(manager));
@@ -427,15 +486,17 @@ abstract contract FamilyTestBase is Test {
         a.standardCurve = _standardCurveSpec();
         a.hookSalt = sp.salt;
         a.tokenImplementation = sp.tokenImplementation;
+        a.metadataBase = TEST_METADATA_BASE;
         a.roundSetup = FamilyFactory.RoundSetup({
             deployer: address(roundManagerDeployer),
             randomness: address(randomness),
             endTimeout: endTimeout,
             durationScaleDiv: durationScaleDiv
         });
+        a.startSetup = _startSetup();
     }
 
-    /// @dev The factory's creation code with its seventeen constructor arguments appended.
+    /// @dev The factory's creation code with its eighteen constructor arguments appended.
     /// Encoding a struct IS encoding its members, so the only difference from what
     /// `new FamilyFactory(...)` would build is the leading offset word, overwritten below with
     /// the remaining length.
@@ -449,7 +510,7 @@ abstract contract FamilyTestBase is Test {
         return abi.encodePacked(type(FamilyFactory).creationCode, args);
     }
 
-    /// @dev The CREATE itself. It is raw because `new FamilyFactory(...)` evaluates seventeen
+    /// @dev The CREATE itself. It is raw because `new FamilyFactory(...)` evaluates eighteen
     /// constructor arguments and deploys in ONE frame, and the IR pipeline is a stack slot short
     /// there. It cannot be moved behind an external self-call: that costs a nonce and every
     /// address prediction in {_deployStack} is built on the nonce ladder.
@@ -487,9 +548,10 @@ abstract contract FamilyTestBase is Test {
         sp.router = router;
         sp.steward = _steward;
         sp.prior = prior;
-        sp.tokenImplementation = address(new FamilyToken(predictedFactory));
         address hookAddress;
         (hookAddress, sp.salt) = _mineHook(predictedFactory, router);
+        // the implementation carries the venue-lock immutables: mined before it is deployed
+        sp.tokenImplementation = _newTokenImplementation(predictedFactory, hookAddress);
 
         f = _newFactory(sp);
         // refused at construction: {lastFactoryError} says why, and the caller asserts on it
@@ -497,6 +559,20 @@ abstract contract FamilyTestBase is Test {
         h = f.hook();
         assertEq(address(f), predictedFactory, "factory address prediction");
         assertEq(address(h), hookAddress, "mined hook address");
+    }
+
+    /// @dev The FamilyToken implementation for a factory at `predictedFactory`: the PoolManager,
+    /// the mined hook, the factory's nonce-1 Locker and the predicted FeeVault.
+    function _newTokenImplementation(address predictedFactory, address hookAddress) internal returns (address) {
+        return address(
+            new FamilyToken(
+                predictedFactory,
+                address(manager),
+                hookAddress,
+                vm.computeCreateAddress(predictedFactory, 1),
+                feeVault
+            )
+        );
     }
 
     /// @dev Adopt the external genesis as canonical index 0. There is no pool and no
@@ -519,9 +595,13 @@ abstract contract FamilyTestBase is Test {
     /// call ({CurveQuoter}) so the curve construction is never inlined into a test-base frame.
     function _curveOf(uint256 j) internal returns (CurveRange[] memory, uint160) {
         if (address(curveQuoter) == address(0)) curveQuoter = new CurveQuoter();
+        // the basis the factory stored at launch; a link launched by another factory (a
+        // continuation's prior trunk) falls back to the parent's live supply, as BidDeployer does
+        uint256 basis = factory.curveBasisOf(roundManager.canonical(j));
+        if (basis == 0) basis = IERC20(roundManager.canonical(j - 1)).totalSupply();
         return curveQuoter.build(
             factory.curveSpec(),
-            IERC20(roundManager.canonical(j - 1)).totalSupply(),
+            basis,
             SUPPLY,
             factory.TICK_SPACING(),
             Currency.unwrap(roundManager.poolKeyOf(j).currency0) == roundManager.canonical(j)

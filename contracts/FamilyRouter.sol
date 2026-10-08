@@ -178,11 +178,11 @@ contract FamilyRouter is IUnlockCallback {
     /// every candidate route reverted and the only way out was a third-party router - i.e. an
     /// unattributed swap that pays the candidate's creator nothing. The route now walks the
     /// index the ROUND recorded as its parent, which is immutable once written, so a candidate
-    /// pool stays tradeable through this router forever. Registration (the pool exists but the
-    /// hook's own gate has not opened) is still refused.
+    /// pool stays tradeable through this router forever. A candidate's pool opens the moment it
+    /// registers, so Registration routes too; only Idle (no round) is refused.
     /// @return key The candidate's pool key.
     /// @return parentIndex The canonical index the candidate's pool is quoted in.
-    /// @return trading True while the candidate's round is still Trading.
+    /// @return trading True while the candidate's round is still open (Registration or Trading).
     function _candidateRoute(uint256 candidateId)
         internal
         view
@@ -191,8 +191,8 @@ contract FamilyRouter is IUnlockCallback {
         if (candidateId >= roundManager.candidateCount()) revert UnknownCandidate();
         RoundManager.Candidate memory c = roundManager.candidateInfo(candidateId);
         RoundManager.Phase p = roundManager.phase(c.roundId);
-        if (p == RoundManager.Phase.Registration || p == RoundManager.Phase.Idle) revert NotTrading();
-        trading = p == RoundManager.Phase.Trading;
+        if (p == RoundManager.Phase.Idle) revert NotTrading();
+        trading = p == RoundManager.Phase.Registration || p == RoundManager.Phase.Trading;
         parentIndex = roundManager.roundInfo(c.roundId).parentIndex;
         key = c.key;
         if (address(key.hooks) == address(0)) revert UnknownIndex();

@@ -20,14 +20,22 @@ import {V4UnlockGuard} from "./libraries/V4UnlockGuard.sol";
 ///
 /// Lifecycle (DESIGN_BRIEF_v2 sec.2, and the internal research code's `rounds.py`):
 ///
-///   Idle -> Registration ({REGISTRATION_S}) -> Trading ({TRADING_S}, all candidates share
-///   `tradingStart`) -> Submission ({SUBMIT_S}) -> finalize() -> Idle
+///   Idle -> Registration ({REGISTRATION_S}) -> Trading ({durationFor(n)}, the round clock starts at
+///   `tradingStart`) -> Submission (until every candidate has submitted, at most {SUBMIT_S})
+///   -> finalize() -> Idle
+///
+/// Every candidate's pool opens the moment it registers; the round clock is shared. Each is
+/// scored over the same closing window, floored at the round's `tradingStart`, so trading before
+/// the clock is never scored - only the support still held when the window opens counts.
 ///
 /// The scores are snapshots as of `T_end`: `submitScore` reads `(acc, R, tLast)` from the hook
-/// and tail-extends, `avg = (acc + R * (T_end - tLast)) / TRADING_S`. The hook freezes its own
+/// and tail-extends, `avg = (acc + R * (T_end - tLast)) / W` over the closing window
+/// (`closingWindowFor(n)`), not the full round duration. The hook freezes its own
 /// accumulator on the first swap at or after `T_end`, so a post-bell dump cannot move an
 /// average, and the submission window makes submit-and-finalize-atomically
-/// impossible: a low score submitted first cannot exclude a better one submitted later.
+/// impossible: a low score submitted first cannot exclude a better one submitted later. A round
+/// may finalize before the window closes only once EVERY candidate has submitted, when there is
+/// no later score left to exclude.
 /// @title RoundManagerDeployer
 /// @notice The helper the {FamilyFactory} CREATEs its RoundManager through. Its only purpose is
 /// EIP-3860: the RoundManager's init code is a third of the
@@ -60,22 +68,28 @@ contract RoundManager {
     // -------------------------------------------------------------------------------------
 
     /// @notice ADAPTIVE SCHEDULE (sec.2). The whole timetable of round `n` is a
-    /// pure function of `n` - nobody, steward included, can influence it:
+    /// pure function of `n` - nobody, steward included, can influence it. The doubling applies to
+    /// the WHOLE ROUND, entries included, because a coin trades from the moment it registers:
     ///
-    ///   D(n) = min(15 min * 2^floor((n-1)/2), 12 h)     {durationFor}
-    ///   R(n) = clamp(D(n)/5, 3 min, 1 h)                {registrationFor}
+    ///   L(n) = min(10 min * 2^floor((n-1)/2), 12 h)     whole round, open -> `T`  {roundLengthFor}
+    ///   R(n) = clamp(L(n)/5, 3 min, 1 h)                registration               {registrationFor}
+    ///   D(n) = L(n) - R(n)                              trading on the clock       {durationFor}
     ///   late entry iff D(n) >= 1 h, for the first D(n)/3 of trading   {lateEntryUntil}
     ///
-    /// | n     | D      | R      | late entry |
-    /// | 1-2   | 15 min | 3 min  | no         |
-    /// | 3-4   | 30 min | 6 min  | no         |
-    /// | 5-6   | 1 h    | 12 min | 20 min     |
-    /// | 7-8   | 2 h    | 24 min | 40 min     |
-    /// | 9-10  | 4 h    | 48 min | 80 min     |
-    /// | 11-12 | 8 h    | 1 h    | 2 h 40 min |
-    /// | 13+   | 12 h   | 1 h    | 4 h        |
-    uint64 public constant BASE_TRADING_S = 15 minutes;
-    uint64 public constant MAX_TRADING_S = 12 hours;
+    /// so the published end is `nominalEnd = openedAt + L(n)` (exactly, at divisor 1).
+    ///
+    /// | n     | L          | R      | D          | late entry      |
+    /// | 1-2   | 10 min     | 3 min  | 7 min      | no              |
+    /// | 3-4   | 20 min     | 4 min  | 16 min     | no              |
+    /// | 5-6   | 40 min     | 8 min  | 32 min     | no              |
+    /// | 7-8   | 80 min     | 16 min | 64 min     | 21 min 20 s     |
+    /// | 9-10  | 160 min    | 32 min | 128 min    | 42 min 40 s     |
+    /// | 11-12 | 5 h 20 min | 1 h    | 4 h 20 min | 1 h 26 min 40 s |
+    /// | 13-14 | 10 h 40 min| 1 h    | 9 h 40 min | 3 h 13 min 20 s |
+    /// | 15+   | 12 h       | 1 h    | 11 h       | 3 h 40 min      |
+    uint64 public constant BASE_ROUND_S = 10 minutes;
+    /// @notice Cap on the whole round `L(n)`, registration included.
+    uint64 public constant MAX_ROUND_S = 12 hours;
     uint64 public constant MIN_REGISTRATION_S = 3 minutes;
     uint64 public constant MAX_REGISTRATION_S = 1 hours;
     /// @notice Late entry is offered only from the duration at which a five-minute registration
@@ -157,10 +171,12 @@ contract RoundManager {
         bytes32 bestPoolId;
     }
 
-    /// @param tradingStart This candidate's OWN window start: the round's `tradingStart`, or the
-    /// moment it registered if it came in through the late-entry window (sec.2).
-    /// There is no time-based scoring penalty; a late entrant is simply averaged over its own,
-    /// shorter window, which is at least two thirds of the round.
+    /// @param tradingStart The moment this candidate's pool opened: the block it registered in,
+    /// whether during registration or through the late-entry window (sec.2). The SCORED window is
+    /// the round's: {submitScore} floors it at the round's `tradingStart`, so a pool open before
+    /// the clock is scored over the same minutes as everyone else. There is no time-based scoring
+    /// penalty; a late entrant is simply averaged over its own, shorter window, which is at least
+    /// two thirds of the round.
     struct Candidate {
         uint256 roundId;
         address token;
@@ -286,6 +302,11 @@ contract RoundManager {
     mapping(uint256 => Round) internal rounds;
     mapping(uint256 => uint256[]) internal roundCandidates;
     Candidate[] internal candidates;
+    /// @notice How many of round `roundId`'s candidates have submitted a score. When it reaches
+    /// the round's `candidateCount` the round may be finalized before `submitEnd`: nobody is left
+    /// whose better score a finalize could exclude. A counter rather than a loop, so the early
+    /// gate in {finalize} costs one storage read whatever the round's size.
+    mapping(uint256 => uint256) public submittedCount;
 
     /// @notice The round that CROWNED canonical index `i`, so that the generation's siblings -
     /// winner and losers alike - can be found forever. Written once, at finalization.
@@ -578,29 +599,47 @@ contract RoundManager {
     // the adaptive schedule: pure functions of the round number (sec.2)
     // -------------------------------------------------------------------------------------
 
-    /// @dev `min(15 min * 2^floor((n-1)/2), 12 h)`, BEFORE the testnet divisor. Round 0 does not
-    /// exist; it is treated as round 1 so that every view is total.
-    function _rawDuration(uint256 n) internal pure returns (uint64) {
+    /// @dev The whole round `L(n) = min(10 min * 2^floor((n-1)/2), 12 h)`, BEFORE the testnet
+    /// divisor. Round 0 does not exist; it is treated as round 1 so that every view is total.
+    function _rawRoundLength(uint256 n) internal pure returns (uint64) {
         uint256 doublings = n <= 1 ? 0 : (n - 1) / 2;
-        // 15 min << 6 is 16 h, already past the cap: everything from there is capped, and the
-        // early return also keeps the shift below the width of the type
-        if (doublings >= 6) return MAX_TRADING_S;
-        uint64 d = uint64(uint256(BASE_TRADING_S) << doublings);
-        return d > MAX_TRADING_S ? MAX_TRADING_S : d;
+        // 10 min << 7 is 21 h 20 min, already past the cap (10 min << 6 = 10 h 40 min is not):
+        // everything from there is capped, and the early return also keeps the shift below the
+        // width of the type
+        if (doublings >= 7) return MAX_ROUND_S;
+        uint64 l = uint64(uint256(BASE_ROUND_S) << doublings);
+        return l > MAX_ROUND_S ? MAX_ROUND_S : l;
     }
 
-    /// @notice Trading duration of round `n`, in seconds.
+    /// @dev `R(n) = clamp(L(n)/5, 3 min, 1 h)`, BEFORE the testnet divisor.
+    function _rawRegistration(uint256 n) internal pure returns (uint64 r) {
+        r = _rawRoundLength(n) / 5;
+        if (r < MIN_REGISTRATION_S) r = MIN_REGISTRATION_S;
+        if (r > MAX_REGISTRATION_S) r = MAX_REGISTRATION_S;
+    }
+
+    /// @dev `D(n) = L(n) - R(n)`, BEFORE the testnet divisor. Never underflows: `R <= L/5` except
+    /// at the 3-minute floor, which only binds below a 15-minute round, and `L >= 10 min`.
+    function _rawDuration(uint256 n) internal pure returns (uint64) {
+        return _rawRoundLength(n) - _rawRegistration(n);
+    }
+
+    /// @notice The whole of round `n`, first registration to the published end `T`, in seconds:
+    /// `registrationFor(n) + durationFor(n)`.
+    function roundLengthFor(uint256 n) external view returns (uint64) {
+        return registrationFor(n) + durationFor(n);
+    }
+
+    /// @notice Trading duration of round `n` on the round clock, `tradingStart -> T`, in seconds:
+    /// the whole round less its registration window.
     function durationFor(uint256 n) public view returns (uint64) {
         return _rawDuration(n) / DURATION_SCALE_DIV;
     }
 
-    /// @notice Registration window of round `n`: `clamp(D(n)/5, 3 min, 1 h)`. The clamp is
-    /// applied to the UNSCALED duration, so a testnet run keeps the same shape.
+    /// @notice Registration window of round `n`: `clamp(L(n)/5, 3 min, 1 h)`. The clamp is
+    /// applied to the UNSCALED round, so a testnet run keeps the same shape.
     function registrationFor(uint256 n) public view returns (uint64) {
-        uint64 r = _rawDuration(n) / 5;
-        if (r < MIN_REGISTRATION_S) r = MIN_REGISTRATION_S;
-        if (r > MAX_REGISTRATION_S) r = MAX_REGISTRATION_S;
-        return r / DURATION_SCALE_DIV;
+        return _rawRegistration(n) / DURATION_SCALE_DIV;
     }
 
     /// @notice How long after `tradingStart` a LATE ENTRANT may still register in round `n`, or
@@ -618,10 +657,11 @@ contract RoundManager {
     /// @notice The span the true end `T_end = T - (word mod W_r)` is drawn from in round `n`:
     /// `max(1, min(RANDOM_END_S, D(n) / 4))`.
     ///
-    /// @dev On MAINNET this is a no-op. The shortest round is `BASE_TRADING_S` = 15 min, so
-    /// `D(n) / 4 >= 225 s > RANDOM_END_S`, and the window is always {RANDOM_END_S} exactly.
+    /// @dev On MAINNET this binds only on the two ten-minute rounds. Their trading period is
+    /// `D = 10 min - 3 min = 420 s`, so rounds 1-2 draw the end from `D / 4 = 105 s`; from round 3
+    /// (`D = 960 s`) `D(n) / 4 >= 240 s > RANDOM_END_S`, and the window is {RANDOM_END_S} exactly.
     ///
-    /// The quarter-duration clamp exists for a heavily SCALED testnet schedule, where
+    /// The quarter-duration clamp also exists for a heavily SCALED testnet schedule, where
     /// {DURATION_SCALE_DIV} can make `D(n)` shorter than, or barely longer than, the 180-second
     /// random span. Drawing the end out of a window comparable to the whole round can put `T_end`
     /// at or before `tradingStart`, which leaves a round with no tradable span to score. Taking
@@ -982,9 +1022,10 @@ contract RoundManager {
 
     /// @notice Open a round if the chain is idle, or validate that the open one is still in its
     /// registration window. Factory only: candidates exist only as (token, pool, bond) triples.
-    /// @dev The `tradingStart` returned is the OWN window start of a candidate registering in
-    /// this call: the round's synchronized start, or `block.timestamp` for a late entrant, whose
-    /// pool opens the moment it registers (its own 3-second snipe tax applies from that moment).
+    /// @dev The `tradingStart` returned is the OWN pool start of a candidate registering in this
+    /// call: always `block.timestamp`. Every pool opens the moment it registers (its own 3-second
+    /// snipe tax applies from that moment); the round clock (`Round.tradingStart`, `nominalEnd`)
+    /// is unchanged and is what the score window is floored at.
     ///
     /// @dev GUARDED, BECAUSE REGISTRATION IS REACHABLE FROM A TOKEN TRANSFER. The edge
     /// currency is an ERC-20 this protocol did not write, and one with a sender hook can call back
@@ -1016,15 +1057,15 @@ contract RoundManager {
                 return
                     (
                         roundId,
-                        open.tradingStart,
+                        uint64(block.timestamp),
                         open.nominalEnd,
                         scoreSlotFor(roundId),
                         open.parentToken,
                         open.bondAmount
                     );
             }
-            // LATE ENTRY (sec.2): the same bond, the same closing window, and a pool
-            // that opens right now instead of at the round's start.
+            // LATE ENTRY (sec.2): entered after the round clock started - the same bond, the
+            // same closing window, and a pool that opens right now like every other.
             if (open.lateEntryEnd == 0 || block.timestamp >= open.lateEntryEnd) revert RegistrationClosed();
             // A LATE ENTRANT's pool opens now, but its published end is the ROUND's `T` - the
             // same bell as everyone else's, which is what the ring freeze is keyed to
@@ -1065,7 +1106,8 @@ contract RoundManager {
 
         emit RoundOpened(roundId, _headIndex, _head, r.registrationEnd, r.hUsed);
         emit TradingStarted(roundId, r.tradingStart, r.nominalEnd, r.lateEntryEnd);
-        return (roundId, r.tradingStart, r.nominalEnd, scoreSlotFor(roundId), r.parentToken, r.bondAmount);
+        // the candidate's pool opens now; the round clock above is what the score is measured on
+        return (roundId, uint64(block.timestamp), r.nominalEnd, scoreSlotFor(roundId), r.parentToken, r.bondAmount);
     }
 
     /// @dev LAZY HEAD ADOPTION. The prior version must have been sunset for real, must have
@@ -1111,10 +1153,10 @@ contract RoundManager {
     {
         Round storage r = rounds[roundId];
         if (r.openedAt == 0 || r.finalized) revert NoRound();
-        uint64 start = r.tradingStart;
+        // every pool opens the moment it registers; nobody registers after the late-entry window
+        uint64 start = uint64(block.timestamp);
         if (block.timestamp >= r.registrationEnd) {
             if (r.lateEntryEnd == 0 || block.timestamp >= r.lateEntryEnd) revert RegistrationClosed();
-            start = uint64(block.timestamp);
         }
         if (bondAmount != r.bondAmount) revert WrongBond();
         bondEscrow += bondAmount;
@@ -1228,6 +1270,12 @@ contract RoundManager {
         uint64 tFirstAttained = c.tradingStart;
         uint64 w = closingWindowFor(c.roundId);
         uint64 windowStart = r.tradingEnd > w ? r.tradingEnd - w : 0;
+        // THE FLOOR. Pools open at registration, before the round clock; without it a short
+        // round (W >= D) would score each candidate from its own start (the hook clamps there)
+        // and candidates would be measured over different windows. With it every candidate is
+        // scored over [max(T_end - W, tradingStart), T_end]: trading before the clock is not
+        // scored, support bought then and still held is.
+        if (windowStart < r.tradingStart) windowStart = r.tradingStart;
         uint64 tStartUsed;
         uint64 tEndUsed;
         // a pool that opened after the closing window has already closed (only reachable on a
@@ -1237,6 +1285,7 @@ contract RoundManager {
         }
 
         c.submitted = true;
+        submittedCount[c.roundId]++;
         c.avg = avg;
         c.tFirstAttained = tFirstAttained;
 
@@ -1271,13 +1320,21 @@ contract RoundManager {
 
     /// @notice Close the current round: crown the best candidate if it cleared the threshold,
     /// otherwise decay the threshold. Permissionless, deterministic, idempotent.
+    ///
+    /// Callable once `T_end` is settled AND either every candidate registered in the round has
+    /// submitted its score or the submission window has closed (`submitEnd`). The early path
+    /// cannot exclude anybody - every score is already in - and `submitEnd` stays the deadline
+    /// for a round in which some candidate never submits. Registration is closed long before
+    /// `T_end` is known, so `candidateCount` can no longer grow once the gate is reachable.
     function finalize() external nonReentrant notInsideUnlock {
         uint256 roundId = roundCount;
         if (roundId == 0) revert NoRound();
         Round storage r = rounds[roundId];
         if (r.finalized) return; // idempotent: a stale finalize can never overwrite anything
         if (r.tradingEnd == 0) revert EndNotSettled();
-        if (block.timestamp < r.submitEnd) revert SubmissionWindowOpen();
+        if (block.timestamp < r.submitEnd && submittedCount[roundId] < r.candidateCount) {
+            revert SubmissionWindowOpen();
+        }
 
         r.finalized = true;
         if (!r.hasBest) emit NoScoreSubmitted(roundId, r.candidateCount);
@@ -1439,7 +1496,7 @@ contract RoundManager {
     // -------------------------------------------------------------------------------------
 
     /// @notice Current threshold `H` in parent tokens: an AVERAGE absorption over the trading
-    /// window, directly comparable with `score / TRADING_S`.
+    /// window, directly comparable with `score / W (closingWindowFor)`.
     ///
     /// @dev ACCEPTED, DOCUMENTED BEHAVIOUR. `H` is a fraction of the head's LIVE total
     /// supply, and `FamilyToken.burn` is permissionless, so anyone holding head tokens can lower
@@ -1469,7 +1526,8 @@ contract RoundManager {
         if (block.timestamp < r.nominalEnd) return Phase.Trading;
         // past `T`: the round is over, but nobody knows WHEN it ended until the beacon lands
         if (r.tradingEnd == 0) return Phase.EndPending;
-        if (block.timestamp < r.submitEnd) return Phase.Submission;
+        // every score already in: finalizable now, without waiting out the window
+        if (block.timestamp < r.submitEnd && submittedCount[roundId] < r.candidateCount) return Phase.Submission;
         return Phase.Finalizable;
     }
 

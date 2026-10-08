@@ -85,6 +85,18 @@ party.
 | FEE-12 | An unattributed swap credits `creator = 0` and `M = 0`, so its whole flywheel share lands on genesis; the developer's 20% is paid on every protocol fee, attributed or not. | conservation | U,F | |
 | FEE-13 | On a partially filled exact-input swap the fee is charged on the full `amountSpecified`; this is the only case where fee basis and executed notional differ. | arithmetic | U,K | Disclosed (L1); pinned so a later change is visible. |
 
+### 3.2b Venue lock
+
+Replaces the earlier per-transfer side-tax charge (commit b4e42e0, 2026-10-01). A chain coin
+(any family token, index 1 and deeper) can only be traded on its own canonical pool; the fee
+itself moved from a transfer-time charge on the coin to a swap-time collection by the hook, on
+the parent/$DOLL side of that canonical pool only.
+
+| ID | Statement | Class | Tiers | Notes |
+|---|---|---|---|---|
+| ★ VEN-01 | A family token's `transfer`/`transferFrom` reverts `NonCanonicalVenue(from, to, reason, available)` whenever the movement would place or hold the token in a non-canonical venue: (1) an inbound transfer to the `PoolManager` beyond the hook's own canonical allowance for that token, (2) an outbound transfer from the `PoolManager` beyond that allowance, or (3) a transfer to or from any pool-shaped contract (one that answers both `token0()` and `token1()`) that is not the token's registered canonical pool. A plain wallet-to-wallet transfer, or a transfer to or from any non-pool-shaped contract, is never affected. | safety | U,F,I | Falsified by any transfer that lands a chain coin in a second venue without reverting, or by a wallet/non-pool transfer reverting. |
+| VEN-02 | The fee that used to be charged on the chain coin's own side of a transfer is now collected entirely by `FamilyHook`, inside the swap, on the parent ($DOLL-denominated) side of that pool; no fee is ever taken from the family-token side and no fee is ever taken outside a swap. | conservation | U,F,K | Restates the old side-tax credit (`contracts/FamilyHook.sol`, "THE CANONICAL CREDIT") in terms of the parent-side collection that replaced it. |
+
 ### 3.3 Ancestor sleeve
 
 | ID | Statement | Class | Tiers | Notes |
@@ -115,18 +127,19 @@ party.
 | SCR-12 | The tie rule orders candidates by higher average, then earlier `tFirstAttained`, then lower `uint256(poolId)`, and is a total order: two distinct candidates can never both beat each other. | safety | U,F | `tFirstAttained` is a block timestamp, never a hash. |
 | SCR-13 | SCORE AVAILABILITY. For every candidate of a settled round, `submitScore` succeeds at every instant of `[tradingEnd, submitEnd)`, whatever any trader does before, at or after `T_end`. No pattern of swaps can make a round's score unreadable. | liveness | U,I | Falsified by a single swap placed later in `T_end`'s own 5-second slot, and by one-per-slot dust across the fast ring after the reveal. |
 | SCR-14 | FALLBACK EXACTNESS BOUND. When an edge `t` has no bracketing checkpoint, `averageOver` evaluates the accumulator EXACTLY at the largest checkpointed `tSwap <= t` across both rings, and divides by the span between the two instants it actually used. The instant used is at most one coarse slot (`scoreSlotFor(n)`, 18 s on mainnet) before `t`, and is never after it. Both instants are RETURNED and are carried in `RoundManager.ScoreSubmitted` (`tStartUsed`, `tEndUsed`), so a fallback resolution is visible in the logs. When the two resolve to the SAME instant the call REVERTS `BadScoreWindow` rather than answering zero; that is unreachable while `closingWindowFor(n) > scoreSlotFor(n)`, which `DeployConstants.t.sol` asserts for `DURATION_SCALE_DIV ∈ {1, 5}`. | arithmetic | U,F | The bound is what keeps SCR-10 true: every reachable sample is stamped at or before `T` and holds a pre-swap state, and no sample stamped after `T` exists at all. |
+| SCR-15 | THE FLOOR. Every candidate's pool opens at its own registration (`c.tradingStart = block.timestamp`, at or before `max(r.tradingStart, T − W − RANDOM_END_S)`), and every candidate of a round is scored over the same span `[max(T_end − W, r.tradingStart), T_end]`: `ScoreSubmitted.tStartUsed == max(T_end − W, r.tradingStart)` for all of them. Trading before the round clock is not scored; support bought then and still held counts exactly like the same support bought at the clock. | safety | U,I | `InstantTrading.t.sol`; `Invariants.t.sol::invariant_everyPoolOpensAtRegistrationAndBeforeTheScoredWindow` |
 
 ### 3.5 Round lifecycle
 
 | ID | Statement | Class | Tiers | Notes |
 |---|---|---|---|---|
-| RND-01 | `durationFor(n) = min(15 min · 2^floor((n−1)/2), 12 h)/DURATION_SCALE_DIV`, `registrationFor(n) = clamp(D(n)/5, 3 min, 1 h)`, `lateEntryUntil(n) = D(n)/3` iff `D(n) ≥ 1 h` else 0, `closingWindowFor(n) = CLOSING_WINDOW_S/DURATION_SCALE_DIV` (a flat 15 min on every round), `randomEndWindowFor(n) = max(1, min(180 s, D(n)/4))`, each a pure function of `n` alone. | purity | U,F | No caller, steward or timestamp may perturb any of them. Reproduce the published table row by row. |
+| RND-01 | The whole round `L(n) = min(10 min · 2^floor((n−1)/2), 12 h)`, `registrationFor(n) = clamp(L(n)/5, 3 min, 1 h)/DURATION_SCALE_DIV`, `durationFor(n) = (L(n) − R(n))/DURATION_SCALE_DIV`, `roundLengthFor(n) = registrationFor(n) + durationFor(n)`, `lateEntryUntil(n) = D(n)/3` iff the unscaled `D(n) ≥ 1 h` (from round 7) else 0, `closingWindowFor(n) = CLOSING_WINDOW_S/DURATION_SCALE_DIV` (a flat 15 min on every round), `randomEndWindowFor(n) = max(1, min(180 s, D(n)/4))`, each a pure function of `n` alone. | purity | U,F | No caller, steward or timestamp may perturb any of them. Reproduce the published table row by row. |
 | RND-02 | For every `n`, `lateEntryUntil(n) < D(n) − closingWindowFor(n) − RANDOM_END_S`, so no candidate is ever scored over a span beginning before its own pool opened. | arithmetic | U | Must hold at every legal scale divisor. |
-| RND-03 | The only reachable transitions are Unlaunched→Idle, Idle→Registration, Registration→Trading (clock), Trading→EndPending (clock), EndPending→Submission (via `fulfilEnd` or `finalizeDeterministic`), Submission→Finalizable (clock), Finalizable→Finalized+Idle, plus the sunset announce/cancel pair; no other transition exists and none is privileged. | safety | I,C | A state-machine invariant over a handler calling every external function in every order. |
+| RND-03 | The only reachable transitions are Unlaunched→Idle, Idle→Registration, Registration→Trading (clock), Trading→EndPending (clock), EndPending→Submission (via `fulfilEnd` or `finalizeDeterministic`), Submission→Finalizable (clock, or the last candidate's `submitScore`), Finalizable→Finalized+Idle, plus the sunset announce/cancel pair; no other transition exists and none is privileged. | safety | I,C | A state-machine invariant over a handler calling every external function in every order. |
 | RND-04 | `requestEnd()` is callable only at or after `T`, at most once per round, and pins a beacon round whose scheduled production time is strictly in the future at the moment of pinning. | safety | U,K | The unpredictability of `T_end` rests entirely on this. |
-| RND-05 | On fulfilment, `tradingEnd = T − (word mod randomEndWindowFor(n))` so `T_end ∈ (T − 180 s, T]` at mainnet constants, and `submitEnd = block.timestamp of fulfilment + 300 s`. | arithmetic | U,K | The submission window starts at settlement, not at `T`. |
+| RND-05 | On fulfilment, `tradingEnd = T − (word mod randomEndWindowFor(n))` so `T_end ∈ (T − 180 s, T]` at mainnet constants (`(T − 105 s, T]` on the ten-minute rounds 1–2), and `submitEnd = block.timestamp of fulfilment + 300 s`. | arithmetic | U,K | The submission window starts at settlement, not at `T`. |
 | RND-06 | If no verifiable beacon is relayed within `END_TIMEOUT = 30 min` of `T`, anyone may settle `tradingEnd = T` with a loud event, without anyone having called `requestEnd` first; the end can be settled at most once by either path. | liveness | U,K | A round never hangs on the beacon. |
-| RND-07 | `finalize()` reverts before `submitEnd` and before the end is settled; thereafter it is permissionless, deterministic and idempotent, a second call is a no-op that cannot overwrite the head. | safety | U,I,K | |
+| RND-07 | `finalize()` reverts before the end is settled, and reverts before `submitEnd` unless every candidate registered in the round has submitted (`submittedCount[roundId] == candidateCount`); once either holds it is permissionless, deterministic and idempotent, a second call is a no-op that cannot overwrite the head. | safety | U,I,K | Early finalize cannot exclude a score: all are in. Invariant `invariant_finalizeNeverRunsBeforeEveryScoreOrSubmitEnd` (FamilyHandler ghost recomputes "all submitted" from the candidates' own flags). |
 | RND-08 | Round `n+1` cannot open until round `n` is finalized: `openRoundIfIdle` reverts otherwise. | safety | U,I | Also the liveness hazard: nothing advances a round automatically. |
 | ★ RND-09 | `canonical[i]` is write-once for every `i`, at most one winner exists per index, the reverse index (`indexOf`, `parentOf`, `isCanonical`) is consistent with it at all times, and the winner branch of `finalize()` is the only writer besides one-shot continuation adoption. | safety | I,C | Append-only history. A violation is unrecoverable. |
 | RND-10 | A round crowns a winner iff `hasBest && bestAvg ≥ hUsed`, where `hUsed` was snapshotted when the round opened and cannot move afterwards. | safety | U | |
@@ -226,7 +239,7 @@ round. There is no ranking, which is why the PUR IDs skip 01, 03, 06 and 07.
 | ROU-04 | `swapPath` enforces per-leg adjacency (`to == from+1`, `from == to+1`) starting at index 1 and reverts otherwise; `maxHops` bounds the whole route including a candidate leg. There is no native-ETH sentinel and no leg touching index 0: the router is $DOLL-only. | safety | U,F | |
 | ROU-05 | The router has no `receive()` and no `msg.value` path anywhere; every entrypoint takes `amountIn` as an ERC-20 pulled from the caller, so no native value can be parked in it and later swept. | safety | U,F | |
 | ROU-06 | Every positive intermediate residual is paid to `to`, and every negative one reverts with a named per-leg error. | conservation | U,K | A route never leaves value in the router. **** there is no native-settle branch and nothing to refund; every leg is an ERC-20 pull of exactly `amountIn`. |
-| ROU-08 | `buyCandidate`/`sellCandidate` are refused only while the candidate's round is in `Registration` or `Idle`, and work forever afterwards, win or lose. | liveness | U,K | |
+| ROU-08 | `buyCandidate`/`sellCandidate` are refused only while the candidate's round is `Idle` (a candidate's pool opens at its registration, so `Registration` routes like `Trading`), and work forever afterwards, win or lose. | liveness | U,K | |
 
 ### 3.14 Reentrancy and ordering
 
@@ -383,8 +396,9 @@ two-currency ledger model), as must the BN254 pairing precompile `0x08` (NONDET 
    explicitly not `RANDOM_END_S`; it is silent on whether `W` is computed from the scaled or the nominal
    `D`. RND-01 assumes the scaled one. `W` is FLAT - `CLOSING_WINDOW_S / DURATION_SCALE_DIV`, 15 min on every round, so the question of which `D` it is computed from no longer arises for `W` itself. The random-end window is
    `max(1, min(RANDOM_END_S, D(n) / 4))`, so a scaled round can no longer draw `T_end` at or before its
-   own `tradingStart`, and the modulus in `fulfilEnd` is never zero. On mainnet `D(n) >= 15 min` and the
-   clamp never binds.
+   own `tradingStart`, and the modulus in `fulfilEnd` is never zero. On mainnet rounds 1-2 have
+   `D(n) = 420 s`, where the floor binds every time; rounds 3-4 hit the floor only when the random
+   offset exceeds 60 s; from round 5 onward the floor never binds.
 8. **"No fee on non-edge paths", CLOSED.** The rule is now "protocol fee iff the pool's
    parent is canonical index 0" (`isEdge`), computed once at registration rather than derived from a
    currency comparison; every round-one pool of a version is an edge pool for its whole life. A

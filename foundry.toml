@@ -5,7 +5,10 @@ script = "script"
 libs = ["lib"]
 out = "out"
 solc = "0.8.26"
-evm_version = "cancun"
+# Prague: the EVM the tests run on, so an EIP-7702 delegated account (the `0xef0100` designator,
+# test/VenueLock.t.sol test_5) executes its delegate instead of INVALID. solc 0.8.26 has no Prague
+# target, so the compiler still emits Cancun bytecode: the shipped artifacts are unchanged.
+evm_version = "prague"
 optimizer = true
 optimizer_runs = 200
 via_ir = true
@@ -77,3 +80,9 @@ script = "test/medusa"
 out = "out-medusa"
 cache_path = "cache-medusa"
 skip = ["test/properties/**", "test/fork/**", "test/halmos/**", "test/utils/**", "test/*.t.sol", "script/**"]
+
+# Light compile for static analysis only (Slither reads source; no via_ir/optimizer needed).
+# Usage: FOUNDRY_PROFILE=analysis FOUNDRY_THREADS=1 slither . --foundry-compile-all ...
+[profile.analysis]
+via_ir = false
+optimizer = false

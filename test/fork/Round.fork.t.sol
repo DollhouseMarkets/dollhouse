@@ -15,9 +15,9 @@ import {RoundManager} from "../../contracts/RoundManager.sol";
 /// relayer submits into a local fork. The beacon verifier itself is covered on chain by the unit
 /// tier (`test/Drand.t.sol`, real beacons against the deployed group key).
 contract RoundForkTest is ForkBase {
-    /// @dev Round 5 is the first round whose UNSCALED duration reaches `LATE_ENTRY_FROM_S`, so
+    /// @dev Round 7 is the first round whose UNSCALED duration reaches `LATE_ENTRY_FROM_S`, so
     /// it is the first round that offers late entry at all.
-    uint256 internal constant LONG_ROUND = 5;
+    uint256 internal constant LONG_ROUND = 7;
     /// @dev The parent-token support each contender puts behind its pool.
     uint256 internal constant SUPPORT = 1_000_000e18;
 
@@ -125,16 +125,19 @@ contract RoundForkTest is ForkBase {
 
         int256 avgEarly = roundManager.submitScore(early.id);
         int256 avgLate = roundManager.submitScore(late.id);
+
+        // ---- RND-07: finalize is refused while a candidate's score is missing and the
+        // submission window is open
+        vm.expectRevert(RoundManager.SubmissionWindowOpen.selector);
+        roundManager.finalize();
         int256 avgSold = roundManager.submitScore(sold.id);
 
         assertGt(avgEarly, 0, "a held level scores");
         assertApproxEqRel(uint256(avgLate), uint256(avgEarly), 1e15, "equal closing-window support, equal score");
         assertLt(avgSold, avgEarly / 100, "support sold before the window counts for nothing");
 
-        // ---- RND-07: finalize is refused before the submission window closes, then idempotent
-        vm.expectRevert(RoundManager.SubmissionWindowOpen.selector);
-        roundManager.finalize();
-        vm.warp(submitEnd + 1);
+        // ---- every score is in: finalize runs at once, before submitEnd, and is then idempotent
+        assertLt(block.timestamp, submitEnd, "early finalize");
         roundManager.finalize();
         address crowned = roundManager.head();
         roundManager.finalize(); // a second call is a no-op

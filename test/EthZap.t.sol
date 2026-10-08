@@ -658,6 +658,7 @@ contract EthZapTest is RoundTestBase {
     function test_leftoverLinkCoinOnSell_isRefunded() public {
         uint256 huge = 500_000_000 ether;
         deal(link1, alice, huge);
+        uint256 supply = IERC20(link1).totalSupply();
         vm.recordLogs();
         vm.prank(alice);
         uint256 ethOut = zapTake.sellForEth(1, huge, 1, alice, 1, block.timestamp);
@@ -667,6 +668,8 @@ contract EthZapTest is RoundTestBase {
         assertGt(back, 0, "unspent link coin returned");
         assertLt(back, huge, "some was sold");
         assertEq(s.coinRefunded, back, "event carries the coin refund");
+        // the partial canonical fill and the zap's refund to the payer pass the venue lock untaxed
+        assertEq(IERC20(link1).totalSupply(), supply, "partial fill and refund untaxed");
         _assertAllZapsClean();
     }
 

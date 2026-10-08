@@ -26,6 +26,7 @@ import {StandardCurve} from "../../contracts/libraries/StandardCurve.sol";
 import {CurveRange} from "../../contracts/types/CurveRange.sol";
 import {FamilyToken} from "../../contracts/FamilyToken.sol";
 import {MockDoll} from "./MockDoll.sol";
+import {MockVenueOracle} from "./MockVenueOracle.sol";
 
 /// @dev Random-action driver for the invariant suite. Every action is wrapped in `try` so that a
 /// legitimately-reverting call (wrong phase, empty pool, band guard) does not end the run; the
@@ -77,6 +78,46 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
     uint256 public deployAttempts;
     uint256 public successionAttempts;
     uint256 public claimAttempts;
+
+    /// @notice START-RULE GHOSTS. The venue oracle the factory was built against, when the suite
+    /// fuzzes it (zero otherwise); every {FamilyFactory.StartPriced} seen and how many of those
+    /// opened outside [Y, X] of the parent's supply; and how many registrations reverted ONLY
+    /// because of the oracle's state (the same call, retried against a sane oracle, succeeds).
+    MockVenueOracle public oracle;
+    uint256 public startsChecked;
+    uint256 public startsOutOfBand;
+    uint256 public oracleCausedReverts;
+
+    /// @notice POOL-START GHOSTS. Every candidate's pool opens at its own registration
+    /// (`c.tradingStart == block.timestamp`), and no later than
+    /// `max(r.tradingStart, T - W - RANDOM_END_S)`, so a scored window never starts before a
+    /// pool existed. Counts every registration checked and every one that broke either rule.
+    uint256 public poolStartsChecked;
+    uint256 public poolStartsOutOfRule;
+    /// @notice How many of the pool-start checks above landed on a LATE entrant (registered at
+    /// or after `r.registrationEnd`, on a round long enough to offer one). Coverage only — the
+    /// random walk rarely reaches a round long enough to offer late entry, so this is not
+    /// asserted against in {InvariantsTest}; the guarantee it would check is pinned instead by
+    /// the deterministic `InstantTradingTest.test_lateEntrantIsScoredFromTEndMinusWWithNoFloorBinding`.
+    uint256 public lateEntryChecked;
+
+    /// @notice FINALIZE-GATE GHOSTS. Every finalize that actually closed a round, how many of those
+    /// closed it BEFORE `submitEnd` (the early path, which needs every candidate's score in), and
+    /// how many broke the gate: closed before `submitEnd` with some candidate of the round still
+    /// unsubmitted. The "every candidate submitted" fact is recomputed here from the candidates'
+    /// own `submitted` flags, independently of the contract's `submittedCount`.
+    uint256 public finalizesChecked;
+    uint256 public earlyFinalizes;
+    uint256 public finalizesOutOfGate;
+
+    /// @notice THE NEGATIVE BRANCH OF THE FINALIZE GATE. How many times
+    /// {attemptFinalizeWithMissingScore} deliberately withheld one candidate's score and tried to
+    /// finalize before `submitEnd` anyway, and how many of those the contract actually refused.
+    /// Without this pair, `invariant_finalizeNeverRunsBeforeEveryScoreOrSubmitEnd` could pass
+    /// vacuously forever: the random walk almost never happens to call `finalize` with a score
+    /// missing on its own, so the gate's refusal path would never be exercised.
+    uint256 public missingScoreFinalizeAttempts;
+    uint256 public missingScoreFinalizeRefused;
 
     constructor(
         FamilyFactory _factory,
@@ -175,18 +216,77 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
         _snapshot();
     }
 
+    function setOracle(MockVenueOracle o) external {
+        oracle = o;
+    }
+
+    /// @dev A random oracle answer: any price (biased towards a plausible band), any status,
+    /// any clamped streak, and sometimes a revert, a gas burn, a short or an out-of-range answer.
+    function fuzzOracle(uint256 priceSeed, uint256 statusSeed, uint256 modeSeed) external {
+        calls++;
+        if (address(oracle) == address(0)) return;
+        uint160 price = priceSeed % 2 == 0
+            ? uint160(bound(priceSeed, uint256(1) << 80, uint256(1) << 112))
+            : uint160(bound(priceSeed, 0, type(uint160).max));
+        uint8 status = statusSeed % 3 == 0 ? uint8(statusSeed >> 8) : 0;
+        uint8 mode = uint8(modeSeed % 10);
+        oracle.set(price, status, uint32(statusSeed >> 16), mode > 4 ? 0 : mode);
+    }
+
+    /// @dev Every start priced in `logs` must lie within [Y, X] of its parent's supply.
+    function _checkStarts(Vm.Log[] memory logs) internal {
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(factory) || logs[i].topics[0] != FamilyFactory.StartPriced.selector) {
+                continue;
+            }
+            (,, uint256 cap,,) = abi.decode(logs[i].data, (uint160, uint256, uint256, uint256, uint16));
+            uint256 supply = IERC20(address(uint160(uint256(logs[i].topics[2])))).totalSupply();
+            uint256 lo = (supply * factory.START_MIN_PARENT_WAD()) / 1e18;
+            uint256 hi = (supply * factory.START_MAX_PARENT_BPS()) / 10_000;
+            startsChecked++;
+            if (cap < lo || cap > hi || cap == 0) startsOutOfBand++;
+        }
+    }
+
+    /// @dev A registration reverted: retry it against a sane oracle and put the state back. If
+    /// the retry succeeds, the oracle's state alone made registration revert.
+    function _checkOracleRevert() internal {
+        if (address(oracle) == address(0)) return;
+        (uint160 p, uint8 st, uint32 sk, uint8 m) = (oracle.sqrtP(), oracle.status(), oracle.streak(), oracle.mode());
+        if (m == 0 && st == 0 && p != 0) return; // already sane: nothing to blame on the oracle
+        uint256 snap = vm.snapshotState();
+        oracle.set(uint160(uint256(1) << 96), 0, 0, 0);
+        try factory.registerCandidate("H", "H", "", type(uint256).max) {
+            oracleCausedReverts++;
+        } catch {}
+        vm.revertToState(snap);
+        sk;
+    }
+
     function registerCandidate(uint256 seed) external {
         calls++;
         uint256 bond = roundManager.currentBond();
-        address parent = roundManager.head();
-        uint256 parentSupply = IERC20(parent).totalSupply();
+        _registerOneCandidate();
+        seed;
+        bond;
+        _snapshot();
+    }
+
+    /// @dev Shared registration body: {registerCandidate} and {attemptFinalizeWithMissingScore}'s
+    /// own guaranteed-fresh candidate both run it, so `poolStartsChecked` and every other
+    /// registration ghost (tokens, positions) reflect EVERY candidate this harness ever
+    /// registers, through either path, rather than only the ones that went through the
+    /// dedicated action.
+    function _registerOneCandidate() internal returns (bool ok) {
+        vm.recordLogs();
         try factory.registerCandidate("H", "H", "", type(uint256).max) returns (
             address token, PoolKey memory key, uint256 id
         ) {
+            _checkStarts(vm.getRecordedLogs());
             _noteToken(token);
             (CurveRange[] memory ranges,) = StandardCurve.build(
                 factory.curveSpec(),
-                parentSupply,
+                factory.curveBasisOf(token),
                 FamilyToken(token).TOTAL_SUPPLY(),
                 factory.TICK_SPACING(),
                 Currency.unwrap(key.currency0) == token
@@ -194,13 +294,30 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
             for (uint256 i = 0; i < ranges.length; i++) {
                 notePosition(key.toId(), ranges[i].tickLower, ranges[i].tickUpper);
             }
+            _checkPoolStart(id);
             _candidates.push(id);
-            seed;
-        } catch {}
-        _snapshot();
+            ok = true;
+        } catch {
+            _checkOracleRevert();
+            ok = false;
+        }
     }
 
     uint256[] internal _candidates;
+
+    /// @dev The candidate just registered opened its pool now, and at or before
+    /// `max(r.tradingStart, T - W - RANDOM_END_S)`.
+    function _checkPoolStart(uint256 id) internal {
+        RoundManager.Candidate memory c = roundManager.candidateInfo(id);
+        RoundManager.Round memory r = roundManager.roundInfo(c.roundId);
+        uint64 reach = roundManager.closingWindowFor(c.roundId) + roundManager.RANDOM_END_S();
+        uint64 latest = r.nominalEnd > reach ? r.nominalEnd - reach : 0;
+        if (latest < r.tradingStart) latest = r.tradingStart;
+        poolStartsChecked++;
+        if (c.tradingStart != block.timestamp || c.tradingStart > latest) poolStartsOutOfRule++;
+        if (factory.hook().poolInfo(c.key.toId()).tradingStart != c.tradingStart) poolStartsOutOfRule++;
+        if (r.lateEntryEnd != 0 && c.tradingStart >= r.registrationEnd) lateEntryChecked++;
+    }
 
     function tradeCandidate(uint256 seed, uint256 amountSeed) external {
         calls++;
@@ -237,8 +354,11 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
                 try roundManager.submitScore(_candidates[i]) {} catch {}
             }
             open = roundManager.roundInfo(roundManager.roundCount());
-            if (block.timestamp < open.submitEnd) vm.warp(open.submitEnd);
-            roundManager.finalize();
+            // early when every score is in; otherwise wait out the window
+            if (block.timestamp < open.submitEnd && !_allSubmitted(roundManager.roundCount())) {
+                vm.warp(open.submitEnd);
+            }
+            _finalizeChecked();
             delete _candidates;
         }
         uint256 head = roundManager.headIndex();
@@ -250,12 +370,15 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
         successionAttempts++;
 
         uint256 bond = roundManager.currentBond();
+        vm.recordLogs();
         (address token, PoolKey memory key, uint256 id) = factory.registerCandidate("W", "W", "", type(uint256).max);
+        _checkStarts(vm.getRecordedLogs());
+        _checkPoolStart(id);
         _noteToken(token);
         {
             (CurveRange[] memory ranges,) = StandardCurve.build(
                 factory.curveSpec(),
-                IERC20(parent).totalSupply(),
+                factory.curveBasisOf(token),
                 FamilyToken(token).TOTAL_SUPPLY(),
                 factory.TICK_SPACING(),
                 Currency.unwrap(key.currency0) == token
@@ -282,9 +405,9 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
         _settleEnd();
         roundManager.submitScore(id);
         r = roundManager.roundInfo(roundManager.roundCount());
-        vm.warp(r.submitEnd);
+        if (!_allSubmitted(roundManager.roundCount())) vm.warp(r.submitEnd);
         uint256 headBefore = roundManager.headIndex();
-        roundManager.finalize();
+        _finalizeChecked();
         if (roundManager.headIndex() != headBefore) successions++;
         delete _candidates;
         _snapshot();
@@ -329,10 +452,83 @@ contract FamilyHandler is CommonBase, StdCheats, StdUtils {
         for (uint256 i = 0; i < _candidates.length; i++) {
             try roundManager.submitScore(_candidates[i]) {} catch {}
         }
-        try roundManager.finalize() {
-            delete _candidates;
-        } catch {}
+        if (_finalizeChecked()) delete _candidates;
         _snapshot();
+    }
+
+    /// @dev NEGATIVE BRANCH: deliberately withholds the last candidate's score and attempts
+    /// `finalize()` before `submitEnd` anyway. The call must be refused (`SubmissionWindowOpen`):
+    /// a success here is exactly what `finalizesOutOfGate` (via `_finalizeChecked`) already
+    /// treats as a failure, so this action's only job is to make sure that branch is actually
+    /// reachable instead of merely never tried.
+    ///
+    /// Registers one FRESH candidate of its own BEFORE settling the end (registration closes
+    /// once trading ends, so it must happen first), rather than relying on the random walk to
+    /// have left one of the round's existing candidates unsubmitted: a candidate registered in
+    /// this very call is guaranteed unsubmitted, which is what makes the missing-score state
+    /// below reachable on demand instead of by luck.
+    ///
+    /// Whatever happens above, the LAST thing this call does is submit every outstanding score
+    /// and retry finalize. Without that cleanup, a fresh candidate this action registers but
+    /// never gets to (the round was not yet settled, or was already past `submitEnd`) would sit
+    /// permanently unsubmitted, which would push EVERY later `submitAndFinalize` / `forceSuccession`
+    /// on that round past the early path for good - exactly the coverage this harness also has to
+    /// prove (`earlyFinalizes`), so this action must never be the reason it goes unreached.
+    function attemptFinalizeWithMissingScore() external {
+        calls++;
+        _registerOneCandidate();
+        _settleEnd();
+        uint256 roundId = roundManager.roundCount();
+        if (roundId != 0) {
+            RoundManager.Round memory r = roundManager.roundInfo(roundId);
+            bool ready = !r.finalized && r.tradingEnd != 0 && block.timestamp < r.submitEnd && _candidates.length >= 1;
+            if (ready) {
+                // submit every score except the last candidate's
+                for (uint256 i = 0; i + 1 < _candidates.length; i++) {
+                    try roundManager.submitScore(_candidates[i]) {} catch {}
+                }
+                if (!roundManager.candidateInfo(_candidates[_candidates.length - 1]).submitted) {
+                    missingScoreFinalizeAttempts++;
+                    if (_finalizeChecked()) delete _candidates;
+                    else missingScoreFinalizeRefused++;
+                }
+            }
+            // cleanup: submit whatever is still outstanding (a no-op for anything already
+            // submitted) and retry finalize, so nothing this call touched is left orphaned
+            for (uint256 i = 0; i < _candidates.length; i++) {
+                try roundManager.submitScore(_candidates[i]) {} catch {}
+            }
+            if (_finalizeChecked()) delete _candidates;
+        }
+        _snapshot();
+    }
+
+    /// @dev Every candidate registered in `roundId` has a score, read off the candidates themselves.
+    function _allSubmitted(uint256 roundId) internal view returns (bool) {
+        uint256[] memory ids = roundManager.candidateIds(roundId);
+        for (uint256 i = 0; i < ids.length; i++) {
+            if (!roundManager.candidateInfo(ids[i]).submitted) return false;
+        }
+        return true;
+    }
+
+    /// @dev `finalize()` under the gate ghost: a call that closes the round must find the round's
+    /// `submitEnd` passed or every candidate's score in. Returns whether the round is now final.
+    function _finalizeChecked() internal returns (bool closed) {
+        uint256 roundId = roundManager.roundCount();
+        RoundManager.Round memory r = roundManager.roundInfo(roundId);
+        bool wasFinal = r.finalized;
+        bool allIn = _allSubmitted(roundId);
+        try roundManager.finalize() {} catch {}
+        closed = roundManager.roundInfo(roundId).finalized;
+        if (closed && !wasFinal) {
+            finalizesChecked++;
+            if (block.timestamp < r.submitEnd) {
+                earlyFinalizes++;
+                if (!allIn) finalizesOutOfGate++;
+            }
+            if (r.tradingEnd == 0) finalizesOutOfGate++;
+        }
     }
 
     function deploySupport(uint256 seed) external {

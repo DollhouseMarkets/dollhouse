@@ -838,8 +838,10 @@ contract FeeVault is IFeeVault, IUnlockCallback {
             // head the candidate is challenging - the candidate trades against that head's token
             // and its liquidity. AFTER the round there is no contest left to share: a trade in a
             // losing candidate's pool is that coin's own trade, so its creator takes the whole
-            // creator share.
-            bool trading = roundManager.phase(c.roundId) == RoundManager.Phase.Trading;
+            // creator share. Registration counts as during: the pool trades from the moment it
+            // registers.
+            RoundManager.Phase ph = roundManager.phase(c.roundId);
+            bool trading = ph == RoundManager.Phase.Registration || ph == RoundManager.Phase.Trading;
             return (true, c.token, trading ? roundManager.canonical(parentIndex) : address(0), parentIndex);
         }
         if (terminalIndex > roundManager.headIndex()) return (false, address(0), address(0), 0);

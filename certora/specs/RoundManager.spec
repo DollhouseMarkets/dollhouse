@@ -17,6 +17,17 @@
  *     the round's only progression path.
  * - `openRoundIfIdle` and `addCandidate` CARRY THE REENTRANCY GUARD, because
  *     both are reachable from inside a transfer this contract is making.
+ *
+ * NEEDS A RE-RUN (2026-10-03): commit e1e974e renamed BASE_TRADING_S/MAX_TRADING_S to
+ * BASE_ROUND_S/MAX_ROUND_S, added `roundLengthFor(n)` and early finalize via
+ * `submittedCount[round]`. Every rule in this file is affected by the rename, but the rules
+ * whose STATEMENT (not just a getter name) changed under this commit, and that must be re-run
+ * once Prover access is available, are:
+ *   - lateEntryClosesBeforeTheClosingWindow (durationFor/registrationFor now derive from L(n))
+ *   - trueEndFallsInsideTheWindow (randomEndWindowFor depends on durationFor(n))
+ *   - finalizeIsIdempotent (finalize's gate condition changed)
+ *   - finalizeBooksWhatItCouldNotDeliver (finalize's gate condition changed)
+ *   - noTransitionIsPrivileged (finalize's reachability now depends on submittedCount)
  */
 
 using RoundManager as rm;
@@ -25,16 +36,22 @@ methods {
     // --- schedule, pure in the round number (spec C; RND-01) ---
     function durationFor(uint256) external returns (uint64) envfree;
     function registrationFor(uint256) external returns (uint64) envfree;
+    function roundLengthFor(uint256) external returns (uint64) envfree;
     function lateEntryUntil(uint256) external returns (uint64) envfree;
     function closingWindowFor(uint256) external returns (uint64) envfree;
     function randomEndWindowFor(uint256) external returns (uint64) envfree;
     function scoreSlotFor(uint256) external returns (uint32) envfree;
     function bondFor(uint256) external returns (uint256) envfree;
+    // The round's current phase (spec A); used by the finalize-gate equivalence below.
+    function phase(uint256) external returns (RoundManager.Phase) envfree;
+    // The per-round count of candidates that have submitted a score; the finalize gate's
+    // "every score is already in" half (spec C, "Early finalize").
+    function submittedCount(uint256) external returns (uint256) envfree;
 
     // --- constants and immutables (spec C) ---
-    function BASE_TRADING_S() external returns (uint64) envfree;
+    function BASE_ROUND_S() external returns (uint64) envfree;
     function CLOSING_WINDOW_S() external returns (uint64) envfree;
-    function MAX_TRADING_S() external returns (uint64) envfree;
+    function MAX_ROUND_S() external returns (uint64) envfree;
     function MIN_REGISTRATION_S() external returns (uint64) envfree;
     function MAX_REGISTRATION_S() external returns (uint64) envfree;
     function LATE_ENTRY_FROM_S() external returns (uint64) envfree;
@@ -420,6 +437,25 @@ rule finalizeIsIdempotent(env e, env e2) {
         "a second finalize changed state";
 }
 
+/// EARLY FINALIZE (spec C). `finalize` may only cross its gate once the end is settled
+/// (`tradingEnd != 0`) AND either `submitEnd` has passed or every one of the round's registered
+/// candidates has already submitted a score (`submittedCount == candidateCount`); registration is
+/// closed long before `T_end` is known, so `candidateCount` cannot grow once the gate is
+/// reachable and the early path cannot exclude anybody. The idempotent no-op (an already
+/// finalized round) is excluded from the gate itself, since it succeeds regardless.
+rule finalizeGate(env e) {
+    uint256 roundId = roundCount();
+    RoundManager.Round before = roundInfo(roundId);
+    uint256 submittedBefore = submittedCount(roundId);
+    finalize@withrevert(e);
+    bool succeeded = !lastReverted;
+    assert succeeded && !before.finalized => before.tradingEnd != 0,
+        "finalize succeeded before the end was settled";
+    assert succeeded && !before.finalized =>
+        (e.block.timestamp >= before.submitEnd || submittedBefore >= before.candidateCount),
+        "finalize succeeded while the submission window was open and scores were still missing";
+}
+
 /// Round n+1 cannot open until round n is finalized.
 rule noNewRoundBeforeFinalize(env e) {
     require !isIdle();          // a round is open and not yet finalized
@@ -608,6 +644,36 @@ rule guardedFactoryEntrypointsCannotBeReentered(env e, uint256 roundId, address 
 }
 
 // ---------------------------------------------------------------------------------------------
+// the submission window (early finalize, spec C)
+// ---------------------------------------------------------------------------------------------
+
+/// `submittedCount[roundId]` never exceeds the round's `candidateCount`: every one of a round's
+/// candidates can advance the counter at most once (`submitScore` is a no-op once `c.submitted`
+/// is already true), and registration closes long before the submission window opens, so the
+/// round's `candidateCount` cannot grow once the window is reachable. This is the invariant the
+/// `finalizeGate` early path rests on: `submittedCount == candidateCount` is reachable at all,
+/// and once reached it is never exceeded.
+invariant submittedCountBounded(uint256 roundId)
+    to_mathint(submittedCount(roundId)) <= to_mathint(roundInfo(roundId).candidateCount)
+    filtered { f -> !f.isView && f.contract == currentContract }
+
+/// The only writer of `submittedCount[roundId]` is `submitScore`, and it moves the counter by
+/// exactly one per candidate: zero on the re-submission no-op (`c.submitted` already true), one
+/// the first time a given candidate submits. No other entrypoint, finalize included, may touch
+/// it.
+rule submittedCountMovesOnlyInSubmitScore(method f, env e, calldataarg args, uint256 roundId)
+    filtered { f -> !f.isView && f.contract == currentContract }
+{
+    mathint before = to_mathint(submittedCount(roundId));
+    f(e, args);
+    mathint after = to_mathint(submittedCount(roundId));
+    assert after != before => f.selector == sig:submitScore(uint256).selector,
+        "submittedCount moved outside submitScore";
+    assert after - before >= 0 && after - before <= 1,
+        "a submitScore call moved submittedCount by more than one, or decreased it";
+}
+
+// ---------------------------------------------------------------------------------------------
 // the random end (RND-04, RND-05, RND-06, RAN-03, RAN-04)
 // ---------------------------------------------------------------------------------------------
 
@@ -623,7 +689,8 @@ rule requestEndIsOnceAndNotBeforeT(env e, env e2) {
 }
 
 /// On fulfilment T_end lies in [T - randomEndWindowFor(n), T], i.e. in the last
-/// 180 s at mainnet constants, and never after T.
+/// 180 s at mainnet constants for round 5 onward, and never after T. On rounds 1-2 the window is
+/// clamped to D(n)/4 = 105 s (D(n) = 420 s there), not the flat 180 s.
 rule trueEndFallsInsideTheWindow(env e, bytes proof, uint256 n) {
     require wellFormedSchedule();
     uint64 tEnd = fulfilEnd(e, proof);
@@ -666,13 +733,19 @@ rule scheduleIsPureInN(method f, env e, calldataarg args, uint256 n)
     uint64 w = closingWindowFor(n);
     uint64 re = randomEndWindowFor(n);
     uint32 s = scoreSlotFor(n);
+    uint64 rl = roundLengthFor(n);
     f(e, args);
     assert durationFor(n) == d && registrationFor(n) == r && lateEntryUntil(n) == l
-        && closingWindowFor(n) == w && randomEndWindowFor(n) == re && scoreSlotFor(n) == s,
+        && closingWindowFor(n) == w && randomEndWindowFor(n) == re && scoreSlotFor(n) == s
+        && roundLengthFor(n) == rl,
         "a schedule value changed after a state-changing call";
 }
 
-/// D(n) is capped at MAX_TRADING_S and R(n) is clamped into
+/// L(n) = roundLengthFor(n), the WHOLE round (registration through the published end `T`), is
+/// capped at MAX_ROUND_S; D(n) = durationFor(n) is exactly L(n) - R(n) (`roundLengthFor` is
+/// `registrationFor(n) + durationFor(n)` by construction, restated here as a consistency check
+/// rather than assumed); D(n) is capped at MAX_ROUND_S - 180, because R(n) never falls below the
+/// 180 s (`MIN_REGISTRATION_S`) floor and L(n) never exceeds MAX_ROUND_S; and R(n) is clamped into
 /// [MIN_REGISTRATION_S, MAX_REGISTRATION_S], for every n.
 /// SPEC-GAP: DURATION_SCALE_DIV divides D and R; the spec is silent on whether W is computed from the
 /// scaled or the nominal D (PROPERTIES 7 item 7). This encodes the scaled reading, as RND-01 assumes.
@@ -680,9 +753,12 @@ rule scheduleIsPureInN(method f, env e, calldataarg args, uint256 n)
 /// directly rather than reproducing a piecewise table.
 rule scheduleBounds(uint256 n) {
     require wellFormedSchedule();
-    assert durationFor(n) <= MAX_TRADING_S() / DURATION_SCALE_DIV()
-        || DURATION_SCALE_DIV() == 1 && durationFor(n) <= MAX_TRADING_S(),
-        "D(n) exceeded its cap";
+    assert to_mathint(roundLengthFor(n)) <= to_mathint(MAX_ROUND_S()),
+        "L(n) exceeded MAX_ROUND_S";
+    assert to_mathint(durationFor(n)) == to_mathint(roundLengthFor(n)) - to_mathint(registrationFor(n)),
+        "D(n) is not L(n) - R(n)";
+    assert to_mathint(durationFor(n)) <= to_mathint(MAX_ROUND_S()) - 180,
+        "D(n) exceeded MAX_ROUND_S - 180";
     assert registrationFor(n) >= MIN_REGISTRATION_S() / DURATION_SCALE_DIV()
         || registrationFor(n) >= 1,
         "R(n) fell below its floor";
@@ -760,6 +836,10 @@ rule theScoredWindowAlwaysExceedsOneCoarseSlot(uint256 n) {
 
 /// No candidate is
 /// ever scored over a span beginning before its own pool opened.
+/// VACUOUS AT DURATION_SCALE_DIV() > 1: `require durationFor(n) >= LATE_ENTRY_FROM_S()` scales
+/// `durationFor` down with the divisor while `LATE_ENTRY_FROM_S()` stays flat, so on a scaled
+/// testnet schedule the precondition is unsatisfiable and the rule proves nothing; it is only
+/// a live check at the mainnet divisor of 1.
 rule lateEntryClosesBeforeTheClosingWindow(uint256 n) {
     require wellFormedSchedule();
     require durationFor(n) >= LATE_ENTRY_FROM_S();
@@ -853,6 +933,44 @@ rule sunsetTouchesNothingElse(env e, address successorAddr) {
     announceSunset(e, successorAddr);
     assert head() == h && headIndex() == hi && roundCount() == rc && hWad() == hw,
         "announcing a sunset moved the chain";
+}
+
+// ---------------------------------------------------------------------------------------------
+// audit follow-ups beyond what exists above (schedule audit, commit e1e974e)
+// ---------------------------------------------------------------------------------------------
+
+/// (d) THE SCORED SPAN EXCEEDS ONE COARSE SLOT, restated over the round's own duration rather than
+/// the flat closing window: `durationFor(n) - randomEndWindowFor(n) + 1 > scoreSlotFor(n)`. This is
+/// a stronger, duration-relative statement than `theScoredWindowAlwaysExceedsOneCoarseSlot` above
+/// (which is stated over `closingWindowFor(n)`): since `closingWindowFor(n) <= durationFor(n)` for
+/// every reachable n (the closing window cannot outlast the round it closes), this bound dominates
+/// it whenever `randomEndWindowFor(n) <= durationFor(n) - closingWindowFor(n)`, i.e. whenever the
+/// random end cannot itself eat into the closing window's own span.
+rule scoredSpanExceedsOneCoarseSlot(uint256 n) {
+    require wellFormedSchedule();
+    assert to_mathint(durationFor(n)) - to_mathint(randomEndWindowFor(n)) + 1
+            > to_mathint(scoreSlotFor(n)),
+        "the scored span (duration less the random-end window) is no wider than one coarse slot";
+}
+
+/// (g) THE FINALIZE GATE AND `phase()` AGREE. `phase(roundId) == Finalizable` iff a `finalize()`
+/// call against that round does not revert with `SubmissionWindowOpen`: the gate is one single
+/// condition (`block.timestamp >= submitEnd || submittedCount >= candidateCount`), restated once in
+/// the phase view and once in the finalize entrypoint, and this rule is the anti-drift check that
+/// the two restatements never disagree. A round that is not open at all (`Idle`) or already
+/// `Finalized` is excluded: `finalize` on those reverts for a different reason (`NoRound` /
+/// idempotent no-op), not `SubmissionWindowOpen`, so the equivalence is stated over the rounds
+/// where `SubmissionWindowOpen` is the only question on the table.
+rule finalizeGateMatchesPhase(env e) {
+    uint256 roundId = roundCount();
+    RoundManager.Round before = roundInfo(roundId);
+    require before.openedAt != 0 && !before.finalized;
+    require before.tradingEnd != 0;             // EndPending excluded: a different revert there
+    bool isFinalizable = phase(roundId) == RoundManager.Phase.Finalizable;
+    bool windowOpen = e.block.timestamp < before.submitEnd
+        && to_mathint(submittedCount(roundId)) < to_mathint(before.candidateCount);
+    assert isFinalizable == !windowOpen,
+        "phase()'s Finalizable reading disagrees with the gate's own SubmissionWindowOpen condition";
 }
 
 /// CON-01 (spec A "Continuation, with LAZY HEAD ADOPTION"): adoption happens at most once.

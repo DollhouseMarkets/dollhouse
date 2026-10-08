@@ -6,6 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FeeVault} from "../contracts/FeeVault.sol";
 import {RoundManager} from "../contracts/RoundManager.sol";
+import {FamilyFactory} from "../contracts/FamilyFactory.sol";
 import {DeployConstantsLib} from "../script/DeployConstantsLib.sol";
 
 /// @notice The stack as it will actually be deployed: every number here is the LOCKED value from
@@ -38,7 +39,7 @@ contract DeployConstantsTest is RoundTestBase {
     uint256 internal constant D_BOND_DOUBLING_EVERY = DeployConstantsLib.BOND_DOUBLING_EVERY;
     uint256 internal constant D_BOND_MAX = DeployConstantsLib.BOND_MAX;
     uint256 internal constant D_H_FRAC_WAD = DeployConstantsLib.H_FRAC_WAD; // threshold disabled in this deployment
-    uint64 internal constant D_TRADING_S = 900;
+    uint64 internal constant D_TRADING_S = 420;
     uint64 internal constant D_SUBMIT_S = 300;
     /// @dev Steward / developer role transfer delay. Hardcoded in RoundManager/FeeVault, not a
     /// Deploy.s.sol constant. There is no developer allocation and no vesting-related deploy
@@ -82,8 +83,49 @@ contract DeployConstantsTest is RoundTestBase {
         return RoundManager.Bond({base: D_BOND_BASE, doublingEvery: D_BOND_DOUBLING_EVERY, max: D_BOND_MAX});
     }
 
+    /// @dev The ETH-anchored start exactly as Deploy.s.sol sends it, in the curve phase (no venue
+    /// oracle: every round opens on START_FALLBACK_DOLL).
+    function _startSetup() internal pure override returns (FamilyFactory.StartSetup memory) {
+        return FamilyFactory.StartSetup({
+            expectedVenueId: bytes32(0),
+            oracleCodehash: bytes32(0),
+            fdvWei: DeployConstantsLib.START_FDV_WEI,
+            maxParentBps: DeployConstantsLib.START_MAX_PARENT_BPS,
+            minParentWad: DeployConstantsLib.START_MIN_PARENT_WAD,
+            fallbackDoll: DeployConstantsLib.START_FALLBACK_DOLL,
+            oracleGas: DeployConstantsLib.ORACLE_GAS,
+            linkMinCoverS: DeployConstantsLib.START_LINK_MIN_COVER_S,
+            walkMax: DeployConstantsLib.START_WALK_MAX
+        });
+    }
+
     function setUp() public {
         _setUpEdge();
+    }
+
+    /// @notice The start constants are the spec's (private/V2_ORACLE_SPEC.md "Deploy
+    /// parameters") and reach the factory unchanged.
+    function test_startConstantsAreTheSpecsAndWired() public view {
+        assertEq(DeployConstantsLib.START_FDV_WEI, 5e18, "E0 5 ETH");
+        assertEq(DeployConstantsLib.START_MAX_PARENT_BPS, 5_000, "X 50%");
+        assertEq(DeployConstantsLib.START_MIN_PARENT_WAD, 1e15, "Y 0.1%");
+        assertEq(DeployConstantsLib.ORACLE_GAS, 200_000);
+        assertEq(DeployConstantsLib.START_LINK_MIN_COVER_S, 1800);
+        assertEq(DeployConstantsLib.START_WALK_MAX, 24);
+        // E0 / graduation price (2.0580e-8 ETH per $DOLL), to the whole token
+        assertEq(DeployConstantsLib.START_FALLBACK_DOLL, (uint256(5e18) * 1e18 / 2.058e10) / 1e18 * 1e18);
+        assertEq(factory.START_FDV_WEI(), DeployConstantsLib.START_FDV_WEI);
+        assertEq(factory.START_MAX_PARENT_BPS(), DeployConstantsLib.START_MAX_PARENT_BPS);
+        assertEq(factory.START_MIN_PARENT_WAD(), DeployConstantsLib.START_MIN_PARENT_WAD);
+        assertEq(factory.START_FALLBACK_DOLL(), DeployConstantsLib.START_FALLBACK_DOLL);
+        assertEq(factory.ORACLE_GAS(), DeployConstantsLib.ORACLE_GAS);
+        assertEq(factory.START_LINK_MIN_COVER_S(), DeployConstantsLib.START_LINK_MIN_COVER_S);
+        assertEq(factory.START_WALK_MAX(), DeployConstantsLib.START_WALK_MAX);
+        assertEq(factory.venueOracle(), address(0), "curve phase: no oracle bound");
+        // the lower clamp is exactly the old start rule: spec[0] opens at 1/1000 of the parent
+        assertEq(factory.curveSpec()[0].fdvRatioLowerWad, DeployConstantsLib.START_MIN_PARENT_WAD);
+        // link one opened on the fallback, unclamped (24% of $DOLL's supply)
+        assertEq(factory.startFdvOf(roundManager.canonical(1)), DeployConstantsLib.START_FALLBACK_DOLL);
     }
 
     // ---------------------------------------------------------------------------------
@@ -123,17 +165,19 @@ contract DeployConstantsTest is RoundTestBase {
         assertEq(factory.GENESIS_TOKEN(), address(doll), "the adopted edge currency");
         assertEq(vault.EDGE().toId(), uint256(uint160(address(doll))), "and the vault is denominated in it");
         assertEq(roundManager.H_FRAC_WAD(), D_H_FRAC_WAD, "H0 = 0, threshold disabled in this deployment");
-        assertEq(roundManager.durationFor(1), D_TRADING_S, "trading window 900 s");
+        assertEq(roundManager.durationFor(1), D_TRADING_S, "trading window 420 s");
         assertEq(factory.TICK_SPACING(), 60, "tick spacing 60");
 
         // The adaptive schedule, the closing window and the random end
         assertEq(roundManager.DURATION_SCALE_DIV(), 1, "the mainnet schedule is unscaled");
-        assertEq(roundManager.BASE_TRADING_S(), 15 minutes, "D(1) = 15 min");
-        assertEq(roundManager.MAX_TRADING_S(), 12 hours, "D is capped at 12 h");
+        assertEq(roundManager.BASE_ROUND_S(), 10 minutes, "L(1) = 10 min, entries included");
+        assertEq(roundManager.MAX_ROUND_S(), 12 hours, "L is capped at 12 h");
+        assertEq(roundManager.roundLengthFor(1), 10 minutes, "round 1 is ten minutes from the first entry");
+        assertEq(roundManager.registrationFor(1), 3 minutes, "of which 3 min registration");
         assertEq(roundManager.MIN_REGISTRATION_S(), 3 minutes, "R floor 3 min");
         assertEq(roundManager.MAX_REGISTRATION_S(), 1 hours, "R cap 1 h");
         assertEq(roundManager.LATE_ENTRY_FROM_S(), 1 hours, "late entry from 1-hour rounds up");
-        assertEq(roundManager.closingWindowFor(1), 15 minutes, "closing window 15 min on a short round");
+        assertEq(roundManager.closingWindowFor(1), 15 minutes, "closing window 15 min on a short round (W > D: scored over all of trading)");
         assertEq(roundManager.closingWindowFor(13), 15 minutes, "and 15 min on a 12-hour one: W is flat");
         assertEq(roundManager.RANDOM_END_S(), 180, "the true end falls in the last 3 minutes");
         assertEq(roundManager.END_TIMEOUT(), 30 minutes, "deterministic fallback after 30 min");

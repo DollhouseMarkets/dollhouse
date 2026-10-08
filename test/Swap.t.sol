@@ -185,7 +185,9 @@ contract SwapTest is RoundTestBase {
         assertGt(p2.cumSqrtP, 0, "price observation accumulated");
     }
 
-    /// @notice A candidate pool cannot be traded before its synchronized start.
+    /// @notice The hook still refuses a swap before a pool's registered start. In production the
+    /// factory registers every pool with its own registration block as the start, so this gate never
+    /// fires there; it stays as defence and is covered here with a future start.
     function test_swapRevertsBeforeTradingStart() public {
         (FamilyFactory f2, FamilyHook h2) = _deployFactory(address(swapRouter));
         PoolKey memory k2 = PoolKey({

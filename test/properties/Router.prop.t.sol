@@ -8,6 +8,7 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FamilyRouter} from "../../contracts/FamilyRouter.sol";
+import {RoundManager} from "../../contracts/RoundManager.sol";
 
 /// @notice Property tests for the router (docs/spec/PROPERTIES.md sec.3.13), tier F.
 contract RouterPropTest is RoundTestBase {
@@ -176,19 +177,30 @@ contract RouterPropTest is RoundTestBase {
         assertEq(address(familyRouter).balance, 0, "and holds nothing");
     }
 
-    /// @notice ROU-08: `buyCandidate`/`sellCandidate` are refused while the candidate's round is
-    /// in Registration, and work forever afterwards, win or lose.
+    /// @notice ROU-08: `buyCandidate`/`sellCandidate` work from the candidate's registration -
+    /// its pool opens then, so Registration routes like Trading - and forever afterwards, win or
+    /// lose. Only Idle is refused (unreachable for a registered candidate; forced by a mock).
     function testFuzz_ROU08_candidateRoutesFollowTheRoundPhase(uint256 ethIn, uint256 wait) public {
         ethIn = bound(ethIn, 0.01 ether, 1 ether);
         Cand memory c = _registerCandidate(address(0xA11CE), "C");
         (uint64 tradingStart,, uint64 submitEnd) = _roundTimes(roundManager.roundCount());
 
+        vm.mockCall(
+            address(roundManager),
+            abi.encodeWithSelector(RoundManager.phase.selector, roundManager.candidateInfo(c.id).roundId),
+            abi.encode(RoundManager.Phase.Idle)
+        );
         vm.expectRevert(FamilyRouter.NotTrading.selector);
         familyRouter.buyCandidate(c.id, ethIn, 0, address(this), 8);
+        vm.clearMockedCalls();
+
+        vm.warp(_poolStart(c) + 1);
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Registration));
+        assertGt(familyRouter.buyCandidate(c.id, ethIn, 0, address(this), 8), 0, "trades during Registration");
 
         vm.warp(tradingStart + 1);
         uint256 out = familyRouter.buyCandidate(c.id, ethIn, 0, address(this), 8);
-        assertGt(out, 0, "the candidate trades once its pool opens");
+        assertGt(out, 0, "and once the round clock starts");
 
         // it loses the round, and its pool lives on
         _settleEnd();

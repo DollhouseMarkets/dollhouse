@@ -25,7 +25,7 @@ contract InvariantsTest is RoundTestBase {
             handler.notePosition(poolId, ranges[i].tickLower, ranges[i].tickUpper);
         }
 
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](10);
         selectors[0] = FamilyHandler.buy.selector;
         selectors[1] = FamilyHandler.sell.selector;
         selectors[2] = FamilyHandler.registerCandidate.selector;
@@ -35,6 +35,7 @@ contract InvariantsTest is RoundTestBase {
         selectors[6] = FamilyHandler.deploySupport.selector;
         selectors[7] = FamilyHandler.forceSuccession.selector;
         selectors[8] = FamilyHandler.claimFees.selector;
+        selectors[9] = FamilyHandler.attemptFinalizeWithMissingScore.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -93,6 +94,36 @@ contract InvariantsTest is RoundTestBase {
         if (handler.claimAttempts() != 0) {
             assertGt(handler.claims(), 0, "no fee was ever claimable");
         }
+        // the pool-start invariant below is checked against a counter that the run itself must
+        // have advanced at least once, or it is asserting against zero candidates
+        assertGt(handler.poolStartsChecked(), 0, "the pool-start invariant was never exercised");
+        // EARLY FINALIZE: the run must have actually closed a round, and at least once before
+        // submitEnd, or the gate above is checked against zero finalizations
+        assertGt(handler.finalizesChecked(), 0, "no round was ever finalized");
+        assertGt(handler.earlyFinalizes(), 0, "no round was ever finalized before submitEnd");
+        // THE NEGATIVE BRANCH: a finalize attempted with one score missing before submitEnd must
+        // have been tried, and every one of those must have been refused by the gate.
+        assertGt(
+            handler.missingScoreFinalizeAttempts(), 0, "the finalize gate's negative branch was never exercised"
+        );
+        assertEq(
+            handler.missingScoreFinalizeAttempts(),
+            handler.missingScoreFinalizeRefused(),
+            "a finalize with a score missing before submitEnd was not refused"
+        );
+    }
+
+    /// @notice INSTANT TRADING: every candidate's pool opens at its own registration and no
+    /// later than `max(r.tradingStart, T - W - RANDOM_END_S)`, so the scored window never starts
+    /// before a pool existed.
+    function invariant_everyPoolOpensAtRegistrationAndBeforeTheScoredWindow() public view {
+        assertEq(handler.poolStartsOutOfRule(), 0, "a pool opened off its registration or too late");
+    }
+
+    /// @notice EARLY FINALIZE: no round is ever closed before every one of its candidates has
+    /// submitted a score, unless its `submitEnd` has passed - and never before `T_end` is settled.
+    function invariant_finalizeNeverRunsBeforeEveryScoreOrSubmitEnd() public view {
+        assertEq(handler.finalizesOutOfGate(), 0, "a round was finalized with a score missing before submitEnd");
     }
 
     /// @notice One canonical token per index, append-only, with a consistent reverse index.

@@ -20,6 +20,7 @@ import {FeeVault} from "./FeeVault.sol";
 import {Locker} from "./Locker.sol";
 import {RoundManager} from "./RoundManager.sol";
 import {IBidDeployer} from "./interfaces/IBidDeployer.sol";
+import {IFamilyFactory} from "./interfaces/IFamilyFactory.sol";
 import {IPriorRegistry} from "./interfaces/IPriorRegistry.sol";
 import {IVersionFactory} from "./interfaces/IVersionFactory.sol";
 import {StandardCurve} from "./libraries/StandardCurve.sol";
@@ -849,11 +850,11 @@ contract BidDeployer is IBidDeployer {
     }
 
     /// @dev Generation `j`'s launch curve, rebuilt from the deploy constants of the version that
-    /// launched it.
+    /// launched it and the curve basis that version's factory stored for `token`.
     /// @dev `token` is the CHILD of the pool being sized - `canonical(j)` for the trunk link, or a
     /// losing SIBLING of the same generation when the purse is being split. Every sibling of a
-    /// generation launched off the same parent supply with the same standard curve, so the shape
-    /// is identical; only the orientation depends on how the token sorted.
+    /// round shares one stored basis and the same standard curve, so the shape is identical;
+    /// only the orientation depends on how the token sorted.
     function _curveRanges(PoolKey memory key, uint256 j, address token)
         internal
         view
@@ -861,9 +862,17 @@ contract BidDeployer is IBidDeployer {
     {
         if (token == address(0) || j == 0) return ranges;
         FamilyFactory f = _factoryFor(j);
+        // The basis the factory STORED at launch. The parent's live supply is only the fallback
+        // for factories that predate {IFamilyFactory.curveBasisOf}: it drifts whenever anyone
+        // burns the parent, and a curve rebuilt from it no longer matches the pool.
+        uint256 basis;
+        try IFamilyFactory(address(f)).curveBasisOf(token) returns (uint256 b) {
+            basis = b;
+        } catch {}
+        if (basis == 0) basis = IERC20(roundManager.canonical(j - 1)).totalSupply();
         (ranges,) = StandardCurve.build(
             f.curveSpec(),
-            IERC20(roundManager.canonical(j - 1)).totalSupply(),
+            basis,
             FAMILY_TOTAL_SUPPLY,
             key.tickSpacing,
             Currency.unwrap(key.currency0) == token

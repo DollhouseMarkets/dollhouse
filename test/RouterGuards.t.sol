@@ -138,9 +138,17 @@ contract RouterGuardsTest is RoundTestBase {
         Cand memory c = _registerCandidate(address(0xA11CE), "CAND");
         (uint64 tradingStart, uint64 tradingEnd,) = _roundTimes(roundManager.roundCount());
 
-        // refused outside Trading
+        // INSTANT TRADING: the pool opens at its own registration, so the route works during
+        // Registration, before the round clock starts
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Registration));
+        vm.warp(block.timestamp + 3); // past the pool's own snipe tax
+        assertGt(familyRouter.buyCandidate(c.id, 1 ether, 1, address(0xBEEF), 8), 0, "buyable during Registration");
+
+        // only Idle is refused (unreachable for a registered candidate; forced by a mock)
+        _mockPhase(c.id, RoundManager.Phase.Idle);
         vm.expectRevert(FamilyRouter.NotTrading.selector);
         familyRouter.buyCandidate(c.id, 1 ether, 0, address(this), 8);
+        vm.clearMockedCalls();
 
         vm.warp(tradingStart + 10);
         uint256 out = familyRouter.buyCandidate(c.id, 1 ether, 1, address(this), 8);
@@ -194,6 +202,33 @@ contract RouterGuardsTest is RoundTestBase {
             "so is the head creator's half, on top of what it had already earned"
         );
         _assertSolvent();
+    }
+
+    /// @notice The 50/50 split applies from the candidate's registration: a buy during
+    /// Registration (the pool trades before the round clock starts) is "during the round" too.
+    function test_candidateBuyDuringRegistrationSplitsTheCreatorShare() public {
+        Cand memory c = _registerCandidate(address(0xA11CE), "CAND");
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Registration));
+        vm.warp(block.timestamp + 3);
+
+        uint256 creatorBefore = vault.creatorBalance(c.token);
+        uint256 link1Before = vault.creatorBalance(link1);
+        familyRouter.buyCandidate(c.id, 1 ether, 0, address(this), 8);
+
+        uint256 creatorShare = ((1 ether / 100) * CREATOR_BPS) / 10_000;
+        uint256 toCandidate = vault.creatorBalance(c.token) - creatorBefore;
+        uint256 toHead = vault.creatorBalance(link1) - link1Before;
+        assertEq(toHead, creatorShare / 2, "half goes to the head's creator during Registration");
+        assertEq(toCandidate, creatorShare - creatorShare / 2, "the candidate's creator takes the other half");
+        _assertSolvent();
+    }
+
+    /// @dev Force `phase(roundOf(candidateId))` to answer `p` for both the router and the vault.
+    function _mockPhase(uint256 candidateId, RoundManager.Phase p) internal {
+        uint256 roundId = roundManager.candidateInfo(candidateId).roundId;
+        vm.mockCall(
+            address(roundManager), abi.encodeWithSelector(RoundManager.phase.selector, roundId), abi.encode(p)
+        );
     }
 
     /// @notice A canonical-link buy pays the WHOLE creator share to that link's own creator: the
@@ -357,16 +392,22 @@ contract RouterGuardsTest is RoundTestBase {
         assertGt(roundManager.submitScore(c.id), 0, "the head-funded absorption was scored");
     }
 
-    /// @notice The head-funded route is refused outside the trading window, exactly like the
-    /// edge-funded one.
+    /// @notice The head-funded route follows the same window as the edge-funded one: open from
+    /// the candidate's registration, refused only when the round is Idle.
     function test_buyCandidateWithParentRespectsTheTradingWindow() public {
         Cand memory c = _registerCandidate(address(0xA11CE), "CAND");
         (, uint64 tradingEnd,) = _roundTimes(roundManager.roundCount());
         IERC20(link1).approve(address(familyRouter), type(uint256).max);
 
-        // during REGISTRATION the pool exists but its hook gate is shut: still refused
+        // during REGISTRATION the pool is already open: the route works
+        assertEq(uint256(roundManager.currentPhase()), uint256(RoundManager.Phase.Registration));
+        assertGt(familyRouter.buyCandidateWithParent(c.id, 1e18, 0, address(this)), 0, "buyable during Registration");
+
+        // Idle is still refused
+        _mockPhase(c.id, RoundManager.Phase.Idle);
         vm.expectRevert(FamilyRouter.NotTrading.selector);
         familyRouter.buyCandidateWithParent(c.id, 1e18, 0, address(this));
+        vm.clearMockedCalls();
 
         // After the bell the route stays open, quoted in the round's recorded parent
         _settleEnd();

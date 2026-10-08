@@ -4,6 +4,11 @@ pragma solidity ^0.8.26;
 import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {FamilyToken} from "../contracts/FamilyToken.sol";
@@ -12,6 +17,7 @@ import {FamilyFactory} from "../contracts/FamilyFactory.sol";
 import {FamilyHook} from "../contracts/FamilyHook.sol";
 import {FamilyRouter} from "../contracts/FamilyRouter.sol";
 import {FamilyLens} from "../contracts/FamilyLens.sol";
+import {VenueOracle} from "../contracts/VenueOracle.sol";
 import {BidDeployer} from "../contracts/BidDeployer.sol";
 import {FeeVault} from "../contracts/FeeVault.sol";
 import {RoundManager, RoundManagerDeployer} from "../contracts/RoundManager.sol";
@@ -39,15 +45,25 @@ import {DeployConstantsLib} from "./DeployConstantsLib.sol";
 /// contracts actually deployed, and THE HOOK SALT IS MINED HERE, in this script, against the
 /// factory address this ladder predicts - see `HookMiner.find` below:
 ///
-///   nonce n+0 : FamilyToken    -> the implementation every family token is a 1167 clone of
-///   nonce n+1 : RoundManagerDeployer -> CREATEs the RoundManager, out of the factory's initcode
-///   nonce n+2 : MockRandomnessSource / DrandSource -> ONLY when RANDOMNESS_SOURCE is unset
-///   nonce k+0 : FamilyFactory   -> deploys Locker (CREATE), FamilyHook (CREATE2), RoundManager
+/// `n` is the deployer's nonce when the script starts, `v` is 1 when the venue is LIVE at deploy
+/// (initialised, in-range liquidity) and 0 otherwise, `r` is 1 when RANDOMNESS_SOURCE is unset:
+///
+///   nonce n       : VenueOracle  -> ONLY when v = 1: broadcast first, then bound to the factory
+///                                   in the same run (curve phase: none; script/BindOracle.s.sol
+///                                   deploys and binds it after graduation)
+///   nonce n+v     : FamilyToken  -> the implementation every family token is a 1167 clone of
+///   nonce n+v+1   : RoundManagerDeployer -> CREATEs the RoundManager, out of the factory's initcode
+///   nonce n+v+2   : MockRandomnessSource / DrandSource -> ONLY when r = 1
+///   nonce k+0 : FamilyFactory   (k = n + v + 2 + r) -> deploys Locker (CREATE), FamilyHook
+///                                (CREATE2), RoundManager
 ///   nonce k+1 : FeeVault
 ///   nonce k+2 : BidDeployer    -> the Locker's only depositor and the vault's only keeper hook
 ///   nonce k+3 : FamilyRouter
 ///   nonce k+4 : FamilyLens
+///   nonce k+5 : V4UnlockGuardProbe (throwaway)
 contract Deploy is Script {
+    using StateLibrary for IPoolManager;
+
     // ---------------------------------------------------------------------------------------
     // deploy constants (docs/DEPLOY_CONSTANTS.md)
     // ---------------------------------------------------------------------------------------
@@ -107,6 +123,15 @@ contract Deploy is Script {
     /// Re-calibrate this at the actual launch price; it is not a substitute for that. Override
     /// with the `MIN_BOUNTY_DOLL` env var.
     uint256 internal constant MIN_BOUNTY_DOLL = DeployConstantsLib.MIN_BOUNTY_DOLL;
+    /// @dev The one chain a missing venue key is refused on (see ALLOW_NO_VENUE_ORACLE).
+    uint256 internal constant MAINNET_CHAIN_ID = 4663;
+    /// @dev Base URL every launched family token's on-chain metadata document
+    /// (`FamilyToken.tokenURI` / `metadataURI`, the getters trading terminals like GMGN and DEX
+    /// Screener read) is served from: the full document a terminal fetches is this string plus
+    /// the token's own lowercase hex address, with no separator (so it must end in `/`).
+    /// Overridable per deployment through the `METADATA_BASE` env var; the default is this
+    /// prefix plus the chain actually being deployed to (`block.chainid`) and a trailing `/`.
+    string internal constant METADATA_BASE_PREFIX = "https://dollhouse-meta-api.dollhousemarkets.workers.dev/token/";
     /// @dev sec.3. END_TIMEOUT_S: how long a round waits for the drand relay before
     /// ending deterministically at `T`. DURATION_SCALE_DIV: 1 on mainnet; a testnet run sets 60
     /// (through the environment) so a 12-hour round is exercised in 12 minutes. RANDOMNESS_DELAY_S
@@ -160,6 +185,15 @@ contract Deploy is Script {
     address internal stateViewAddr;
     /// @dev The result of the REN-01 guard self-check, recorded in the artefact.
     bool internal renGuardBound;
+    /// @dev The VenueOracle the factory's start rule reads, or address(0) in the curve phase
+    /// (no venue pool yet): the factory then opens every round on START_FALLBACK_DOLL, flagged,
+    /// until script/BindOracle.s.sol deploys the oracle and binds it.
+    address internal venueOracleAddr;
+    /// @dev The venue the factory may be bound to (FamilyFactory.EXPECTED_VENUE_ID) and the
+    /// runtime code hash of the one VenueOracle it accepts (EXPECTED_ORACLE_CODEHASH). Both zero
+    /// when the deployment has no venue key (HOOKS unset): the ETH rule can then never run.
+    bytes32 internal expectedVenueIdValue;
+    bytes32 internal oracleCodehashValue;
 
     function run() external {
         address poolManager = vm.envAddress("POOL_MANAGER");
@@ -183,6 +217,8 @@ contract Deploy is Script {
         // STATE_VIEW; without BOTH it prints no ETH or USD figure at all, which is the intended
         // behaviour on a chain with no venue behind the edge currency. Optional, both of them.
         entrancePoolIdValue = vm.envOr("ENTRANCE_POOL_ID", bytes32(0));
+        // ...or the id an earlier run already recorded for this chain
+        if (entrancePoolIdValue == bytes32(0)) entrancePoolIdValue = _recordedVenueId(genesisToken);
         stateViewAddr = vm.envOr("STATE_VIEW", address(0));
         // SAY SO. Missing either of them is a legitimate deployment and a silent one:
         // the record is written with zeros, the web build reads them, and the site prints no ETH
@@ -250,6 +286,10 @@ contract Deploy is Script {
         // Unset deploys a clearly labelled MockRandomnessSource, which is acceptable ONLY on a
         // testnet: see docs/DEPLOY_CONSTANTS.md.
         address randomnessSource = vm.envOr("RANDOMNESS_SOURCE", address(0));
+        string memory metadataBase = vm.envOr(
+            "METADATA_BASE", string.concat(METADATA_BASE_PREFIX, vm.toString(block.chainid), "/")
+        );
+        console2.log("metadataBase", metadataBase);
         console2.log("endTimeoutS", endTimeout);
         console2.log("durationScaleDiv", durationScaleDiv);
         console2.log("steward", steward);
@@ -261,7 +301,34 @@ contract Deploy is Script {
         // FamilyToken and RoundManagerDeployer are broadcast BEFORE the factory (their code is
         // kept out of its init code for EIP-3860), and so is the randomness source when one is
         // being deployed.
-        uint256 nonce = vm.getNonce(deployer) + (randomnessSource == address(0) ? 3 : 2);
+        // THE VENUE ORACLE. The factory is BOUND to it once, by anyone, through
+        // `bindVenueOracle`, and accepts only the oracle fixed here: the venue id
+        // (EXPECTED_VENUE_ID, from the same key DeployZap uses) and the oracle's runtime code
+        // hash (EXPECTED_ORACLE_CODEHASH: VenueOracle with this PoolManager, that venue and the
+        // two pokers). The key is known before the venue exists, so a curve-phase deploy still
+        // fixes both. Venue live now: the oracle is broadcast FIRST and bound in this run.
+        (bool hasKey, bool venueLive, PoolKey memory venueKey) = _venueKey(poolManager, genesisToken);
+        address pokerA;
+        address pokerB;
+        if (hasKey) {
+            pokerA = vm.envAddress("KEEPER_ADDRESS");
+            pokerB = vm.envAddress("POKER_BACKUP_ADDRESS");
+            require(pokerA != address(0) && pokerB != address(0), "KEEPER_ADDRESS and POKER_BACKUP_ADDRESS must be set");
+            expectedVenueIdValue = PoolId.unwrap(venueKey.toId());
+            console2.log("expectedVenueId");
+            console2.logBytes32(expectedVenueIdValue);
+            // curve phase: the oracle cannot be deployed yet (its constructor needs a live venue),
+            // so its code hash is taken from a local, never-broadcast deployment against a
+            // mocked venue; the seed price lives in storage, so the code is identical
+            if (!venueLive) oracleCodehashValue = _oracleCodehash(poolManager, venueKey, pokerA, pokerB);
+        } else {
+            require(
+                block.chainid != MAINNET_CHAIN_ID || vm.envOr("ALLOW_NO_VENUE_ORACLE", uint256(0)) == 1,
+                "HOOKS is not set: the ETH-anchored start could never be bound. Set ALLOW_NO_VENUE_ORACLE=1 to accept that"
+            );
+            console2.log("venue oracle off for good: no venue key (HOOKS unset); every start uses START_FALLBACK_DOLL");
+        }
+        uint256 nonce = vm.getNonce(deployer) + (randomnessSource == address(0) ? 3 : 2) + (venueLive ? 1 : 0);
         address predictedFactory = vm.computeCreateAddress(deployer, nonce);
         address predictedVault = vm.computeCreateAddress(deployer, nonce + 1);
         address predictedBidDeployer = vm.computeCreateAddress(deployer, nonce + 2);
@@ -282,8 +349,17 @@ contract Deploy is Script {
         uint256 startBlock = block.number;
         vm.startBroadcast();
 
+        if (venueLive) {
+            venueOracleAddr = address(new VenueOracle(IPoolManager(poolManager), venueKey, pokerA, pokerB));
+            oracleCodehashValue = venueOracleAddr.codehash;
+            console2.log("venueOracle", venueOracleAddr);
+        }
+
         // the token implementation must exist before the factory, which verifies the link back
-        FamilyToken tokenImplementation = new FamilyToken(predictedFactory);
+        // it also carries the venue-lock immutables: the PoolManager, the mined hook, the Locker and
+        // the FeeVault, all predictions the factory verifies against what it actually creates
+        FamilyToken tokenImplementation =
+            new FamilyToken(predictedFactory, poolManager, minedHook, predictedLocker, predictedVault);
         // the RoundManager is CREATEd through a helper for the same EIP-3860 reason: the adaptive
         // schedule and the random end pushed the factory's deployment transaction over the limit
         RoundManagerDeployer roundManagerDeployer = new RoundManagerDeployer();
@@ -323,12 +399,14 @@ contract Deploy is Script {
             standardCurveSpec(),
             hookSalt,
             address(tokenImplementation),
+            metadataBase,
             FamilyFactory.RoundSetup({
                 deployer: address(roundManagerDeployer),
                 randomness: randomnessSource,
                 endTimeout: endTimeout,
                 durationScaleDiv: durationScaleDiv
-            })
+            }),
+            _startSetup(expectedVenueIdValue, oracleCodehashValue)
         );
         FeeVault vault = new FeeVault(factory, developer, CREATOR_BPS, ANCESTOR_BPS, REINFORCE_BPS);
         BidDeployer bidDeployer = new BidDeployer(vault, vm.envOr("MIN_BOUNTY_DOLL", MIN_BOUNTY_DOLL));
@@ -372,9 +450,119 @@ contract Deploy is Script {
         renGuardBound = new V4UnlockGuardProbe().probe(poolManager);
         console2.log("renGuardBound", renGuardBound);
 
+        // THE BIND, when the venue is live: the oracle was broadcast first, so it goes in now.
+        // It still reads fallback (flagged) until it holds 24 h of slow history.
+        if (venueLive) {
+            factory.bindVenueOracle(venueOracleAddr);
+            require(factory.venueOracle() == venueOracleAddr, "venue oracle bind");
+        }
+
         vm.stopBroadcast();
 
+        if (hasKey && !venueLive) {
+            console2.log("venue oracle UNBOUND (curve phase). After graduation, deploy and bind it with:");
+            console2.log("  forge script script/BindOracle.s.sol --rpc-url $RPC_URL --broadcast");
+            console2.log("or, for an oracle already deployed with the same pokers and build:");
+            console2.log(
+                string.concat(
+                    "  cast send ",
+                    vm.toString(address(factory)),
+                    " \"bindVenueOracle(address)\" <VENUE_ORACLE> --rpc-url $RPC_URL"
+                )
+            );
+        }
+
         _write(factory, vault, bidDeployer, router, lens, token, poolManager, startBlock, continueFrom);
+    }
+
+    /// @dev The ETH-anchored start constants (DeployConstantsLib), each overridable through the env
+    /// var of the same name, against the venue `venueId` and the oracle code hash `codehash` the
+    /// factory may later be bound to (both zero = the permanent constant fallback).
+    function _startSetup(bytes32 venueId, bytes32 codehash) internal view returns (FamilyFactory.StartSetup memory) {
+        return FamilyFactory.StartSetup({
+            expectedVenueId: venueId,
+            oracleCodehash: codehash,
+            fdvWei: vm.envOr("START_FDV_WEI", DeployConstantsLib.START_FDV_WEI),
+            maxParentBps: vm.envOr("START_MAX_PARENT_BPS", DeployConstantsLib.START_MAX_PARENT_BPS),
+            minParentWad: vm.envOr("START_MIN_PARENT_WAD", DeployConstantsLib.START_MIN_PARENT_WAD),
+            fallbackDoll: vm.envOr("START_FALLBACK_DOLL", DeployConstantsLib.START_FALLBACK_DOLL),
+            oracleGas: vm.envOr("ORACLE_GAS", DeployConstantsLib.ORACLE_GAS),
+            linkMinCoverS: uint32(
+                vm.envOr("START_LINK_MIN_COVER_S", uint256(DeployConstantsLib.START_LINK_MIN_COVER_S))
+            ),
+            walkMax: vm.envOr("START_WALK_MAX", DeployConstantsLib.START_WALK_MAX)
+        });
+    }
+
+    /// @dev The `entrancePoolId` an earlier run recorded for this chain, or zero. Only a record of
+    /// the SAME genesis token counts: a relaunch on a fresh token must never inherit the old
+    /// token's venue.
+    function _recordedVenueId(address genesisToken) internal view returns (bytes32) {
+        string memory path = string.concat("deployments/", vm.toString(block.chainid), ".json");
+        if (!vm.isFile(path)) return bytes32(0);
+        string memory record = vm.readFile(path);
+        if (!vm.keyExistsJson(record, ".entrancePoolId") || !vm.keyExistsJson(record, ".genesisToken")) {
+            return bytes32(0);
+        }
+        if (vm.parseJsonAddress(record, ".genesisToken") != genesisToken) return bytes32(0);
+        return vm.parseJsonBytes32(record, ".entrancePoolId");
+    }
+
+    /// @dev The venue's key, built from the same env as script/DeployZap.s.sol (POOL_FEE default
+    /// 0, TICK_SPACING default 200, HOOKS): native ETH / the genesis token. `hasKey` when HOOKS is
+    /// set (required when ENTRANCE_POOL_ID is); `live` when the pool is initialised with in-range
+    /// liquidity (the oracle's constructor checks the same). A named venue id must match the key
+    /// and be live; with no id named, a not-yet-graduated venue is the curve phase.
+    function _venueKey(address poolManager, address genesisToken)
+        internal
+        view
+        returns (bool hasKey, bool live, PoolKey memory key)
+    {
+        address hooks = vm.envOr("HOOKS", address(0));
+        if (entrancePoolIdValue == bytes32(0) && hooks == address(0)) return (false, false, key);
+        require(hooks != address(0), "HOOKS must be set with ENTRANCE_POOL_ID");
+        uint256 feeRaw = vm.envOr("POOL_FEE", uint256(0));
+        uint256 spacingRaw = vm.envOr("TICK_SPACING", uint256(200));
+        require(feeRaw <= type(uint24).max, "POOL_FEE out of range");
+        require(spacingRaw != 0 && spacingRaw <= 32_767, "TICK_SPACING out of range");
+        key = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(genesisToken),
+            // casting is safe: both values are range-checked just above
+            // forge-lint: disable-next-line(unsafe-typecast)
+            fee: uint24(feeRaw),
+            // forge-lint: disable-next-line(unsafe-typecast)
+            tickSpacing: int24(int256(spacingRaw)),
+            hooks: IHooks(hooks)
+        });
+        PoolId id = key.toId();
+        (uint160 spot,,,) = IPoolManager(poolManager).getSlot0(id);
+        live = spot != 0 && IPoolManager(poolManager).getLiquidity(id) > 0;
+        if (entrancePoolIdValue != bytes32(0)) {
+            require(PoolId.unwrap(id) == entrancePoolIdValue, "venue key does not hash to ENTRANCE_POOL_ID");
+            require(spot != 0, "venue pool is not initialized: unset ENTRANCE_POOL_ID for a curve-phase deploy");
+            require(live, "venue pool has no in-range liquidity");
+        }
+        return (true, live, key);
+    }
+
+    /// @dev The runtime code hash of `new VenueOracle(poolManager, key, pokerA, pokerB)` while
+    /// the venue does not exist yet: deployed LOCALLY (outside the broadcast, so nothing is sent)
+    /// against a PoolManager whose slot0 and liquidity reads for this pool are mocked. The
+    /// runtime code holds only the immutables (manager, venue id, pokers); the mocked seed price
+    /// goes to storage, so the hash is the one the real deployment will have on the same build.
+    function _oracleCodehash(address poolManager, PoolKey memory key, address pokerA, address pokerB)
+        internal
+        returns (bytes32 codehash)
+    {
+        bytes32 stateSlot = StateLibrary._getPoolStateSlot(key.toId());
+        bytes32 liquiditySlot = bytes32(uint256(stateSlot) + StateLibrary.LIQUIDITY_OFFSET);
+        vm.mockCall(
+            poolManager, abi.encodeWithSignature("extsload(bytes32)", stateSlot), abi.encode(uint256(1) << 96)
+        );
+        vm.mockCall(poolManager, abi.encodeWithSignature("extsload(bytes32)", liquiditySlot), abi.encode(uint256(1)));
+        codehash = address(new VenueOracle(IPoolManager(poolManager), key, pokerA, pokerB)).codehash;
+        vm.clearMockedCalls();
     }
 
     function _write(
@@ -426,6 +614,11 @@ contract Deploy is Script {
         // `entrancePoolId`, and leaves every ETH and USD figure out when either is missing.
         vm.serializeBytes32(o, "entrancePoolId", entrancePoolIdValue);
         vm.serializeAddress(o, "stateView", stateViewAddr);
+        // the start rule's venue oracle: zero until bound (curve phase), when script/BindOracle.s.sol
+        // writes it; and the venue and oracle code the factory will accept, fixed here
+        vm.serializeAddress(o, "venueOracle", factory.venueOracle());
+        vm.serializeBytes32(o, "expectedVenueId", factory.EXPECTED_VENUE_ID());
+        vm.serializeBytes32(o, "expectedOracleCodehash", factory.EXPECTED_ORACLE_CODEHASH());
         vm.serializeAddress(o, "developer", vault.developer());
         vm.serializeAddress(o, "roundManagerDeployer", roundManagerDeployerAddr);
         vm.serializeAddress(o, "randomnessSource", randomnessSourceAddr);
@@ -449,8 +642,8 @@ contract Deploy is Script {
         vm.serializeUint(c, "maxIndex", roundManager.MAX_INDEX());
         // the schedule is adaptive now (sec.2): what is constant is its SHAPE, so the
         // artefact records the shape constants plus the first rounds the schedule produces
-        vm.serializeUint(c, "baseTradingS", roundManager.BASE_TRADING_S());
-        vm.serializeUint(c, "maxTradingS", roundManager.MAX_TRADING_S());
+        vm.serializeUint(c, "baseRoundS", roundManager.BASE_ROUND_S());
+        vm.serializeUint(c, "maxRoundS", roundManager.MAX_ROUND_S());
         vm.serializeUint(c, "minRegistrationS", roundManager.MIN_REGISTRATION_S());
         vm.serializeUint(c, "maxRegistrationS", roundManager.MAX_REGISTRATION_S());
         vm.serializeUint(c, "durationScaleDiv", roundManager.DURATION_SCALE_DIV());
@@ -471,6 +664,13 @@ contract Deploy is Script {
         vm.serializeUint(c, "minBountyDoll", bidDeployer.MIN_BOUNTY_DOLL());
         vm.serializeUint(c, "snipeS", factory.hook().SNIPE_S());
         vm.serializeUint(c, "tickSpacing", uint256(int256(factory.TICK_SPACING())));
+        vm.serializeUint(c, "startFdvWei", factory.START_FDV_WEI());
+        vm.serializeUint(c, "startMaxParentBps", factory.START_MAX_PARENT_BPS());
+        vm.serializeUint(c, "startMinParentWad", factory.START_MIN_PARENT_WAD());
+        vm.serializeUint(c, "startFallbackDoll", factory.START_FALLBACK_DOLL());
+        vm.serializeUint(c, "oracleGas", factory.ORACLE_GAS());
+        vm.serializeUint(c, "startLinkMinCoverS", factory.START_LINK_MIN_COVER_S());
+        vm.serializeUint(c, "startWalkMax", factory.START_WALK_MAX());
         string memory constantsJson = vm.serializeUint(c, "supply", SUPPLY);
 
         string memory h = "hookFlags";

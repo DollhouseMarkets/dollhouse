@@ -57,6 +57,18 @@ export function ethZapRequired(raw, isMainnet) {
   return isMainnet && !isZeroValue(raw?.entrancePoolId)
 }
 
+/// Whether `expectedVenueId` (the venue the factory's ETH-anchored start may be bound to,
+/// `FamilyFactory.EXPECTED_VENUE_ID`, written by `Deploy.s.sol`) must be present and non-zero
+/// in `raw`: on mainnet, whenever the record comes from a factory with the ETH-anchored start
+/// (its `constants.startFdvWei` is written by the same script run) - curve phase or not, since
+/// the venue key is known before the venue exists. A zero id means the start can never be bound.
+/// `venueOracle` itself is NOT required: it stays zero until the one-shot bind
+/// (script/BindOracle.s.sol, or Deploy.s.sol when the venue was already live), and a record of an
+/// earlier factory has no start rule to feed.
+export function expectedVenueIdRequired(raw, isMainnet) {
+  return isMainnet && raw?.constants?.startFdvWei !== undefined
+}
+
 /// Role EOAs in a record. None of them may be a well-known Anvil account.
 export const ROLE_KEYS = ['deployer', 'developer', 'devVestingDeployer', 'roundManagerDeployer', 'steward']
 

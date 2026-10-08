@@ -70,24 +70,24 @@ over by the clock, and only `finalize()` needs a caller.
 |---|---|---|---|---|---|
 | 1 | Unlaunched | → Idle(head=#0) | `FamilyFactory.wire()` | anyone, once | replaces `createGenesis`. Adoption runs inside `wire()` itself, not through a separate public `adoptGenesis(token)` call, since the old standalone entry point was front-runnable for the creator attribution and is now gone; `wire()` calls the factory-internal `_adoptGenesis()`, which calls the factory-only `RoundManager.adoptGenesis(token, creator)` with `creator` fixed to the deployer recorded at construction, so whoever sends the `wire()` transaction, the outcome is identical. `priorRegistry == address(0)` else `ContinuationHasGenesis`; `genesisAdopted == false` else `GenesisAlreadyAdopted`; `token == GENESIS_TOKEN` else `WrongGenesisToken`; the token must answer 18 decimals and a nonzero `totalSupply()` else `BadGenesisToken`. **No curve, no price and no pool are computed or created**: index 0 is an external, already-graduated ERC-20 with no pool key in this deployment (`poolKeyOf(0)` is a zero key), and the chain this protocol owns starts at link one |
 | 2 | Idle(head=#N) | → Registration(round R) | `FamilyFactory.registerCandidate` → `RoundManager.openRoundIfIdle` | anyone paying the round's bond | `wire()`; `headIndex + 1 <= FenwickRangeAdd.MAX_INDEX` else `FamilyFactory.ChainDepthLimit`; `head != address(0)` else `NoGenesis`; the previous round must be `finalized`; **not sunset** else `Sunset(successor)`; a **continuation** must be able to adopt the trunk else `PriorNotHandedOver`, and, **transitively**: the prior registry itself must be a root or already `adopted()` else `PriorNotAdopted()` (audit 2); `headIndex + 1 <= MAX_INDEX` (when non-zero) else `RoundManager.ChainDepthLimit`; then `registerCandidate` (no longer payable) pulls the round's own `bondFor(headIndex+1)` in the adopted edge token by `safeTransferFrom(msg.sender, roundManager, bondAmount)`, called AFTER `openRoundIfIdle` so `RegistrationClosed` is checked before any allowance problem |
-| 3 | Registration | → Registration (more entries) | same | anyone | `block.timestamp < r.registrationEnd` else `RegistrationClosed`; unlimited candidates |
-| 3b | Trading (late entry, §2) | → Trading (new candidate) | `FamilyFactory.registerCandidate` → `RoundManager.addCandidate` | anyone paying the round's pinned bond | permitted **only when `durationFor(n) >= 1 hour`**, and only through `lateEntryUntil(n)` (a third of trading); refused outright on a short round (`RegistrationClosed`); the late entrant's own pool opens and its own 3-second snipe tax starts at THIS moment, not at `tradingStart`; scored over the identical closing window as every other candidate (§F) |
-| 4 | Registration | → Trading | none, implicit at `r.registrationEnd` | clock | `FamilyHook.beforeSwap` reverts `TradingNotStarted` while `block.timestamp < p.tradingStart` |
+| 3 | Registration | → Registration (more entries) | same | anyone | `block.timestamp < r.registrationEnd` else `RegistrationClosed`; unlimited candidates; each candidate's pool opens and its own 3-second snipe tax starts at its registration block (`c.tradingStart = block.timestamp`), so it trades during Registration |
+| 3b | Trading (late entry, §2) | → Trading (new candidate) | `FamilyFactory.registerCandidate` → `RoundManager.addCandidate` | anyone paying the round's pinned bond | permitted **only when `durationFor(n) >= 1 hour`**, and only through `lateEntryUntil(n)` (a third of trading); refused outright on a short round (`RegistrationClosed`); like every candidate's, the late entrant's own pool opens and its own 3-second snipe tax starts at THIS moment; scored over the identical closing window as every other candidate (§F) |
+| 4 | Registration | → Trading | none, implicit at `r.registrationEnd` | clock | the round clock starts: `r.tradingStart = r.registrationEnd` is the floor of every candidate's scored window (§F). Pools are NOT gated by this transition: each already trades from its own registration. `FamilyHook.beforeSwap` still reverts `TradingNotStarted` while `block.timestamp < p.tradingStart`, but the factory registers every pool with `p.tradingStart` = its registration block, so that gate never fires in production |
 | 5 | Trading | → Trading (scored swaps) | `PoolManager.swap` on a candidate pool, or `FamilyRouter.buyCandidate` / `sellCandidate` | anyone | pool must be `registered`; score updated in `afterSwap`; the accumulator is **never frozen or clamped by this transition** (§1/§3), it keeps running past the nominal end as a public support measure (§J) and is read back through the checkpoint rings at whatever `T_end` the random end later settles on |
 | 6 | Trading | → EndPending | none, implicit at `r.nominalEnd = T` | clock | nothing swapped after `T` counts toward any candidate's score (`FamilyHook.beforeSwap` still permits the swap, losers and the eventual winner alike trade right through the bell, but scoring reads for this round never look past `T`); `RoundManager.requestEnd()` becomes callable |
 | 6b | EndPending | → Submission | `RoundManager.requestEnd()` then `fulfilEnd(proof)` | anyone (permissionless, two separate calls, possibly two different callers) | `requestEnd`: `block.timestamp >= r.nominalEnd`, `r.tradingEnd == 0`, once per round (`EndAlreadyRequested`), pins a **future** drand round via `IRandomnessSource.pin()` (§3); `fulfilEnd`: verifies the relayed beacon proof on chain, sets `r.tradingEnd = T − (word mod randomEndWindowFor(n))` and opens the submission window from THIS moment (`r.submitEnd = now + SUBMIT_S`), not from `T`, a beacon that takes 20 minutes to arrive does not eat the window it opens |
 | 6c | EndPending | → Submission (fallback) | `RoundManager.finalizeDeterministic()` | anyone | **disclosed fallback**: only after `block.timestamp >= r.nominalEnd + END_TIMEOUT` (30 min) and `r.tradingEnd == 0`; sets `r.tradingEnd = T` deterministically and emits `RandomEndUnavailable`, the randomness is simply absent for that round; needs nobody to have called `requestEnd` first |
-| 7 | Submission | → Submission | `RoundManager.submitScore(candidateId)` | anyone (permissionless) | `r.tradingEnd != 0` else `EndNotSettled`; `tradingEnd <= now < submitEnd` else `OutsideSubmissionWindow`; per-candidate idempotent (`c.submitted` → no-op return); reads the candidate's **closing-window** average `[T_end − W, T_end]` out of the hook's checkpoint rings (§F) |
-| 8 | Submission | → Finalizable | none, implicit at `r.submitEnd` | clock | `finalize()` reverts `SubmissionWindowOpen` before it; also reverts `EndNotSettled` if `EndPending` was never resolved |
+| 7 | Submission | → Submission | `RoundManager.submitScore(candidateId)` | anyone (permissionless) | `r.tradingEnd != 0` else `EndNotSettled`; `tradingEnd <= now < submitEnd` else `OutsideSubmissionWindow`; per-candidate idempotent (`c.submitted` → no-op return); reads the candidate's **closing-window** average `[max(T_end − W, r.tradingStart), T_end]` out of the hook's checkpoint rings (§F) |
+| 8 | Submission | → Finalizable | none, implicit: at the moment EVERY candidate of the round has submitted (`submittedCount[roundId] == r.candidateCount`, incremented once per candidate by `submitScore`), or at `r.submitEnd`, whichever comes first | clock / the last `submitScore` | `finalize()` reverts `SubmissionWindowOpen` while `block.timestamp < r.submitEnd && submittedCount[roundId] < r.candidateCount`; `submitEnd` stays the deadline for a round in which some candidate never submits; also reverts `EndNotSettled` if `EndPending` was never resolved. Early finalize cannot exclude a score: every candidate's is already in, and `candidateCount` cannot grow once the end is settled (registration and late entry close before `T`). `phase()` reports `Finalizable` on the same condition (`Round.t.sol::test_finalizeAsSoonAsAllScoresAreIn`, `test_aMissingScoreHoldsFinalizeUntilSubmitEnd`) |
 | 9 | Finalizable | → Finalized + Idle(head=#N+1) | `RoundManager.finalize()` | anyone | `r.hasBest && r.bestAvg >= int256(r.hUsed)`; writes `canonical[N+1]`, **resets** `hWad = H_FRAC_WAD`, refunds the winner's bond, forfeits the rest |
 | 10 | Finalizable | → Finalized + Idle(head=#N) | `RoundManager.finalize()` | anyone | no best, or `bestAvg < hUsed`: `hWad = max(0.9·hWad, H_MIN_FRAC_WAD)`, **all** bonds forfeited |
 | 11 | Finalized | → Finalized (no-op) | `RoundManager.finalize()` | anyone | `if (r.finalized) return;`: idempotent, a stale call can never overwrite the head |
 | 12 | any | → Sunset announced | `RoundManager.announceSunset(successor)` | **steward only, once** | `steward != address(0) && msg.sender == steward` else `NotSteward`; `sunsetAt == 0` else `SunsetAlreadyAnnounced`; `successor.code.length != 0` else `SuccessorHasNoCode`; **if this deployment is itself an unadopted continuation, `priorRegistry != address(0) && !adopted` reverts `NotAdopted()` (audit 2, an unadopted intermediate must not be able to start its own sunset clock)**; takes effect at `now + sunsetDelay` (a constructor parameter, mainnet 7 days, testnet 1 hour, floor `MIN_SUNSET_DELAY = 1 hours`, §C) |
 | 12b | Sunset announced | → back to normal | `RoundManager.cancelSunset()` | **steward only, once in the deployment's life** | `msg.sender == steward` else `NotSteward`; `sunsetAt != 0 && block.timestamp < sunsetAt && !sunsetCancelled` else `SunsetNotCancellable`; clears `sunsetAt` and `successor` and sets `sunsetCancelled` forever (`Sunset.t.sol::test_cancelSunsetWorksBeforeTheEffectAndNotAfter`, `test_cancelSunsetNeedsAnAnnouncement`) |
 | 13 | Sunset effective | → no further rounds | `openRoundIfIdle` | - | `isSunset()` reverts `Sunset(successor)`, **but only in the "open a new round" branch**: a round already open still registers, trades, is scored, finalizes and crowns a head (`Sunset.t.sol::test_aRoundOpenWhenTheSunsetLandsStillFinishesAndCrowns`) |
-| 14 | any | trading on a canonical or losing pool | `PoolManager.swap` | anyone | never gated after `tradingStart`; losers' pools live forever and keep paying hop fees |
+| 14 | any | trading on a canonical or losing pool | `PoolManager.swap` | anyone | never gated after the pool's own `tradingStart` (its registration block); losers' pools live forever and keep paying hop fees |
 
-Phases 3b and 6b/6c: registration opens the round, trading starts at `registrationEnd`, and
+Phases 3b and 6b/6c: registration opens the round, each candidate's pool trades from its own registration, the round clock starts at `registrationEnd`, and
 `finalize()` is the only place the head moves. A long round (`durationFor(n) >= 1 hour`) also
 accepts new candidates during trading itself, and the public end is a **nominal** end `T`, with the **true** end settled afterwards by a verifiable drand relay or,
 failing that, a disclosed deterministic fallback (§C, §F). Every one of `durationFor`, `registrationFor`,
@@ -153,7 +153,8 @@ first resolves *which* registry owns the entry (`registryOf(index)` / `registryO
 **Liveness dependency.** Nothing advances a round automatically. If nobody calls `submitScore`
 during the 300 s window, the round finalizes with no winner even if a candidate cleared `H`; if
 nobody calls `finalize()`, the chain stays in `Finalizable` forever and no new round can open
-(`openRoundIfIdle` requires the previous round `finalized`). Both calls are permissionless and
+(`openRoundIfIdle` requires the previous round `finalized`). `finalize()` is callable as soon as every
+candidate has submitted, without waiting for `submitEnd` (§A row 8). Both calls are permissionless and
 economically motivated (the winner's creator wants the slot and the bond back), but neither is
 guaranteed.
 
@@ -214,29 +215,40 @@ round number `n`, computed once (`RoundManager.durationFor/registrationFor/lateE
 closingWindowFor/scoreSlotFor`), and, apart from the mainnet-vs-testnet `DURATION_SCALE_DIV`
 constructor divisor described below, none of it can be changed after deploy.
 
-**Adaptive duration.** `D(n) = min(15 min × 2^floor((n−1)/2), 12 h)` (`BASE_TRADING_S`,
-`MAX_TRADING_S`), `R(n) = clamp(D(n)/5, 3 min, 1 h)` (`MIN_REGISTRATION_S`, `MAX_REGISTRATION_S`):
+**Adaptive duration.** The doubling is on the WHOLE round, entries included, because a coin trades
+from the moment it registers: `L(n) = min(10 min × 2^floor((n−1)/2), 12 h)` (`BASE_ROUND_S`,
+`MAX_ROUND_S`, `roundLengthFor(n)`), `R(n) = clamp(L(n)/5, 3 min, 1 h)` (`MIN_REGISTRATION_S`,
+`MAX_REGISTRATION_S`), and the round clock runs `D(n) = L(n) − R(n)` (`durationFor(n)`), so
+`nominalEnd = openedAt + L(n)` (2026-10-03; it used to be `D(n) = min(15 min × 2^floor((n−1)/2), 12 h)`
+with registration on top):
 
-| Round `n` | `D(n)` | `R(n)` | Late entry |
-|---|---|---|---|
-| 1–2 | 15 min | 3 min | no |
-| 3–4 | 30 min | 6 min | no |
-| 5–6 | 1 h | 12 min | first 20 min of trading |
-| 7–8 | 2 h | 24 min | first 40 min |
-| 9–10 | 4 h | 48 min | first 80 min |
-| 11–12 | 8 h | 1 h (cap) | first 2 h 40 min |
-| 13+ | 12 h (cap) | 1 h (cap) | first 4 h |
+| Round `n` | `L(n)` | `R(n)` | `D(n)` | Random-end window | Late entry |
+|---|---|---|---|---|---|
+| 1–2 | 10 min | 3 min | 7 min (420 s) | 105 s | no |
+| 3–4 | 20 min | 4 min | 16 min | 180 s | no |
+| 5–6 | 40 min | 8 min | 32 min | 180 s | no |
+| 7–8 | 80 min | 16 min | 64 min | 180 s | first 21 min 20 s of trading |
+| 9–10 | 160 min | 32 min | 128 min | 180 s | first 42 min 40 s |
+| 11–12 | 5 h 20 min | 1 h (cap) | 4 h 20 min | 180 s | first 1 h 26 min 40 s |
+| 13–14 | 10 h 40 min | 1 h (cap) | 9 h 40 min | 180 s | first 3 h 13 min 20 s |
+| 15+ | 12 h (cap) | 1 h (cap) | 11 h | 180 s | first 3 h 40 min |
+
+`W = 15 min` exceeds `D` on rounds 1–2, so with the floor at `r.tradingStart` every candidate of
+those rounds is scored over the whole 420 s of trading.
 
 **Late entry.** `lateEntryUntil(n)` returns `D(n)/3` when `D(n) >= LATE_ENTRY_FROM_S = 1 hour`, else 0
 (`RegistrationClosed` on a short round). A late entrant posts the round's same pinned bond and its
-pool opens the instant it registers (its own 3-second snipe tax runs from that moment, not from
-`tradingStart`); it carries no scoring penalty of its own kind, it is scored over the identical
+pool opens the instant it registers, like every candidate's (its own 3-second snipe tax runs from
+that moment); it carries no scoring penalty of its own kind, it is scored over the identical
 closing window as everyone else and simply has less time to build the level that window measures.
 
 **The closing window `W`, what actually decides a round.** `closingWindowFor(n)` is
 `CLOSING_WINDOW_S / DURATION_SCALE_DIV` and **does not depend on `n` at all**: a FLAT 15 minutes on
 every round (2026-09-12; it used to be `D(n)/4` above an hour, 2 h → 30 min, 12 h → 3 h). A candidate's score
 is its average net parent absorption over **`[T_end − W, T_end]`**, not the whole round, see §F.
+Either edge of that span — including the floor at `r.tradingStart` on a short round — is exact to
+within one coarse slot (18 s on the mainnet schedule) when a swap on each side of the boundary
+falls in the same slot; see the Exactness bound in §F.
 Late entry always closes (`D/3`) strictly before the closing window's earliest possible start
 (`D − W − RANDOM_END_S`), so no candidate is ever scored over a span that begins before its own pool
 opened (`Schedule.t.sol::test_lateEntryAlwaysEndsBeforeTheClosingWindowStarts`).
@@ -255,8 +267,8 @@ absent for that round; the round always finalizes, it never hangs on the beacon
 `test_theFallbackWorksEvenIfNobodyEverRequestedTheEnd`). `randomEndWindowFor(n) = max(1, min(RANDOM_END_S,
 D(n) / 4))`: a heavily testnet-scaled round draws its end from at most the last quarter of its own
 length, so `T_end` can never land at or before `tradingStart`, and the floor of 1 keeps the modulus
-in `fulfilEnd` defined. On mainnet `D(n) >= 15 min`, so `D(n) / 4 >= 225 s` and the window is always
-exactly `RANDOM_END_S`.
+in `fulfilEnd` defined. On mainnet the clamp binds only on rounds 1–2 (`D = 420 s`, window 105 s);
+from round 3 `D(n) >= 960 s`, so `D(n) / 4 >= 240 s` and the window is exactly `RANDOM_END_S`.
 
 **`DURATION_SCALE_DIV`** (mainnet `1`, a `RoundManager` constructor parameter, `ALLOW_SCALED_SCHEDULE`
 gate) divides `D`, `R` and the late-entry window uniformly, so a testnet run can exercise a 12-hour
@@ -301,16 +313,23 @@ depth free. Tests: `Depth.t.sol::test_bondDoublesEveryFourLinksAndIsCapped`,
 ```
 openedAt          = block.timestamp of the first registerCandidate
 registrationEnd   = openedAt + registrationFor(n)
-tradingStart      = registrationEnd                  (shared by every candidate in the round)
+tradingStart      = registrationEnd                  (the round clock; the floor of every candidate's scored window)
+c.tradingStart    = block.timestamp of the candidate's registration    (its pool opens and its snipe tax runs from here)
 nominalEnd (T)    = tradingStart + durationFor(n)    (public from the moment the round opens)
 tradingEnd        = T - (r mod randomEndWindowFor(n))    (T_end, settled by fulfilEnd/finalizeDeterministic, §C above)
 submitEnd         = settlement time + 300            (block.timestamp of the fulfilEnd or finalizeDeterministic call; starts at settlement, not at T or T_end)
 ```
 
-Late entrants (round `n` with `durationFor(n) >= 1 hour`) register through `lateEntryUntil(n)` of
-trading and get their own `tradingStart = block.timestamp` of registration for snipe-window purposes
-only, the round's single `nominalEnd`/`tradingEnd`/closing window `[T_end − W, T_end]` (§F) apply
-identically to every candidate regardless of when its own pool opened.
+Every candidate's pool opens at its own registration: `openRoundIfIdle` and `addCandidate` both
+record `c.tradingStart = block.timestamp`, whether it registered during Registration or, on a round
+with `durationFor(n) >= 1 hour`, through `lateEntryUntil(n)` of trading (late entry). That start
+drives the pool's gate, its 3-second snipe tax and its accumulator only; the round's single
+`nominalEnd`/`tradingEnd` and the scored window `[max(T_end − W, r.tradingStart), T_end]` (§F) apply
+identically to every candidate regardless of when its own pool opened. Trading before the round
+clock is therefore never scored, but support bought then and still held when the window opens is.
+Nobody registers at or after `registrationEnd` on a short round, or after `lateEntryEnd` on a long
+one (`RegistrationClosed`, both checks unchanged), so every pool opens at or before
+`max(r.tradingStart, T − W − RANDOM_END_S)`.
 
 `Round.hUsed` is snapshotted at open (`r.hUsed = threshold()`), so a later decay cannot move the bar
 a candidate was competing against. `r.parentIndex` / `r.parentToken` pin the numeraire for the whole
@@ -319,8 +338,8 @@ a timestamp, not a call.
 
 Functions, in order: `FamilyFactory.registerCandidate` (not payable; the bond is an ERC-20 pull of
 the edge currency) → swaps on the candidate
-pools during `[tradingStart, ∞)` (scored only until `T_end`; `FamilyRouter.buyCandidate` /
-`sellCandidate` refuse anything but `Phase.Trading`) → `RoundManager.submitScore` →
+pools during `[c.tradingStart, ∞)` (scored only over `[max(T_end − W, r.tradingStart), T_end]`;
+`FamilyRouter.buyCandidate` / `sellCandidate` refuse only `Phase.Idle`) → `RoundManager.submitScore` →
 `RoundManager.finalize`. Reads for the UI come from `FamilyLens.roundView(roundId, offset, limit)`
 (paginated candidates with score, spot price and tokens sold), `FamilyLens.candidateView` and
 `FamilyLens.chainView(from, to)`, the last of which spans continuation versions
@@ -461,8 +480,9 @@ applies a `beforeSwap` return delta *before* the pool swap, so a parent-side fee
 applied after `delta` is computed and so is likewise not in it. **No fee adjustment is made in
 either direction**, and the transient skim slot the previous version used is gone. `R` is `int128`
 and signed (sells reduce it); `acc` is its time integral in parent-units·seconds. `p.tLast` is
-initialised to `tradingStart` at registration, so the accumulator measures the full synchronized
-window, not "since the first swap".
+initialised to the pool's own `tradingStart` (its registration block) at registration, so the
+accumulator runs from the moment the pool opens, not "since the first swap"; `submitScore` floors the
+scored window at the round's `tradingStart`, so every candidate is measured over the same span.
 
 **v4 protocol-fee subtraction from the score (audit 9, conditional).** Uniswap v4's own
 protocol-fee controller (§T, an address the protocol does not control) can charge up to a further
@@ -486,7 +506,7 @@ Exact `R` is pinned in all four orientations and inside the snipe window by `tes
 | `test_scoreExactInParentUnspecified` | the same identity with the fee charged in `afterSwap` |
 | `test_scoreExactOutParentUnspecified` | the same identity, mirrored |
 | `test_scoreIsAdditiveAcrossOrientations` | buys add, sells subtract, across swaps |
-| `test_snipeWindowBuyScoresPoolDeltaAndNeverGoesNegative` | at `tradingStart`, with a 99% snipe tax plus the hop fee, a 1e18 buy scores exactly `0.009e18`, positive, never negative |
+| `test_snipeWindowBuyScoresPoolDeltaAndNeverGoesNegative` | at the pool's own `tradingStart` (its registration), with a 99% snipe tax plus the hop fee, a 1e18 buy scores exactly `0.009e18`, positive, never negative |
 | `test_snipeDecayMovesTheScoreNotTheSign` | the same buy 2 s later scores strictly more |
 
 **The score is a closing-window average read out of a checkpoint ring, because `T_end` is no longer known
@@ -590,7 +610,8 @@ that was really measured. Queried between a pool's registration and its `trading
 `(0, 0)` rather than reverting.
 
 **`FamilyHook.averageOver(id, tStart, tEnd)`, the closing-window average.** `RoundManager.submitScore`
-calls it with `tStart = max(0, T_end − W)`, `tEnd = T_end`; it reconstructs the accumulator state at
+calls it with `tStart = max(T_end − W, r.tradingStart)` (the floor: without it a short round,
+where `W >= D`, would score each candidate from its own pool start), `tEnd = T_end`; it reconstructs the accumulator state at
 both edges from the rings and returns `(avg, tLastBefore)`, `tLastBefore` playing the role
 `tFirstAttained` played before: the last real score update at or before `tEnd`, i.e. when the final
 average was first reached. A candidate that registered after `T_end − W` (only reachable on a heavily
@@ -628,8 +649,10 @@ in §R/§U, not a bug).
 
 **The round mechanism: `finalize()` first requires the end to be settled.** `r.tradingEnd == 0` reverts
 `EndNotSettled`: either `fulfilEnd(proof)` (a verified drand relay, §C) or `finalizeDeterministic()`
-(the disclosed 30-minute timeout fallback) must have run first, and `block.timestamp >= r.submitEnd`
-must hold measured from whichever of those settled the end, not from the round's nominal end `T`.
+(the disclosed 30-minute timeout fallback) must have run first, and then EITHER every candidate of the
+round has submitted (`submittedCount[roundId] == r.candidateCount`, a counter `submitScore` bumps once per
+candidate, so the gate costs one storage read and no loop) OR `block.timestamp >= r.submitEnd`, measured
+from whichever call settled the end, not from the round's nominal end `T`.
 Once settled, `finalize()` itself is otherwise unchanged: it still reads only `r.hasBest`/`r.bestAvg`
 from `submitScore`'s running best, still writes the head in exactly one branch, and a winning round
 now also records that generation's round (`_roundOfIndex[newIndex] = roundId`, §J) so its siblings (this winner and every candidate that lost the same round) can be found forever from the moment it
@@ -691,8 +714,8 @@ state kept between calls.
   there is no cross-currency sentinel leg to special-case any more.
 - `buyCandidate(candidateId, minOut, to, maxHops)` / `sellCandidate(candidateId, amountIn, minOut,
   to, maxHops)` (M4), the canonical chain plus one extra hop into the candidate's own pool,
-  refused only while the candidate's round is still `Registration` or `Idle` (`NotTrading`), i.e.
-  before its pool's own hook gate has opened, and requires `candidateId < candidateCount()`
+  refused only while the candidate's round is `Idle` (`NotTrading`): a candidate's pool opens at
+  its registration, so `Registration` routes like `Trading`, and requires `candidateId < candidateCount()`
   (`UnknownCandidate`). **Candidate routes survive the round (audit 8, fixed).** `_candidateRoute`
   resolves the pool's parent from the index the ROUND recorded (`roundManager.roundInfo(c.roundId)
   .parentIndex`), which is immutable once written, not from the *current* head, so a losing
@@ -831,6 +854,28 @@ unredeemed claims, which is what the solvency invariant is measured against.
 
 **No sell-side asymmetry.** Buys and sells pay the same rates (design analysis keeps 1%/1%).
 ---
+
+## I2. Venue lock
+
+Replaces the earlier per-transfer side-tax charge on the family token itself (commit b4e42e0,
+2026-10-01; the triage of the prior mechanism is kept for the record at
+`docs/security/slither-sidetax-triage.md`). A chain coin (any family token, index 1 and deeper)
+can only be traded on its own canonical pool. `FamilyToken.transfer`/`transferFrom` reverts
+`NonCanonicalVenue(from, to, reason, available)` when a movement would put the token into a second venue:
+
+1. **reason 1**, an inbound transfer to the `PoolManager` beyond the hook's own canonical
+   allowance for that token (the allowance `FamilyHook` grants only to the token's registered
+   canonical pool, see §I's credit mask, renamed in code from "the side-tax credit" to "the
+   canonical credit");
+2. **reason 2**, an outbound transfer from the `PoolManager` beyond that same allowance;
+3. **reason 3**, a transfer to or from any pool-shaped contract — one that answers both
+   `token0()` and `token1()` — that is not the token's registered canonical pool.
+
+A plain wallet-to-wallet transfer is unaffected, and so is any transfer to or from a contract
+that is not pool-shaped (it never trips check 3, and never touches the `PoolManager` allowance
+checked by 1/2). The fee itself moved with the mechanism: it is collected entirely by
+`FamilyHook`, inside the swap, on the parent ($DOLL) side of the canonical pool; no fee is ever
+taken from the family-token side of a swap and none is ever taken outside a swap.
 
 ## J. Fee recipients
 
@@ -1567,9 +1612,22 @@ outcome in Dollhouse's favour, because the only thing a withheld beacon produces
 `test_aBeaconForAnotherRoundIsRefused`, `test_aTamperedSignatureIsRefused`,
 `test_pinIsAlwaysInTheFuture`, `test_fulfilBeforeTheBeaconExistsIsRefused`, `test_unknownIdIsRefused`.
 
-There is no external oracle, price feed or off-chain input anywhere on the trust path for PRICE or
-SCORE: the drand beacon above is consulted only to fix a timestamp, and a withheld beacon still lets
-every round finalize deterministically.
+**Opening price (`VenueOracle`).** A round's curve basis is set once, by its first registration,
+from E0 = 5 ETH converted to $DOLL at the external ETH/$DOLL venue's averaged price, walked down the
+chain and clamped to [1/1000, 1/2] of the parent's market cap. `VenueOracle` keeps that average from
+samples taken by two fixed pokers (at most once a minute, never inside a PoolManager unlock, each
+sample limited to a 3% step in sqrt price); it never reads spot on the start path, so a swap in the
+registering transaction cannot move it. `startPrice()` answers max(10 min, 24 h average) once 24 h of
+history exist (status 0), and in the first day max(10 min average, slow average so far) with status 8
+once the last ten minutes holds no clamped sample and not the constructor's seed. Otherwise the start opens
+on the constant `START_FALLBACK_DOLL` and says so (flag bit 1). The oracle is bound once, by anyone,
+only if its runtime code hash and venue match the values fixed at deploy; its constructor refuses to
+run inside a PoolManager unlock. Tests: `VenueOracle.t.sol`, `StartAnchor.t.sol`.
+
+The venue average above is the only external price input, and it sets only a round's OPENING price,
+inside the [1/1000, 1/2] clamps; there is no external oracle, price feed or off-chain input on the
+trust path for SCORE or for any price after a pool opens. The drand beacon above is consulted only to
+fix a timestamp, and a withheld beacon still lets every round finalize deterministically.
 
 ---
 
@@ -1682,7 +1740,7 @@ recorded run: `docs/security/PROPERTY_RESULTS.md` section 0.
 | **Bond doubles with depth, is capped, and is refunded/forfeited at the amount actually posted (F6)** | `Depth.t.sol::test_bondDoublesEveryFourLinksAndIsCapped`, `test_theBondIsEnforcedRefundedAndForfeitedAtTheScheduledAmount` |
 | **The beta depth cap `MAX_INDEX` refuses the round that would go past it** | `Depth.t.sol::test_maxIndexRefusesTheRoundThatWouldGoPastIt` |
 | **Candidate ids are paginable (F10)** | `Round.t.sol::test_candidateIdsArePaginated` |
-| Candidate pools gated until `tradingStart` | `Round.t.sol::test_candidatePoolIsGatedUntilTradingStart`; `Swap.t.sol::test_swapRevertsBeforeTradingStart` |
+| Candidate pools open at their own registration; the hook gate still refuses a swap before a registered start | `Round.t.sol::test_candidatePoolTradesAtItsOwnRegistration`; `InstantTrading.t.sol` (shared scored window `tStartUsed == r.tradingStart`, support held from before the clock, own snipe tax, no registration at or after `registrationEnd` on a short round); `Invariants.t.sol::invariant_everyPoolOpensAtRegistrationAndBeforeTheScoredWindow`; `Swap.t.sol::test_swapRevertsBeforeTradingStart` (future start, hook unit test) |
 | **Score = the pool's own parent delta, in all four orientations (C1)** | `HookScore.t.sol::test_scoreExactInParentSpecified`, `test_scoreExactOutParentSpecified`, `test_scoreExactInParentUnspecified`, `test_scoreExactOutParentUnspecified`, `test_scoreIsAdditiveAcrossOrientations` |
 | **A sniped buy scores the pool delta and never goes negative** | `HookScore.t.sol::test_snipeWindowBuyScoresPoolDeltaAndNeverGoesNegative`, `test_snipeDecayMovesTheScoreNotTheSign` |
 | Snipe tax profile (99% at +1 s, none at +4 s) | `Round.t.sol::test_snipeTaxBitesAtOneSecondButNotAtFour` |
@@ -1790,7 +1848,7 @@ Numbers are the MID deploy configuration at the 900 s window, per design analysi
 | Hop fee is the ceiling on chain length | at 7.5 bps a 100-hop route pays 7.5% in hop fees, the same order as the edge fee itself | design analysis |
 | Curve vs threshold | at h = 0.15% the median MID winner ends the round with 60.2% of float sold, having absorbed 9.0× the threshold in total | design analysis (MID) |
 | **Closing-window sniper** | a **window sniper**: capital equal to the leader's, bought at the start of the closing window `W` and held, beats a leader still spreading its buys ≈82% of the time in a 4-hour round and ≈93% of 15-minute rounds, fixed or random end alike. This is the closing-window rule working exactly as defined (highest average at the end wins; late money that stays counts fully), not a bug, and is disclosed as "a long-time leader can lose to money that arrives for the closing window" | design analysis |
-| **Random end's actual value** | on a 15-minute round the random end cuts a last-second sniper's flip rate 2.4% → 0.2%; spreading a buy across the last 3 minutes instead of dropping it at once keeps 67% of its value and still cuts the flip rate 18.2% → 7.6%. On a 12-hour round a fixed end already flips 0.00%, so the random end mainly protects SHORT rounds, it is kept uniform across all durations for simplicity, not because it matters equally everywhere | design analysis |
+| **Random end's actual value** | on a 15-minute round the random end cuts a last-second sniper's flip rate 2.4% → 0.2%; spreading a buy across the last 3 minutes instead of dropping it at once keeps 67% of its value and still cuts the flip rate 18.2% → 7.6%. On a 12-hour round a fixed end already flips 0.00%, so the random end mainly protects SHORT rounds, it is kept uniform across all durations for simplicity, not because it matters equally everywhere. Historical note: these numbers were measured on the old fixed 15-minute-round schedule, before the ten-minute-first-round, doubling-with-depth schedule replaced it | design analysis |
 | **Curve-exhaustion caveat, disclosed, no constant change** | at rounds ≥ 8 h the demand model (∝ √D) implies absorbing more parent tokens than exist; the reported curve exhaustion at high rounds is a modelling artefact, not a contract behaviour, real rounds are bounded by the parent's actual float. Monitor on mainnet | design analysis |
 | **Each link is worth a small fraction of its parent** | measured winners land at **5–8% of parent value in $DOLL**; this is the weakest assumption in the whole design, and keeper precision, threshold meaning, route impact and "value flows to index 0" all rest on it | audit §3 |
 | **The threshold stops being a real cost at depth** | `H` is 0.15% of the *parent's supply*, so clearing it for 900 s costs ≈$100 at generation 1, ≈$7 at generation 2 and **< $1 from generation 3**; from there the **bond** is the binding cost of extending the chain, which is why it now doubles every 4 links (§C) | audit F6 |
@@ -2025,10 +2083,10 @@ mined hook encodes exactly `HOOK_FLAGS`, and on a continuation asserts head cont
 | **Beacon withholder / non-relayer** | the League of Entropy threshold colludes to withhold a signature, or simply nobody bothers to relay one | `END_TIMEOUT = 30 min` permissionless `finalizeDeterministic()` settles `T_end = T` regardless; the round never hangs | **Accepted and disclosed, and self-defeating for the attacker:** the only achievable outcome of withholding is `T_end = T`, which is exactly the outcome a late buyer could already plan for, a withheld beacon cannot bias a round in anyone's favour, only remove the randomness. Never fired in production (§ Links with liveness evidence). |
 | **Purse parker** | parked capital equal to a sibling's trailing support to move the top-2 ranking and claim purse share | - | **Closed by removal (2026-09-13).** The purse is no longer contestable: a generation's whole share is locked under `canonical(j)`, decided by the round result and by nothing measured afterwards. There is no ranking to move. |
 | **Purse-wall seller (disclosed working-as-designed)** | holders of the round winner sell into the purse's own bid range, so fee-funded liquidity buys them out | none by design, and none intended: the purse is a **permanent buy wall under the coin that won the round**, placed from just under spot to about 6% below it, and being able to sell into it is what makes it support rather than a lock-up. The bounds are the per-deployment size cap (2% of the target range's parent reserve) and the 24-hour drawdown bucket (10% of the generation's accrued $DOLL), so no single moment can be used to shove the pool | **Accepted and disclosed.** The reinforcement share (20% of the fee) has worked exactly this way; the purse extends the same property from 20% to 40% of the fee by making the ancestor sleeve uncontested. Keeping the value on the canonical chain in bid form is the intent. |
-| **Block-1 sniper** | the first swap at `tradingStart` | linear snipe tax 99% → 1% over 3 s; proceeds go to the parent's reinforcement pot; the score counts only what the pool absorbed, so a sniped buy scores small and positive | Priced, not prevented: mean +$445/round (design analysis). |
+| **Block-1 sniper** | the first swap at a pool's own `tradingStart` (its registration block; pools open one at a time, so there is no single shared instant to watch) | linear snipe tax 99% → 1% over 3 s; proceeds go to the parent's reinforcement pot; the score counts only what the pool absorbed, so a sniped buy scores small and positive | Priced, not prevented: mean +$445/round (design analysis). |
 | **Score-sign attacker (C1)** | one exact-in buy inside the 99% window to drive a rival's `R` negative | closed: `R` is the pool's own parent delta, fee-exclusive by construction; pinned in four orientations and inside the snipe window | Closed (`HookScore.t.sol`). |
 | **Genesis squatter (C2), REMOVED** | watches the factory deploy and front-runs adoption at a near-zero FDV | there is no FDV to front-run: adoption places no curve and no price at all, only checks the adopted token against the fixed `GENESIS_TOKEN` deploy constant. There is no public `adoptGenesis(token)` entry point; adoption runs inside `wire()` with `genesisCreator` fixed at construction to the deployer | Closed by construction. There is no first caller to race: the attribution is fixed before any transaction can be sent, and it carries no fee stream. |
-| **Submission-order attacker** | submits a weak score and finalizes atomically | `submitScore` confined to `[T_end, settlement time + 300)`; `finalize()` refused until `submitEnd`; scores are `T_end` snapshots | Closed (`test_submitOrderingAttackCannotWin`). |
+| **Submission-order attacker** | submits a weak score and finalizes atomically | `submitScore` confined to `[T_end, settlement time + 300)`; `finalize()` refused until `submitEnd` or until every candidate has submitted; scores are `T_end` snapshots | Closed (`test_submitOrderingAttackCannotWin`). |
 | **Submission griefer** | withholds a rival's `submitScore` or spams submissions | permissionless and per-candidate idempotent; anyone may submit for anyone | Residual: if *nobody* submits, a qualifying round still finalizes with no winner and all bonds are forfeited. |
 | **Finalization stalker** | refuses to call `finalize()` | permissionless, idempotent, no deadline | Residual liveness dependency: succession halts until someone pays the gas. Trading continues. |
 | **Pool poisoner** | pre-initializes the predictable `PoolKey` | `beforeInitialize` requires factory pre-registration at the exact registered price; the factory registers, initializes and places in one transaction | Closed (finding 8). |

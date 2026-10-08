@@ -62,7 +62,9 @@ contract SnipeTaxTest is RoundTestBase {
         }
         assertTrue(matched, "no twin pool with the same curve orientation");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-        (tradingStart,,) = _roundTimes(roundManager.roundCount());
+        // every pool's snipe tax runs from its OWN start; the twins registered in one block
+        tradingStart = _poolStart(a);
+        assertEq(_poolStart(b), tradingStart, "twins opened together");
     }
 
     /// @dev (parent the trader paid, parent the pool kept) for one buy, measured from balances
@@ -137,7 +139,7 @@ contract SnipeTaxCeilingTest is RoundTestBase {
         _buyLink(1, 5 ether);
         Cand memory c = _registerCandidate(address(0xA11CE), "A");
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c);
         vm.warp(tradingStart);
 
         bool zeroForOne = !c.tokenIsCurrency0;
@@ -173,7 +175,7 @@ contract SnipeTaxEdgeFeeTest is RoundTestBase {
     /// schedule.
     function test_edgeFeeIsSuppressedForTheWholeSnipeWindow() public {
         Cand memory c = _registerCandidate(address(0xA11CE), "EDGE");
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c);
         assertTrue(hook.poolInfo(c.poolId).isEdge, "round one launches against index 0: an edge pool");
 
         _assertSnipeWindowFee(c, tradingStart, 0);
@@ -231,7 +233,7 @@ contract SnipeTaxEdgeFeeTest is RoundTestBase {
     /// of a round-one pool it must still price.
     function test_exactOutputBuyPricesAtTheOpeningInstantOfAnEdgePool() public {
         Cand memory c = _registerCandidate(address(0xA11CE), "EDGE");
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c);
         vm.warp(tradingStart);
 
         bool zeroForOne = !c.tokenIsCurrency0;

@@ -67,11 +67,35 @@ contract CodeSizeTest is RoundTestBase {
             bytes32(0),
             factory.tokenImplementation()
         );
-        uint256 argsLength = argsA.length + argsB.length;
+        // the metadata base, the round wiring and the ETH-anchored start setup (all static-size
+        // but the string, whose standalone encoding is the same length as its place in the tail)
+        bytes memory argsC = abi.encode(
+            TEST_METADATA_BASE,
+            FamilyFactory.RoundSetup({
+                deployer: address(roundManagerDeployer),
+                randomness: address(randomness),
+                endTimeout: endTimeout,
+                durationScaleDiv: durationScaleDiv
+            }),
+            _startSetup()
+        );
+        uint256 argsLength = argsA.length + argsB.length + argsC.length;
         uint256 size = type(FamilyFactory).creationCode.length + argsLength;
         emit log_named_uint("FamilyFactory deployment transaction bytes", size);
         emit log_named_uint("...of which constructor arguments", argsLength);
         assertLe(size, EIP3860_LIMIT, "the factory deployment transaction exceeds the EIP-3860 limit");
+    }
+
+    /// @notice The venue lock (private/V2_SIDE_TAX_DESIGN.md) touches three contracts: the token
+    /// implementation (the transfer rule, the probe, the successor walk), the hook (the per-pool
+    /// credit) and the factory (the implementation check). Reported here on their own; every
+    /// clone stays a 45-byte EIP-1167 proxy.
+    function test_venueLockContractSizes() public {
+        Cand memory c = _registerCandidate(address(0xC0DE), "CAND");
+        _assertFits("FamilyToken (implementation)", factory.tokenImplementation());
+        _assertFits("FamilyHook", address(hook));
+        _assertFits("FamilyFactory", address(factory));
+        _assertIsClone("FamilyToken (candidate)", c.token);
     }
 
     /// @dev An EIP-1167 minimal proxy is exactly 45 runtime bytes.

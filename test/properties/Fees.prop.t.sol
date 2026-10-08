@@ -190,7 +190,7 @@ contract FeesPropTest is FeesPropBase {
         uint256 amount = bound(amountSeed, 1e18, 100_000e18);
 
         Cand memory c = _registerCandidate(address(0xA11CE), "S");
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c); // the pool's OWN start: its registration
         IERC20(roundManager.head()).approve(address(swapRouter), type(uint256).max);
         vm.warp(tradingStart + dt);
 
@@ -418,7 +418,7 @@ contract FeesEdgeWindowPropTest is FeesPropBase {
 
         Cand memory c = _registerCandidate(address(0xA11CE), "EDGE");
         assertTrue(hook.poolInfo(c.poolId).isEdge, "round one launches against index 0: an edge pool");
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c); // the pool's OWN start: its registration
         vm.warp(uint256(tradingStart) + dt);
 
         uint256 snipePpm = _snipePpmSpec(dt);
@@ -455,7 +455,7 @@ contract FeesEdgeWindowPropTest is FeesPropBase {
         uint256 tokensOut = bound(outSeed, 1e15, 10_000e18);
 
         Cand memory c = _registerCandidate(address(0xA11CE), "EDGE");
-        (uint64 tradingStart,,) = _roundTimes(roundManager.roundCount());
+        uint64 tradingStart = _poolStart(c); // the pool's OWN start: its registration
         vm.warp(uint256(tradingStart) + dt);
 
         bool zeroForOne = !c.tokenIsCurrency0;
